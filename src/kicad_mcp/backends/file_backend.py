@@ -135,8 +135,12 @@ class FileSchematicOps(SchematicOps):
                         symbol_data["reference"] = prop.value
                     elif prop_key == "Value":
                         symbol_data["value"] = prop.value
+                    elif prop_key == "Footprint":
+                        symbol_data["footprint"] = prop.value
             if hasattr(sym, "lib_id"):
-                symbol_data["lib_id"] = str(sym.lib_id)
+                lib_id_str = str(sym.lib_id)
+                symbol_data["lib_id"] = lib_id_str
+                symbol_data["is_power"] = lib_id_str.startswith("power:")
             if hasattr(sym, "at"):
                 pos = self._skip_at_to_pos(sym.at)
                 if pos:
@@ -169,16 +173,40 @@ class FileSchematicOps(SchematicOps):
                         label_data["position"] = pos
                 labels.append(label_data)
 
+        # Parse no_connects and junctions via sexp fallback (skip doesn't expose these well)
+        no_connects = []
+        junctions = []
+        try:
+            tree = parse_sexp_file(path)
+            for node in tree:
+                if not isinstance(node, list) or len(node) < 1:
+                    continue
+                tag = node[0] if isinstance(node[0], str) else ""
+                if tag == "no_connect":
+                    nc = _parse_position_node(node)
+                    if nc:
+                        no_connects.append(nc)
+                elif tag == "junction":
+                    jn = _parse_position_node(node)
+                    if jn:
+                        junctions.append(jn)
+        except Exception:
+            pass  # Non-critical, skip if parsing fails
+
         return {
             "info": {
                 "file_path": str(path),
                 "num_symbols": len(symbols),
                 "num_wires": len(wires),
                 "num_labels": len(labels),
+                "num_no_connects": len(no_connects),
+                "num_junctions": len(junctions),
             },
             "symbols": symbols,
             "wires": wires,
             "labels": labels,
+            "no_connects": no_connects,
+            "junctions": junctions,
         }
 
     def _read_with_sexp(self, path: Path) -> dict[str, Any]:
@@ -186,6 +214,8 @@ class FileSchematicOps(SchematicOps):
         symbols = []
         wires = []
         labels = []
+        no_connects = []
+        junctions = []
 
         for node in tree:
             if not isinstance(node, list) or len(node) < 1:
@@ -203,6 +233,14 @@ class FileSchematicOps(SchematicOps):
                 lbl = _parse_sch_label(node, tag)
                 if lbl:
                     labels.append(lbl)
+            elif tag == "no_connect":
+                nc = _parse_position_node(node)
+                if nc:
+                    no_connects.append(nc)
+            elif tag == "junction":
+                jn = _parse_position_node(node)
+                if jn:
+                    junctions.append(jn)
 
         return {
             "info": {
@@ -210,10 +248,14 @@ class FileSchematicOps(SchematicOps):
                 "num_symbols": len(symbols),
                 "num_wires": len(wires),
                 "num_labels": len(labels),
+                "num_no_connects": len(no_connects),
+                "num_junctions": len(junctions),
             },
             "symbols": symbols,
             "wires": wires,
             "labels": labels,
+            "no_connects": no_connects,
+            "junctions": junctions,
         }
 
     def get_symbols(self, path: Path) -> list[dict[str, Any]]:
@@ -222,47 +264,74 @@ class FileSchematicOps(SchematicOps):
 
     def add_component(
         self, path: Path, lib_id: str, reference: str, value: str,
-        x: float, y: float,
+        x: float, y: float, rotation: float = 0.0,
+        mirror: str | None = None, footprint: str = "",
+        properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        try:
-            from skip import Schematic
-        except ImportError:
-            raise NotImplementedError(
-                "Schematic modification requires kicad-skip. Install: pip install kicad-skip"
-            )
-
-        sch = Schematic(str(path))
-        # Use kicad-skip to add symbol
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
-        # Build the symbol s-expression and append
-        sym_sexp = (
-            f'  (symbol (lib_id "{lib_id}") (at {x} {y} 0)\n'
-            f'    (uuid "{symbol_uuid}")\n'
+        # Build at clause
+        at_clause = f"(at {x} {y} {rotation})"
+
+        # Build mirror clause
+        mirror_clause = ""
+        if mirror in ("x", "y"):
+            mirror_clause = f"\n    (mirror {mirror})"
+
+        # Build properties
+        prop_lines = (
             f'    (property "Reference" "{reference}" (at {x} {y - 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)))\n'
             f'    )\n'
             f'    (property "Value" "{value}" (at {x} {y + 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)))\n'
             f'    )\n'
+        )
+
+        if footprint:
+            prop_lines += (
+                f'    (property "Footprint" "{footprint}" (at {x} {y + 4} 0)\n'
+                f'      (effects (font (size 1.27 1.27)) hide)\n'
+                f'    )\n'
+            )
+
+        if properties:
+            offset = 6
+            for prop_name, prop_val in properties.items():
+                prop_lines += (
+                    f'    (property "{prop_name}" "{prop_val}" (at {x} {y + offset} 0)\n'
+                    f'      (effects (font (size 1.27 1.27)) hide)\n'
+                    f'    )\n'
+                )
+                offset += 2
+
+        sym_sexp = (
+            f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause}\n'
+            f'    (uuid "{symbol_uuid}")\n'
+            f'{prop_lines}'
             f'  )\n'
         )
 
-        # Read file and insert before closing paren
         content = path.read_text(encoding="utf-8")
         last_paren = content.rfind(")")
         if last_paren >= 0:
             content = content[:last_paren] + sym_sexp + content[last_paren:]
             path.write_text(content, encoding="utf-8")
 
-        return {
+        result: dict[str, Any] = {
             "reference": reference,
             "value": value,
             "lib_id": lib_id,
             "position": {"x": x, "y": y},
+            "rotation": rotation,
             "uuid": symbol_uuid,
         }
+        if footprint:
+            result["footprint"] = footprint
+        if mirror:
+            result["mirror"] = mirror
+        return result
 
     def add_wire(
         self, path: Path, start_x: float, start_y: float,
@@ -314,6 +383,208 @@ class FileSchematicOps(SchematicOps):
             "position": {"x": x, "y": y},
             "label_type": label_type,
             "uuid": label_uuid,
+        }
+
+    def add_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        import uuid
+        nc_uuid = str(uuid.uuid4())
+        nc_sexp = (
+            f'  (no_connect (at {x} {y}) (uuid "{nc_uuid}"))\n'
+        )
+
+        content = path.read_text(encoding="utf-8")
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + nc_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "position": {"x": x, "y": y},
+            "uuid": nc_uuid,
+        }
+
+    def add_power_symbol(
+        self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
+    ) -> dict[str, Any]:
+        import uuid
+        symbol_uuid = str(uuid.uuid4())
+
+        # Power symbols use lib_id "power:<name>" and Reference "#PWR0XX"
+        # Auto-increment PWR reference by scanning existing ones
+        content = path.read_text(encoding="utf-8")
+        pwr_refs = re.findall(r'"#PWR(\d+)"', content)
+        next_num = max((int(n) for n in pwr_refs), default=0) + 1
+        pwr_ref = f"#PWR{next_num:03d}"
+
+        lib_id = f"power:{name}"
+
+        sym_sexp = (
+            f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation})\n'
+            f'    (uuid "{symbol_uuid}")\n'
+            f'    (property "Reference" "{pwr_ref}" (at {x} {y - 2} 0)\n'
+            f'      (effects (font (size 1.27 1.27)) hide)\n'
+            f'    )\n'
+            f'    (property "Value" "{name}" (at {x} {y + 2} 0)\n'
+            f'      (effects (font (size 1.27 1.27)))\n'
+            f'    )\n'
+            f'  )\n'
+        )
+
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + sym_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "name": name,
+            "lib_id": lib_id,
+            "reference": pwr_ref,
+            "position": {"x": x, "y": y},
+            "rotation": rotation,
+            "uuid": symbol_uuid,
+        }
+
+    def add_junction(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        import uuid
+        jn_uuid = str(uuid.uuid4())
+        jn_sexp = (
+            f'  (junction (at {x} {y}) (diameter 0) (color 0 0 0 0)\n'
+            f'    (uuid "{jn_uuid}")\n'
+            f'  )\n'
+        )
+
+        content = path.read_text(encoding="utf-8")
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + jn_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "position": {"x": x, "y": y},
+            "uuid": jn_uuid,
+        }
+
+    def get_symbol_pin_positions(
+        self, path: Path, reference: str,
+    ) -> dict[str, Any]:
+        import math
+
+        tree = parse_sexp_file(path)
+
+        # 1. Find the symbol instance by reference
+        sym_node = None
+        for node in tree:
+            if not isinstance(node, list) or len(node) < 2:
+                continue
+            if node[0] != "symbol":
+                continue
+            for child in node[1:]:
+                if (isinstance(child, list) and len(child) >= 3
+                        and child[0] == "property" and child[1] == "Reference"
+                        and child[2] == reference):
+                    sym_node = node
+                    break
+            if sym_node is not None:
+                break
+
+        if sym_node is None:
+            return {"error": f"Symbol with reference '{reference}' not found"}
+
+        # Extract symbol placement: at, lib_id, mirror
+        sx, sy, sym_rot = 0.0, 0.0, 0.0
+        lib_id = ""
+        sym_mirror = None
+        for child in sym_node[1:]:
+            if not isinstance(child, list) or len(child) < 2:
+                continue
+            tag = child[0] if isinstance(child[0], str) else ""
+            if tag == "at" and len(child) >= 3:
+                sx = float(child[1])
+                sy = float(child[2])
+                if len(child) >= 4:
+                    sym_rot = float(child[3])
+            elif tag == "lib_id":
+                lib_id = child[1]
+            elif tag == "mirror":
+                sym_mirror = child[1]
+
+        if not lib_id:
+            return {"error": f"Symbol '{reference}' has no lib_id"}
+
+        # 2. Find the lib_symbols entry in the schematic
+        lib_symbols_node = None
+        for node in tree:
+            if isinstance(node, list) and len(node) >= 1 and node[0] == "lib_symbols":
+                lib_symbols_node = node
+                break
+
+        if lib_symbols_node is None:
+            return {"error": "No lib_symbols section found in schematic"}
+
+        # Find the matching library symbol definition
+        # The lib_symbols cache uses the lib_id directly as the symbol name
+        lib_sym = None
+        for child in lib_symbols_node[1:]:
+            if (isinstance(child, list) and len(child) >= 2
+                    and child[0] == "symbol" and child[1] == lib_id):
+                lib_sym = child
+                break
+
+        if lib_sym is None:
+            return {"error": f"Library symbol '{lib_id}' not found in lib_symbols cache"}
+
+        # 3. Extract pins from lib symbol (recurse into sub-symbols)
+        pins = []
+        for child in lib_sym[1:]:
+            if not isinstance(child, list) or len(child) < 2:
+                continue
+            if child[0] == "pin":
+                pins.append(_parse_pin_node(child))
+            elif child[0] == "symbol":
+                for sub_child in child[1:]:
+                    if isinstance(sub_child, list) and len(sub_child) >= 2 and sub_child[0] == "pin":
+                        pins.append(_parse_pin_node(sub_child))
+
+        # 4. Transform pin positions to absolute schematic coordinates
+        rad = math.radians(sym_rot)
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+
+        pin_positions: dict[str, dict[str, float]] = {}
+        for pin in pins:
+            pos = pin.get("position")
+            if pos is None:
+                continue
+            px = pos["x"]
+            py = pos["y"]
+
+            # Library coordinates are Y-up, schematic is Y-down, so negate py
+            py_sch = -py
+
+            # Apply mirror before rotation
+            if sym_mirror == "x":
+                py_sch = -py_sch
+            elif sym_mirror == "y":
+                px = -px
+
+            # Apply rotation
+            abs_x = sx + px * cos_r - py_sch * sin_r
+            abs_y = sy + px * sin_r + py_sch * cos_r
+
+            pin_key = pin.get("number", pin.get("name", ""))
+            if pin_key:
+                pin_positions[pin_key] = {
+                    "x": round(abs_x, 4),
+                    "y": round(abs_y, 4),
+                }
+
+        return {
+            "reference": reference,
+            "lib_id": lib_id,
+            "position": {"x": sx, "y": sy},
+            "rotation": sym_rot,
+            "mirror": sym_mirror,
+            "pin_positions": pin_positions,
         }
 
 
@@ -827,6 +1098,7 @@ def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
         tag = child[0] if isinstance(child[0], str) else ""
         if tag == "lib_id":
             sym["lib_id"] = child[1]
+            sym["is_power"] = child[1].startswith("power:")
         elif tag == "at" and len(child) >= 3:
             sym["position"] = {"x": float(child[1]), "y": float(child[2])}
         elif tag == "property" and len(child) >= 3:
@@ -834,6 +1106,8 @@ def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
                 sym["reference"] = child[2]
             elif child[1] == "Value":
                 sym["value"] = child[2]
+            elif child[1] == "Footprint":
+                sym["footprint"] = child[2]
     return sym if sym else None
 
 
@@ -849,6 +1123,14 @@ def _parse_sch_wire(node: list) -> dict[str, Any] | None:
     return None
 
 
+def _parse_position_node(node: list) -> dict[str, Any] | None:
+    """Parse a node that has an (at x y) child, returning {"position": {"x": ..., "y": ...}}."""
+    for child in node[1:]:
+        if isinstance(child, list) and len(child) >= 3 and child[0] == "at":
+            return {"position": {"x": float(child[1]), "y": float(child[2])}}
+    return None
+
+
 def _parse_sch_label(node: list, label_type: str) -> dict[str, Any] | None:
     if len(node) < 2:
         return None
@@ -857,6 +1139,29 @@ def _parse_sch_label(node: list, label_type: str) -> dict[str, Any] | None:
         if isinstance(child, list) and len(child) >= 3 and child[0] == "at":
             label["position"] = {"x": float(child[1]), "y": float(child[2])}
     return label
+
+
+def _parse_pin_node(child: list) -> dict[str, Any]:
+    """Parse a single pin s-expression node and extract type, shape, name, number, position."""
+    pin_info: dict[str, Any] = {}
+    if len(child) >= 3:
+        pin_info["type"] = child[1]
+        pin_info["shape"] = child[2]
+    for sub in child[1:]:
+        if not isinstance(sub, list) or len(sub) < 2:
+            continue
+        if sub[0] == "name":
+            pin_info["name"] = sub[1]
+        elif sub[0] == "number":
+            pin_info["number"] = sub[1]
+        elif sub[0] == "at" and len(sub) >= 3:
+            pos: dict[str, Any] = {"x": float(sub[1]), "y": float(sub[2])}
+            if len(sub) >= 4:
+                pos["angle"] = float(sub[3])
+            else:
+                pos["angle"] = 0.0
+            pin_info["position"] = pos
+    return pin_info
 
 
 def _parse_symbol_detail(node: list, lib_name: str) -> dict[str, Any]:
@@ -879,16 +1184,12 @@ def _parse_symbol_detail(node: list, lib_name: str) -> dict[str, Any]:
             elif prop_name == "Datasheet":
                 info["datasheet"] = prop_val
         elif tag == "pin":
-            pin_info: dict[str, Any] = {}
-            if len(child) >= 3:
-                pin_info["type"] = child[1]
-                pin_info["shape"] = child[2]
-            for sub in child[1:]:
-                if isinstance(sub, list) and sub[0] == "name" and len(sub) >= 2:
-                    pin_info["name"] = sub[1]
-                elif isinstance(sub, list) and sub[0] == "number" and len(sub) >= 2:
-                    pin_info["number"] = sub[1]
-            info["pins"].append(pin_info)
+            info["pins"].append(_parse_pin_node(child))
+        elif tag == "symbol":
+            # Recurse into sub-symbols (e.g. "SCD41_1_1") to find pins
+            for sub_child in child[1:]:
+                if isinstance(sub_child, list) and len(sub_child) >= 2 and sub_child[0] == "pin":
+                    info["pins"].append(_parse_pin_node(sub_child))
     info["pin_count"] = len(info["pins"])
     return info
 

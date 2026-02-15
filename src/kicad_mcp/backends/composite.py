@@ -10,6 +10,7 @@ from kicad_mcp.backends.base import (
     DRCOps,
     ExportOps,
     KiCadBackend,
+    LibraryManageOps,
     LibraryOps,
     SchematicOps,
 )
@@ -114,6 +115,16 @@ class CompositeBackend:
         if ops is None:
             raise CapabilityNotSupportedError(
                 f"Backend '{backend.name}' claims LIBRARY_SEARCH but returned no LibraryOps"
+            )
+        return ops
+
+    def get_library_manage_ops(self) -> LibraryManageOps:
+        """Get library management (write) operations from the best available backend."""
+        backend = self._get_backend_for(BackendCapability.LIBRARY_MANAGE)
+        ops = backend.get_library_manage_ops()
+        if ops is None:
+            raise CapabilityNotSupportedError(
+                f"Backend '{backend.name}' claims LIBRARY_MANAGE but returned no LibraryManageOps"
             )
         return ops
 

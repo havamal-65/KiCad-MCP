@@ -8,9 +8,9 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **33+ MCP Tools** across 6 categories:
+- **37+ MCP Tools** across 6 categories:
   - 📋 **Project Management** (5 tools): Create, validate, and manage KiCad projects
-  - 📐 **Schematic Operations** (7 tools): Read, modify, and analyze schematics
+  - 📐 **Schematic Operations** (11 tools): Read, modify, and analyze schematics with pin position queries, no-connects, junctions, and power symbols
   - 🔌 **PCB Board Operations** (8 tools): Work with PCB layouts, components, tracks, and nets
   - 📚 **Library Management** (5 tools): Query and manage component libraries
   - ✅ **Design Rule Checks** (3 tools): Run DRC and ERC validations
@@ -197,14 +197,18 @@ Add to your Cursor MCP settings:
 - `get_project_metadata`: Get project information
 - `update_project_metadata`: Update project settings
 
-### Schematic Operations
-- `read_schematic`: Read complete schematic structure
-- `get_schematic_info`: Get schematic metadata
-- `list_components`: List all components
-- `get_component`: Get component details
-- `update_component`: Modify component properties
-- `list_nets`: List all nets
-- `get_net`: Get net details
+### Schematic Operations (11 tools)
+- `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
+- `add_component`: Place symbols with rotation, mirror, footprint, and custom properties
+- `add_wire`: Draw wire connections
+- `add_label`: Add net labels (net, global, hierarchical)
+- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol (essential for wire routing)
+- `add_no_connect`: Add no-connect (X) markers to unused pins
+- `add_power_symbol`: Add power symbols (+3V3, GND, VCC, etc.) with auto-incrementing references
+- `add_junction`: Add junction dots at wire intersections
+- `annotate_schematic`: Auto-annotate component reference designators
+- `generate_netlist`: Generate netlist from schematic
+- `get_symbol_info`: Get detailed symbol information including pin positions
 
 ### PCB Board Operations
 - `read_board`: Read complete board structure

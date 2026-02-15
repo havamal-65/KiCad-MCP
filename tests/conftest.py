@@ -14,6 +14,7 @@ from kicad_mcp.backends.base import (
     DRCOps,
     ExportOps,
     KiCadBackend,
+    LibraryManageOps,
     LibraryOps,
     SchematicOps,
 )
@@ -183,6 +184,41 @@ class MockLibraryOps(LibraryOps):
         return {"name": "R_0805", "library": "Resistor_SMD", "pad_count": 2, "smd": True}
 
 
+class MockLibraryManageOps(LibraryManageOps):
+    """Mock library management operations for testing."""
+
+    def clone_library_repo(self, url, name, target_path=None):
+        return {"name": name, "path": target_path or f"/mock/libs/{name}", "url": url, "source_type": "git"}
+
+    def register_library_source(self, path, name):
+        return {"name": name, "path": path, "source_type": "local", "url": None}
+
+    def list_library_sources(self):
+        return [{"name": "mock_source", "path": "/mock/libs", "source_type": "local", "url": None}]
+
+    def unregister_library_source(self, name):
+        return {"name": name, "removed": True}
+
+    def search_library_sources(self, query, source_name=None):
+        return {
+            "query": query,
+            "symbols": [{"name": "MockSym", "library": "MockLib", "lib_id": "MockLib:MockSym", "lib_path": "/mock/MockLib.kicad_sym"}],
+            "footprints": [],
+        }
+
+    def create_project_library(self, project_path, library_name, lib_type="both"):
+        return {"library_name": library_name, "project_dir": project_path, "created": [f"{project_path}/{library_name}.kicad_sym"]}
+
+    def import_symbol(self, source_lib, symbol_name, target_lib_path):
+        return {"symbol_name": symbol_name, "source_lib": source_lib, "target_lib_path": target_lib_path}
+
+    def import_footprint(self, source_lib, footprint_name, target_lib_path):
+        return {"footprint_name": footprint_name, "source_lib": source_lib, "target_lib_path": target_lib_path, "copied_file": f"{target_lib_path}/{footprint_name}.kicad_mod"}
+
+    def register_project_library(self, project_path, library_name, library_path, lib_type):
+        return {"library_name": library_name, "table_file": f"{project_path}/sym-lib-table", "uri": library_path, "lib_type": lib_type}
+
+
 class MockBackend(KiCadBackend):
     """Full mock backend for testing."""
 
@@ -200,6 +236,7 @@ class MockBackend(KiCadBackend):
             BackendCapability.EXPORT_PDF,
             BackendCapability.EXPORT_BOM,
             BackendCapability.LIBRARY_SEARCH,
+            BackendCapability.LIBRARY_MANAGE,
         }
 
     @property
@@ -230,6 +267,9 @@ class MockBackend(KiCadBackend):
 
     def get_library_ops(self) -> MockLibraryOps:
         return MockLibraryOps()
+
+    def get_library_manage_ops(self) -> MockLibraryManageOps:
+        return MockLibraryManageOps()
 
 
 @pytest.fixture

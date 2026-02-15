@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -142,3 +143,54 @@ def _parse_tokens(tokens: list[str], pos: int) -> tuple[Any, int]:
     except ValueError:
         pass
     return token, pos + 1
+
+
+def extract_sexp_block(content: str, tag: str, name: str) -> str | None:
+    """Extract a complete S-expression block from raw text by tag and name.
+
+    Finds a block like ``(symbol "Name" ...)`` by matching balanced parentheses.
+    This operates on raw text to avoid formatting drift from parse/serialize round-trips.
+
+    Args:
+        content: Full file text to search in.
+        tag: The S-expression tag to match (e.g. ``"symbol"``).
+        name: The quoted name value following the tag (e.g. ``"SCD41"``).
+
+    Returns:
+        The complete block text including outer parentheses, or ``None`` if not found.
+    """
+    # Build a pattern that matches (tag "name" with flexible whitespace
+    escaped_name = re.escape(name)
+    pattern = re.compile(
+        rf'\({tag}\s+"{escaped_name}"'
+    )
+
+    match = pattern.search(content)
+    if match is None:
+        return None
+
+    start = match.start()
+    # Walk forward matching balanced parentheses
+    depth = 0
+    i = start
+    while i < len(content):
+        ch = content[i]
+        if ch == '"':
+            # Skip quoted strings (handle escaped quotes)
+            i += 1
+            while i < len(content):
+                if content[i] == '\\' and i + 1 < len(content):
+                    i += 2
+                    continue
+                if content[i] == '"':
+                    break
+                i += 1
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return content[start:i + 1]
+        i += 1
+
+    return None

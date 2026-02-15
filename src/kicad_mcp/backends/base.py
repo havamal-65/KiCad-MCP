@@ -156,6 +156,13 @@ class SchematicOps(ABC):
         """Move a schematic symbol to a new position, optionally updating rotation."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def update_component_property(
+        self, path: Path, reference: str,
+        property_name: str, property_value: str,
+    ) -> dict[str, Any]:
+        """Update or add a property on a placed schematic symbol."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
     def annotate(self, path: Path) -> dict[str, Any]:
         """Auto-annotate component references."""
         raise NotImplementedError("This backend does not support annotation")

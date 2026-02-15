@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "python",
+      "args": ["-m", "kicad_mcp"],
+      "env": {
+        "KICAD_MCP_BACKEND": "auto",
+        "KICAD_MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

@@ -572,3 +572,159 @@ class TestCompareSchematicPcb:
 
         # R1 matches perfectly, R2 has mismatch => 1 matched
         assert summary["matched"] == 1
+
+
+# --- lib_symbols cache injection tests ---
+
+MINIMAL_SCHEMATIC = (
+    '(kicad_sch (version 20230121) (generator "test")\n'
+    '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+    '  (lib_symbols\n'
+    '  )\n'
+    ')\n'
+)
+
+MINIMAL_SCHEMATIC_NO_LIB_SYMBOLS = (
+    '(kicad_sch (version 20230121) (generator "test")\n'
+    '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+    ')\n'
+)
+
+MOCK_RESISTOR_LIB = (
+    '(kicad_symbol_lib\n'
+    '  (version 20231120)\n'
+    '  (generator "test")\n'
+    '  (symbol "R"\n'
+    '    (property "Reference" "R" (at 0 0 0))\n'
+    '    (property "Value" "R" (at 0 0 0))\n'
+    '    (symbol "R_0_1"\n'
+    '      (polyline (pts (xy 0 -1.016) (xy 0 1.016)))\n'
+    '    )\n'
+    '    (symbol "R_1_1"\n'
+    '      (pin passive line (at 0 1.27 270) (length 0.254)\n'
+    '        (name "~" (effects (font (size 1.27 1.27))))\n'
+    '        (number "1" (effects (font (size 1.27 1.27))))\n'
+    '      )\n'
+    '      (pin passive line (at 0 -1.27 90) (length 0.254)\n'
+    '        (name "~" (effects (font (size 1.27 1.27))))\n'
+    '        (number "2" (effects (font (size 1.27 1.27))))\n'
+    '      )\n'
+    '    )\n'
+    '  )\n'
+    ')\n'
+)
+
+MOCK_POWER_LIB = (
+    '(kicad_symbol_lib\n'
+    '  (version 20231120)\n'
+    '  (generator "test")\n'
+    '  (symbol "GND"\n'
+    '    (power)\n'
+    '    (property "Reference" "#PWR" (at 0 0 0))\n'
+    '    (property "Value" "GND" (at 0 0 0))\n'
+    '    (symbol "GND_0_1"\n'
+    '      (polyline (pts (xy 0 0) (xy 0 -1.27)))\n'
+    '    )\n'
+    '    (symbol "GND_1_1"\n'
+    '      (pin power_in line (at 0 0 270) (length 0)\n'
+    '        (name "GND" (effects (font (size 1.27 1.27))))\n'
+    '        (number "1" (effects (font (size 1.27 1.27))))\n'
+    '      )\n'
+    '    )\n'
+    '  )\n'
+    ')\n'
+)
+
+
+class TestLibSymbolsCache:
+    def _make_ops(self, tmp_path: Path, lib_content: str, lib_filename: str) -> "FileSchematicOps":
+        """Create a FileSchematicOps with a mock library file."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        lib_file = tmp_path / lib_filename
+        lib_file.write_text(lib_content, encoding="utf-8")
+        ops = FileSchematicOps()
+        ops._symbol_libs = [lib_file]
+        return ops
+
+    def test_lib_symbols_injected_on_add_component(self, tmp_path: Path):
+        """Adding a component injects its symbol definition into lib_symbols."""
+        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        # lib_symbols should contain the renamed symbol
+        assert '(symbol "Device:R"' in content
+        # Sub-symbols should also be renamed
+        assert '(symbol "Device:R_0_1"' in content
+        assert '(symbol "Device:R_1_1"' in content
+        # The placed instance should still be there
+        assert '(lib_id "Device:R")' in content
+
+    def test_lib_symbols_not_duplicated(self, tmp_path: Path):
+        """Adding the same component twice should not duplicate the cache entry."""
+        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+        ops.add_component(sch_file, "Device:R", "R2", "4.7k", 100.0, 80.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        # Count occurrences of the top-level cached symbol
+        import re
+        matches = re.findall(r'\(symbol "Device:R"', content)
+        assert len(matches) == 1, f"Expected 1 lib_symbols entry, found {len(matches)}"
+
+    def test_lib_symbols_power_symbol(self, tmp_path: Path):
+        """Adding a power symbol injects its definition with (power) tag."""
+        ops = self._make_ops(tmp_path, MOCK_POWER_LIB, "power.kicad_sym")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        ops.add_power_symbol(sch_file, "GND", 100.0, 50.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        assert '(symbol "power:GND"' in content
+        assert '(symbol "power:GND_0_1"' in content
+        assert '(symbol "power:GND_1_1"' in content
+        assert "(power)" in content
+
+    def test_lib_symbols_missing_library_graceful(self, tmp_path: Path):
+        """When library is not found, component is still placed without crashing."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        ops = FileSchematicOps()
+        ops._symbol_libs = []  # No libraries at all
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        result = ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+
+        # Component should still be placed
+        assert result["reference"] == "R1"
+        content = sch_file.read_text(encoding="utf-8")
+        assert '(lib_id "Device:R")' in content
+        # No cached symbol since library wasn't found
+        assert '(symbol "Device:R"' not in content
+
+    def test_lib_symbols_section_created_if_missing(self, tmp_path: Path):
+        """Schematic without lib_symbols section gets one created."""
+        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC_NO_LIB_SYMBOLS, encoding="utf-8")
+
+        ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        assert "(lib_symbols" in content
+        assert '(symbol "Device:R"' in content
+        assert '(symbol "Device:R_0_1"' in content

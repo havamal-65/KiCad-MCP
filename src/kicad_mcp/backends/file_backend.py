@@ -520,6 +520,57 @@ class FileSchematicOps(SchematicOps):
             "rotation": new_rot,
         }
 
+    def update_component_property(
+        self, path: Path, reference: str,
+        property_name: str, property_value: str,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_symbol_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Symbol with reference '{reference}' not found in {path}")
+        start, end = location
+        block = content[start:end + 1]
+
+        # Try to find existing property with this name
+        escaped_name = re.escape(property_name)
+        prop_pattern = re.compile(
+            rf'(\(property\s+"{escaped_name}"\s+)"([^"]*)"'
+        )
+        match = prop_pattern.search(block)
+
+        if match:
+            # Replace the existing value
+            new_block = (
+                block[:match.start(2)]
+                + property_value
+                + block[match.end(2):]
+            )
+        else:
+            # Append a new property before the closing paren of the symbol block.
+            # Find the symbol's position to place the property label nearby.
+            at_match = re.search(
+                r'\(at\s+([-\d.]+)\s+([-\d.]+)', block
+            )
+            px = float(at_match.group(1)) if at_match else 0
+            py = float(at_match.group(2)) + 6 if at_match else 0
+
+            new_prop = (
+                f'    (property "{property_name}" "{property_value}" (at {px} {py} 0)\n'
+                f'      (effects (font (size 1.27 1.27)) hide)\n'
+                f'    )\n  '
+            )
+            # Insert before the final closing paren of the block
+            new_block = block[:-1].rstrip() + "\n" + new_prop + ")"
+
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "property": property_name,
+            "value": property_value,
+        }
+
     def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
         content = path.read_text(encoding="utf-8")
         location = find_symbol_block_by_reference(content, reference)

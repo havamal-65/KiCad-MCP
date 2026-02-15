@@ -42,13 +42,11 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Enhancement Needed**: `sync_schematic_to_pcb` tool or at minimum a `compare_schematic_pcb` diagnostic tool.
 
-### 7. No Way to Delete or Modify Placed Components (PARTIALLY FIXED)
+### 7. No Way to Delete or Modify Placed Components (FIXED)
 
 **Problem**: When a component is placed incorrectly (wrong reference, wrong position, stale footprint), there's no tool to remove or update it. Can only add.
 
-**Fix Applied (partial)**: Added `remove_component` and `move_schematic_component` tools. Both use text-level S-expression block finding (via `find_symbol_block_by_reference()`) to locate the exact symbol instance while skipping the `lib_symbols` cache section. The move tool also shifts all property label positions by the same delta to keep them aligned.
-
-**Remaining**: `update_component_property` tool still needed.
+**Fix Applied**: Added `remove_component`, `move_schematic_component`, and `update_component_property` tools. All use text-level S-expression block finding (via `find_symbol_block_by_reference()`) to locate the exact symbol instance while skipping the `lib_symbols` cache section. The move tool shifts all property label positions by the same delta. The update tool can modify existing properties or append new ones (hidden by default).
 
 ### 8. Library Symbol Cache Management
 
@@ -91,7 +89,7 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 1 | `compare_schematic_pcb` | Planned | Detect ref mismatches, missing footprints, stale components between sch/pcb |
 | 2 | `remove_component` (schematic) | **DONE** | Can't fix mistakes without delete capability |
 | 3 | `move_schematic_component` (schematic) | **DONE** | Repositioning without delete+re-add |
-| 4 | `update_component_property` | Planned | Change footprint, value, or custom props on existing symbols |
+| 4 | `update_component_property` | **DONE** | Change footprint, value, or custom props on existing symbols |
 | 5 | Auto-populate `lib_symbols` cache | Planned | Components added via MCP should be renderable in KiCad immediately |
 
 ### P1 — Important for Practical Workflows

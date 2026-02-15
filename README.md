@@ -8,9 +8,9 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **47 MCP Tools** across 7 categories:
+- **48 MCP Tools** across 7 categories:
   - 📋 **Project Management** (5 tools): Create, validate, and manage KiCad projects
-  - 📐 **Schematic Operations** (12 tools): Read, modify, and analyze schematics with pin position queries, no-connects, junctions, power symbols, component removal, and repositioning
+  - 📐 **Schematic Operations** (13 tools): Read, modify, and analyze schematics with pin position queries, no-connects, junctions, power symbols, component removal, repositioning, and property editing
   - 🔌 **PCB Board Operations** (8 tools): Work with PCB layouts, components, tracks, and nets
   - 📚 **Library Search** (5 tools): Query and inspect component/footprint libraries
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
@@ -198,7 +198,7 @@ Add to your Cursor MCP settings:
 - `get_project_metadata`: Get project information
 - `update_project_metadata`: Update project settings
 
-### Schematic Operations (12 tools)
+### Schematic Operations (13 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
 - `add_component`: Place symbols with rotation, mirror, footprint, and custom properties
 - `add_wire`: Draw wire connections
@@ -209,6 +209,7 @@ Add to your Cursor MCP settings:
 - `add_junction`: Add junction dots at wire intersections
 - `remove_component`: Remove a placed component by reference designator
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
+- `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 

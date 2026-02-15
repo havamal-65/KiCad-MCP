@@ -145,6 +145,143 @@ def _parse_tokens(tokens: list[str], pos: int) -> tuple[Any, int]:
     return token, pos + 1
 
 
+def _walk_balanced_parens(content: str, start: int) -> int | None:
+    """Walk forward from an opening paren to find the matching close paren.
+
+    Handles quoted strings (including escaped quotes) correctly.
+
+    Args:
+        content: Full text.
+        start: Index of the opening ``(`` character.
+
+    Returns:
+        Index of the matching ``)`` (inclusive), or ``None`` if unbalanced.
+    """
+    depth = 0
+    i = start
+    while i < len(content):
+        ch = content[i]
+        if ch == '"':
+            # Skip quoted strings (handle escaped quotes)
+            i += 1
+            while i < len(content):
+                if content[i] == '\\' and i + 1 < len(content):
+                    i += 2
+                    continue
+                if content[i] == '"':
+                    break
+                i += 1
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def find_symbol_block_by_reference(content: str, reference: str) -> tuple[int, int] | None:
+    """Locate a schematic symbol instance block by its Reference property.
+
+    Schematic symbol instances look like::
+
+        (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)
+          ...
+          (property "Reference" "R1" (at 100 48 0) ...)
+          ...
+        )
+
+    This function scans for every ``(symbol `` occurrence, extracts the full
+    balanced block, and checks whether the block contains a
+    ``(property "Reference" "<reference>" ...)`` child.
+
+    The ``(lib_symbols ...)`` section is skipped since it contains library
+    definitions, not placed instances.
+
+    Args:
+        content: Full schematic file text.
+        reference: The reference designator to find (e.g. ``"R1"``).
+
+    Returns:
+        ``(start_index, end_index)`` of the block in the text (end is
+        inclusive of the closing ``)``) , or ``None`` if not found.
+    """
+    escaped_ref = re.escape(reference)
+    ref_pattern = re.compile(
+        rf'\(property\s+"Reference"\s+"{escaped_ref}"'
+    )
+
+    # Find the lib_symbols section so we can skip it
+    lib_symbols_start = content.find("(lib_symbols")
+    lib_symbols_end = -1
+    if lib_symbols_start != -1:
+        end = _walk_balanced_parens(content, lib_symbols_start)
+        if end is not None:
+            lib_symbols_end = end
+
+    # Scan for all (symbol occurrences
+    search_start = 0
+    while True:
+        idx = content.find("(symbol ", search_start)
+        if idx == -1:
+            break
+
+        # Skip if inside lib_symbols section
+        if lib_symbols_start != -1 and lib_symbols_start <= idx <= lib_symbols_end:
+            search_start = lib_symbols_end + 1
+            continue
+
+        # Walk balanced parens to find the full block
+        end = _walk_balanced_parens(content, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+
+        block_text = content[idx:end + 1]
+
+        # Check if this block has the matching Reference property
+        if ref_pattern.search(block_text):
+            return (idx, end)
+
+        search_start = end + 1
+
+    return None
+
+
+def remove_sexp_block(content: str, start: int, end: int) -> str:
+    """Remove an S-expression block from file content and clean up whitespace.
+
+    Removes the text from ``start`` to ``end`` (inclusive) and collapses any
+    resulting blank lines down to a single newline.
+
+    Args:
+        content: Full file text.
+        start: Start index of the block to remove.
+        end: End index of the block (inclusive).
+
+    Returns:
+        The modified file content with the block removed.
+    """
+    before = content[:start]
+    after = content[end + 1:]
+
+    # Remove the blank/whitespace-only line(s) left behind by the removal.
+    # Trim trailing whitespace from the part before the block.
+    before = before.rstrip(" \t\n")
+    # Trim leading whitespace/newlines from the part after the block.
+    after = after.lstrip(" \t\n")
+
+    # Rejoin with exactly two newlines (one blank line separator) if both
+    # sides have content, otherwise just a newline.
+    if before and after:
+        return before + "\n\n" + after
+    elif before:
+        return before + "\n"
+    else:
+        return after
+
+
 def extract_sexp_block(content: str, tag: str, name: str) -> str | None:
     """Extract a complete S-expression block from raw text by tag and name.
 
@@ -170,27 +307,7 @@ def extract_sexp_block(content: str, tag: str, name: str) -> str | None:
         return None
 
     start = match.start()
-    # Walk forward matching balanced parentheses
-    depth = 0
-    i = start
-    while i < len(content):
-        ch = content[i]
-        if ch == '"':
-            # Skip quoted strings (handle escaped quotes)
-            i += 1
-            while i < len(content):
-                if content[i] == '\\' and i + 1 < len(content):
-                    i += 2
-                    continue
-                if content[i] == '"':
-                    break
-                i += 1
-        elif ch == '(':
-            depth += 1
-        elif ch == ')':
-            depth -= 1
-            if depth == 0:
-                return content[start:i + 1]
-        i += 1
-
-    return None
+    end = _walk_balanced_parens(content, start)
+    if end is None:
+        return None
+    return content[start:end + 1]

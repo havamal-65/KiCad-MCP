@@ -123,11 +123,25 @@ class MockSchematicOps(SchematicOps):
             {"reference": "U1", "value": "ATtiny85", "lib_id": "MCU:ATtiny85"},
         ]
 
-    def add_component(self, path, lib_id, reference, value, x, y):
-        return {"reference": reference, "value": value, "lib_id": lib_id}
+    def add_component(self, path, lib_id, reference, value, x, y,
+                      rotation=0.0, mirror=None, footprint="", properties=None):
+        result = {"reference": reference, "value": value, "lib_id": lib_id,
+                  "position": {"x": x, "y": y}, "rotation": rotation}
+        if footprint:
+            result["footprint"] = footprint
+        if mirror:
+            result["mirror"] = mirror
+        return result
 
     def add_wire(self, path, start_x, start_y, end_x, end_y):
         return {"start": {"x": start_x, "y": start_y}, "end": {"x": end_x, "y": end_y}}
+
+    def remove_component(self, path, reference):
+        return {"reference": reference, "removed": True}
+
+    def move_component(self, path, reference, x, y, rotation=None):
+        return {"reference": reference, "position": {"x": x, "y": y},
+                "rotation": rotation if rotation is not None else 0.0}
 
     def add_label(self, path, text, x, y, label_type="net_label"):
         return {"text": text, "position": {"x": x, "y": y}}

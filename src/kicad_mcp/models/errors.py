@@ -65,3 +65,15 @@ class DRCError(KiCadMCPError):
 
 class LibraryError(KiCadMCPError):
     """Error accessing component libraries."""
+
+
+class LibraryManageError(KiCadMCPError):
+    """Error during library management operations."""
+
+
+class GitOperationError(LibraryManageError):
+    """Error executing a git operation (clone, pull, etc.)."""
+
+
+class LibraryImportError(LibraryManageError):
+    """Error importing a symbol or footprint between libraries."""

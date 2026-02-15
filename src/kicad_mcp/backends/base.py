@@ -22,6 +22,7 @@ class BackendCapability(Enum):
     EXPORT_BOM = auto()
     EXPORT_PICK_AND_PLACE = auto()
     LIBRARY_SEARCH = auto()
+    LIBRARY_MANAGE = auto()
     NETLIST_GENERATE = auto()
     REAL_TIME_SYNC = auto()
 
@@ -201,6 +202,59 @@ class LibraryOps(ABC):
         raise NotImplementedError("This backend does not support footprint info")
 
 
+class LibraryManageOps(ABC):
+    """Abstract interface for library management (write) operations."""
+
+    @abstractmethod
+    def clone_library_repo(
+        self, url: str, name: str, target_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Clone an external KiCad library repository."""
+
+    @abstractmethod
+    def register_library_source(self, path: str, name: str) -> dict[str, Any]:
+        """Register a local directory as a searchable library source."""
+
+    @abstractmethod
+    def list_library_sources(self) -> list[dict[str, Any]]:
+        """List all registered library sources."""
+
+    @abstractmethod
+    def unregister_library_source(self, name: str) -> dict[str, Any]:
+        """Remove a library source registration (keeps files on disk)."""
+
+    @abstractmethod
+    def search_library_sources(
+        self, query: str, source_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Search for symbols and footprints across registered library sources."""
+
+    @abstractmethod
+    def create_project_library(
+        self, project_path: str, library_name: str, lib_type: str = "both",
+    ) -> dict[str, Any]:
+        """Create an empty project-local library (.kicad_sym and/or .pretty)."""
+
+    @abstractmethod
+    def import_symbol(
+        self, source_lib: str, symbol_name: str, target_lib_path: str,
+    ) -> dict[str, Any]:
+        """Copy a symbol definition from a source .kicad_sym to a target .kicad_sym."""
+
+    @abstractmethod
+    def import_footprint(
+        self, source_lib: str, footprint_name: str, target_lib_path: str,
+    ) -> dict[str, Any]:
+        """Copy a .kicad_mod file from a source .pretty dir to a target .pretty dir."""
+
+    @abstractmethod
+    def register_project_library(
+        self, project_path: str, library_name: str,
+        library_path: str, lib_type: str,
+    ) -> dict[str, Any]:
+        """Add an entry to a project's sym-lib-table or fp-lib-table."""
+
+
 class KiCadBackend(ABC):
     """Base class for all KiCad backends."""
 
@@ -240,4 +294,8 @@ class KiCadBackend(ABC):
 
     def get_library_ops(self) -> LibraryOps | None:
         """Get library operations handler, or None if not supported."""
+        return None
+
+    def get_library_manage_ops(self) -> LibraryManageOps | None:
+        """Get library management (write) operations handler, or None if not supported."""
         return None

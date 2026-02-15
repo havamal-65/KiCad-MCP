@@ -1,4 +1,4 @@
-"""Schematic tools - 7 tools."""
+"""Schematic tools - 12 tools."""
 
 from __future__ import annotations
 
@@ -294,6 +294,80 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         change_log.record(
             "add_power_symbol",
             {"path": path, "name": name, "x": x, "y": y, "rotation": rotation},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def remove_component(path: str, reference: str) -> str:
+        """Remove a component symbol from the schematic by reference designator.
+
+        Completely removes the symbol instance block (e.g. the placed R1 resistor)
+        from the schematic file. This does NOT remove associated wires or labels.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the component to remove (e.g. 'R1', 'U3').
+
+        Returns:
+            JSON confirming removal.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.remove_component(p, reference)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "remove_component",
+            {"path": path, "reference": reference},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def move_schematic_component(
+        path: str,
+        reference: str,
+        x: float,
+        y: float,
+        rotation: float | None = None,
+    ) -> str:
+        """Move a schematic component to a new position.
+
+        Updates the symbol's placement coordinates and shifts all property
+        label positions by the same delta so they stay aligned. Optionally
+        updates the rotation.
+
+        Note: This is for schematic symbols. Use move_component for PCB footprints.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the component to move (e.g. 'R1', 'U3').
+            x: New X position in schematic units (mm).
+            y: New Y position in schematic units (mm).
+            rotation: New rotation in degrees (0, 90, 180, 270). Leave None to keep current.
+
+        Returns:
+            JSON with new position and rotation.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.move_component(p, reference, x, y, rotation=rotation)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "move_schematic_component",
+            {"path": path, "reference": reference, "x": x, "y": y, "rotation": rotation},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )

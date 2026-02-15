@@ -20,7 +20,12 @@ from kicad_mcp.backends.base import (
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.models.errors import GitOperationError, LibraryImportError, LibraryManageError
 from kicad_mcp.utils.library_sources import LibrarySourceRegistry
-from kicad_mcp.utils.sexp_parser import extract_sexp_block, parse_sexp_file
+from kicad_mcp.utils.sexp_parser import (
+    extract_sexp_block,
+    find_symbol_block_by_reference,
+    parse_sexp_file,
+    remove_sexp_block,
+)
 
 logger = get_logger("backend.file")
 
@@ -463,6 +468,67 @@ class FileSchematicOps(SchematicOps):
             "position": {"x": x, "y": y},
             "uuid": jn_uuid,
         }
+
+    def move_component(
+        self, path: Path, reference: str, x: float, y: float,
+        rotation: float | None = None,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_symbol_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Symbol with reference '{reference}' not found in {path}")
+        start, end = location
+        block = content[start:end + 1]
+
+        # Parse the symbol-level (at old_x old_y old_rot) — first occurrence
+        at_match = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)', block)
+        if at_match is None:
+            raise ValueError(f"Symbol '{reference}' has no (at ...) clause")
+
+        old_x = float(at_match.group(1))
+        old_y = float(at_match.group(2))
+        old_rot = float(at_match.group(3)) if at_match.group(3) else 0.0
+        new_rot = rotation if rotation is not None else old_rot
+
+        dx = x - old_x
+        dy = y - old_y
+
+        # Replace the symbol-level (at ...) with new values
+        new_at = f"(at {x} {y} {new_rot})"
+        new_block = block[:at_match.start()] + new_at + block[at_match.end():]
+
+        # Shift all property (at ...) positions by the same delta.
+        # Properties look like: (property "Name" "Value" (at px py angle) ...)
+        # We need to update each one. Process from end to start to preserve indices.
+        prop_at_pattern = re.compile(
+            r'(\(property\s+"[^"]*"\s+"[^"]*"\s+)\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)'
+        )
+        matches = list(prop_at_pattern.finditer(new_block))
+        for m in reversed(matches):
+            px = float(m.group(2)) + dx
+            py = float(m.group(3)) + dy
+            p_rot = m.group(4) if m.group(4) else "0"
+            replacement = f"{m.group(1)}(at {px} {py} {p_rot})"
+            new_block = new_block[:m.start()] + replacement + new_block[m.end():]
+
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "position": {"x": x, "y": y},
+            "rotation": new_rot,
+        }
+
+    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_symbol_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Symbol with reference '{reference}' not found in {path}")
+        start, end = location
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {"reference": reference, "removed": True}
 
     def get_symbol_pin_positions(
         self, path: Path, reference: str,

@@ -145,6 +145,17 @@ class SchematicOps(ABC):
         """Add a junction dot at the given position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+        """Remove a placed component symbol from the schematic by reference designator."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def move_component(
+        self, path: Path, reference: str, x: float, y: float,
+        rotation: float | None = None,
+    ) -> dict[str, Any]:
+        """Move a schematic symbol to a new position, optionally updating rotation."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
     def annotate(self, path: Path) -> dict[str, Any]:
         """Auto-annotate component references."""
         raise NotImplementedError("This backend does not support annotation")

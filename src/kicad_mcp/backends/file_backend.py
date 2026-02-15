@@ -267,6 +267,108 @@ class FileSchematicOps(SchematicOps):
         result = self.read_schematic(path)
         return result.get("symbols", [])
 
+    def _resolve_symbol_libs(self) -> list[Path]:
+        """Lazily resolve system symbol library paths (avoids scanning at construction)."""
+        if not hasattr(self, '_symbol_libs'):
+            from kicad_mcp.utils.kicad_paths import find_symbol_libraries
+            self._symbol_libs = find_symbol_libraries()
+        return self._symbol_libs
+
+    def _ensure_lib_symbol_cached(self, content: str, lib_id: str) -> str:
+        """Inject a symbol definition into the schematic's lib_symbols section if missing.
+
+        Resolves the library file from system paths, extracts the symbol definition,
+        renames it from plain name to full lib_id (e.g. "R" -> "Device:R"), and
+        inserts it into the lib_symbols section.
+
+        Returns the (possibly modified) schematic content.
+        """
+        # Split lib_id into library name and symbol name
+        parts = lib_id.split(":", 1)
+        if len(parts) != 2:
+            logger.warning("Invalid lib_id format for lib_symbols cache: %s", lib_id)
+            return content
+
+        lib_name, sym_name = parts
+
+        # Find the lib_symbols section
+        lib_sym_start = content.find("(lib_symbols")
+        if lib_sym_start == -1:
+            # No lib_symbols section — create one before the first (symbol instance
+            first_sym = content.find("(symbol ")
+            if first_sym == -1:
+                # No symbols at all yet, insert before closing paren
+                last_paren = content.rfind(")")
+                if last_paren >= 0:
+                    content = content[:last_paren] + "  (lib_symbols\n  )\n" + content[last_paren:]
+                else:
+                    return content
+            else:
+                content = content[:first_sym] + "(lib_symbols\n  )\n  " + content[first_sym:]
+            lib_sym_start = content.find("(lib_symbols")
+
+        # Walk balanced parens to find the end of lib_symbols section
+        from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+        lib_sym_end = _walk_balanced_parens(content, lib_sym_start)
+        if lib_sym_end is None:
+            logger.warning("Unbalanced lib_symbols section in schematic")
+            return content
+
+        lib_sym_section = content[lib_sym_start:lib_sym_end + 1]
+
+        # Check if symbol is already cached
+        escaped_lib_id = re.escape(lib_id)
+        if re.search(rf'\(symbol\s+"{escaped_lib_id}"', lib_sym_section):
+            return content
+
+        # Find the library file
+        lib_path = None
+        for p in self._resolve_symbol_libs():
+            if p.stem == lib_name:
+                lib_path = p
+                break
+
+        if lib_path is None:
+            logger.warning("Library file not found for '%s', skipping lib_symbols cache", lib_name)
+            return content
+
+        # Extract the symbol definition from the library file
+        try:
+            lib_content = lib_path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Cannot read library file: %s", lib_path)
+            return content
+
+        block = extract_sexp_block(lib_content, "symbol", sym_name)
+        if block is None:
+            logger.warning("Symbol '%s' not found in library %s", sym_name, lib_path)
+            return content
+
+        # Rename: replace the top-level symbol name and all sub-symbol references
+        # Top-level: (symbol "R" -> (symbol "Device:R"
+        escaped_sym = re.escape(sym_name)
+        block = re.sub(
+            rf'\(symbol\s+"{escaped_sym}"',
+            f'(symbol "{lib_id}"',
+            block,
+            count=1,
+        )
+        # Sub-symbols: (symbol "R_0_1" -> (symbol "Device:R_0_1"
+        block = re.sub(
+            rf'\(symbol\s+"{escaped_sym}_',
+            f'(symbol "{lib_id}_',
+            block,
+        )
+
+        # Insert the block before the closing ) of lib_symbols
+        indent_block = "    " + block.replace("\n", "\n    ")
+        new_content = (
+            content[:lib_sym_end]
+            + "\n" + indent_block + "\n  "
+            + content[lib_sym_end:]
+        )
+        return new_content
+
     def add_component(
         self, path: Path, lib_id: str, reference: str, value: str,
         x: float, y: float, rotation: float = 0.0,
@@ -319,6 +421,7 @@ class FileSchematicOps(SchematicOps):
         )
 
         content = path.read_text(encoding="utf-8")
+        content = self._ensure_lib_symbol_cached(content, lib_id)
         last_paren = content.rfind(")")
         if last_paren >= 0:
             content = content[:last_paren] + sym_sexp + content[last_paren:]
@@ -422,6 +525,7 @@ class FileSchematicOps(SchematicOps):
         pwr_ref = f"#PWR{next_num:03d}"
 
         lib_id = f"power:{name}"
+        content = self._ensure_lib_symbol_cached(content, lib_id)
 
         sym_sexp = (
             f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation})\n'

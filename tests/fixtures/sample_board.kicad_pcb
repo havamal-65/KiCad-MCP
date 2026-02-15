@@ -1,0 +1,65 @@
+(kicad_pcb (version 20230121) (generator "test")
+
+  (general
+    (thickness 1.6)
+  )
+
+  (paper "A4")
+
+  (title_block
+    (title "Sample Board")
+    (rev "1.0")
+    (date "2025-01-01")
+  )
+
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (32 "B.Adhes" user "B.Adhesive")
+    (33 "F.Adhes" user "F.Adhesive")
+    (34 "B.Paste" user)
+    (35 "F.Paste" user)
+    (36 "B.SilkS" user "B.Silkscreen")
+    (37 "F.SilkS" user "F.Silkscreen")
+    (38 "B.Mask" user)
+    (39 "F.Mask" user)
+    (44 "Edge.Cuts" user)
+  )
+
+  (net 0 "")
+  (net 1 "VCC")
+  (net 2 "GND")
+  (net 3 "SDA")
+  (net 4 "SCL")
+
+  (footprint "Resistor_SMD:R_0805_2012Metric" (layer "F.Cu")
+    (at 100 50)
+    (property "Reference" "R1")
+    (property "Value" "10k")
+    (pad "1" smd roundrect (at -0.9125 0) (size 1 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "VCC"))
+    (pad "2" smd roundrect (at 0.9125 0) (size 1 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (net 3 "SDA"))
+  )
+
+  (footprint "Resistor_SMD:R_0805_2012Metric" (layer "F.Cu")
+    (at 100 60)
+    (property "Reference" "R2")
+    (property "Value" "4.7k")
+    (pad "1" smd roundrect (at -0.9125 0) (size 1 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "VCC"))
+    (pad "2" smd roundrect (at 0.9125 0) (size 1 1.45) (layers "F.Cu" "F.Paste" "F.Mask") (net 4 "SCL"))
+  )
+
+  (footprint "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" (layer "F.Cu")
+    (at 120 55)
+    (property "Reference" "U1")
+    (property "Value" "ATtiny85")
+    (pad "1" smd roundrect (at -2.7 -1.905) (size 1.5 0.6) (layers "F.Cu" "F.Paste" "F.Mask") (net 1 "VCC"))
+    (pad "2" smd roundrect (at -2.7 -0.635) (size 1.5 0.6) (layers "F.Cu" "F.Paste" "F.Mask") (net 3 "SDA"))
+    (pad "3" smd roundrect (at -2.7 0.635) (size 1.5 0.6) (layers "F.Cu" "F.Paste" "F.Mask") (net 4 "SCL"))
+    (pad "4" smd roundrect (at -2.7 1.905) (size 1.5 0.6) (layers "F.Cu" "F.Paste" "F.Mask") (net 2 "GND"))
+  )
+
+  (segment (start 100 50) (end 110 50) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 110 50) (end 120 55) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 100 60) (end 110 60) (width 0.25) (layer "F.Cu") (net 4))
+
+)

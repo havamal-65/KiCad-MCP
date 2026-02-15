@@ -143,6 +143,9 @@ class MockSchematicOps(SchematicOps):
         return {"reference": reference, "position": {"x": x, "y": y},
                 "rotation": rotation if rotation is not None else 0.0}
 
+    def update_component_property(self, path, reference, property_name, property_value):
+        return {"reference": reference, "property": property_name, "value": property_value}
+
     def add_label(self, path, text, x, y, label_type="net_label"):
         return {"text": text, "position": {"x": x, "y": y}}
 

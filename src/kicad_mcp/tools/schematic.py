@@ -1,4 +1,4 @@
-"""Schematic tools - 12 tools."""
+"""Schematic tools - 13 tools."""
 
 from __future__ import annotations
 
@@ -368,6 +368,45 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         change_log.record(
             "move_schematic_component",
             {"path": path, "reference": reference, "x": x, "y": y, "rotation": rotation},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def update_component_property(
+        path: str,
+        reference: str,
+        property_name: str,
+        property_value: str,
+    ) -> str:
+        """Update or add a property on a placed schematic component.
+
+        Can modify Value, Footprint, Datasheet, MPN, or any custom property.
+        If the property does not exist on the component, it will be added (hidden by default).
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the component (e.g. 'R1', 'U3').
+            property_name: Property name (e.g. 'Value', 'Footprint', 'Datasheet', 'MPN').
+            property_value: New value for the property.
+
+        Returns:
+            JSON confirming the update.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.update_component_property(p, reference, property_name, property_value)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "update_component_property",
+            {"path": path, "reference": reference,
+             "property": property_name, "value": property_value},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )

@@ -319,3 +319,144 @@ class TestMoveComponent:
         assert "(at 200 80 0)" in modified
         assert "(at 200 78 0)" in modified
         assert "(at 200 82 0)" in modified
+
+
+PROP_TEST_SCHEMATIC = (
+    '(kicad_sch (version 20230121) (generator "test")\n'
+    '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+    '  (lib_symbols)\n'
+    '  (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)\n'
+    '    (uuid "11111111-1111-1111-1111-111111111111")\n'
+    '    (property "Reference" "R1" (at 100 48 0)\n'
+    '      (effects (font (size 1.27 1.27)))\n'
+    '    )\n'
+    '    (property "Value" "10k" (at 100 52 0)\n'
+    '      (effects (font (size 1.27 1.27)))\n'
+    '    )\n'
+    '    (property "Footprint" "Resistor_SMD:R_0805" (at 100 54 0)\n'
+    '      (effects (font (size 1.27 1.27)) hide)\n'
+    '    )\n'
+    '  )\n'
+    ')\n'
+)
+
+
+class TestUpdateComponentProperty:
+    def test_update_via_mock(self, mcp_sch: FastMCP, sample_schematic_path: Path):
+        """Test update_component_property tool via mock backend."""
+        result_json = mcp_sch._tool_manager._tools["update_component_property"].fn(
+            path=str(sample_schematic_path),
+            reference="R1",
+            property_name="Value",
+            property_value="22k",
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["reference"] == "R1"
+        assert result["property"] == "Value"
+        assert result["value"] == "22k"
+
+    def test_update_existing_value(self, tmp_path: Path):
+        """Test updating an existing property value."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(PROP_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        result = ops.update_component_property(sch_file, "R1", "Value", "22k")
+        assert result["value"] == "22k"
+
+        modified = sch_file.read_text(encoding="utf-8")
+        assert '"22k"' in modified
+        assert '"10k"' not in modified
+        # Other properties untouched
+        assert '"R1"' in modified
+        assert '"Resistor_SMD:R_0805"' in modified
+
+    def test_update_footprint(self, tmp_path: Path):
+        """Test updating the Footprint property."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(PROP_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        ops.update_component_property(sch_file, "R1", "Footprint", "Resistor_SMD:R_0402")
+
+        modified = sch_file.read_text(encoding="utf-8")
+        assert '"Resistor_SMD:R_0402"' in modified
+        assert '"Resistor_SMD:R_0805"' not in modified
+
+    def test_add_new_property(self, tmp_path: Path):
+        """Test adding a property that doesn't exist yet."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(PROP_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        result = ops.update_component_property(sch_file, "R1", "MPN", "RC0805FR-0710KL")
+        assert result["property"] == "MPN"
+
+        modified = sch_file.read_text(encoding="utf-8")
+        assert '"MPN"' in modified
+        assert '"RC0805FR-0710KL"' in modified
+        # File should still be valid sexp
+        assert modified.strip().startswith("(")
+        assert modified.strip().endswith(")")
+
+    def test_update_not_found(self, tmp_path: Path):
+        """Test updating a property on a non-existent component."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(PROP_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        with pytest.raises(ValueError, match="not found"):
+            ops.update_component_property(sch_file, "C99", "Value", "100nF")
+
+    def test_update_preserves_other_symbols(self, tmp_path: Path):
+        """Test that updating one symbol's property doesn't affect others."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        content = (
+            '(kicad_sch (version 20230121) (generator "test")\n'
+            '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+            '  (lib_symbols)\n'
+            '  (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)\n'
+            '    (uuid "11111111-1111-1111-1111-111111111111")\n'
+            '    (property "Reference" "R1" (at 100 48 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 100 52 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '  )\n'
+            '  (symbol (lib_id "Device:R") (at 200 80 0) (unit 1)\n'
+            '    (uuid "22222222-2222-2222-2222-222222222222")\n'
+            '    (property "Reference" "R2" (at 200 78 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 200 82 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '  )\n'
+            ')\n'
+        )
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(content, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        ops.update_component_property(sch_file, "R1", "Value", "47k")
+
+        modified = sch_file.read_text(encoding="utf-8")
+        # R1 should have 47k
+        assert '"47k"' in modified
+        # R2 should still have 10k — find it within R2's block
+        from kicad_mcp.utils.sexp_parser import find_symbol_block_by_reference
+        loc = find_symbol_block_by_reference(modified, "R2")
+        assert loc is not None
+        r2_block = modified[loc[0]:loc[1] + 1]
+        assert '"10k"' in r2_block

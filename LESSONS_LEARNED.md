@@ -28,19 +28,19 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: Enriched `read_schematic` to return no_connects, junctions, is_power, footprint (Change 5).
 
-### 5. Reference Designator Sync Between Schematic and PCB Is Error-Prone
+### 5. Reference Designator Sync Between Schematic and PCB Is Error-Prone (FIXED)
 
 **Problem**: Found duplicate U5 references in the PCB — an old pin header footprint and the correct TP4056 charger both had the same designator. This caused KiCad to prompt for 3 items to place on PCB editor entry. Root cause: manual edits or partial "Update PCB from Schematic" runs leaving stale footprints.
 
 **Impact**: Confusing PCB editor behavior, potential for wrong netlist connections.
 
-**Enhancement Needed**: A tool to detect reference designator mismatches between schematic and PCB, and a tool to run "Update PCB from Schematic" programmatically.
+**Fix Applied**: Added `compare_schematic_pcb` tool that detects missing components, footprint mismatches, and value mismatches between schematic and PCB. Power symbols (references starting with `#`) are automatically excluded. Reports missing_from_pcb, missing_from_schematic, footprint_mismatches, and value_mismatches with a summary count.
 
-### 6. No Schematic-to-PCB Sync Tool
+### 6. No Schematic-to-PCB Sync Tool (PARTIALLY FIXED)
 
 **Problem**: After modifying the schematic, there's no MCP tool to sync changes to the PCB. Users must open KiCad GUI and run "Update PCB from Schematic" manually.
 
-**Enhancement Needed**: `sync_schematic_to_pcb` tool or at minimum a `compare_schematic_pcb` diagnostic tool.
+**Fix Applied (partial)**: `compare_schematic_pcb` provides the diagnostic side — detects what's out of sync. Full programmatic sync (`sync_schematic_to_pcb`) still requires kicad-cli or KiCad IPC backend.
 
 ### 7. No Way to Delete or Modify Placed Components (FIXED)
 
@@ -86,7 +86,7 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 | # | Enhancement | Status | Why |
 |---|------------|--------|-----|
-| 1 | `compare_schematic_pcb` | Planned | Detect ref mismatches, missing footprints, stale components between sch/pcb |
+| 1 | `compare_schematic_pcb` | **DONE** | Detect ref mismatches, missing footprints, stale components between sch/pcb |
 | 2 | `remove_component` (schematic) | **DONE** | Can't fix mistakes without delete capability |
 | 3 | `move_schematic_component` (schematic) | **DONE** | Repositioning without delete+re-add |
 | 4 | `update_component_property` | **DONE** | Change footprint, value, or custom props on existing symbols |

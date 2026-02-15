@@ -460,3 +460,115 @@ class TestUpdateComponentProperty:
         assert loc is not None
         r2_block = modified[loc[0]:loc[1] + 1]
         assert '"10k"' in r2_block
+
+
+class TestCompareSchematicPcb:
+    def test_compare_matching(self, mcp_sch: FastMCP, sample_schematic_path: Path,
+                              sample_board_path: Path):
+        """Test comparison when mock schematic and PCB have overlapping components."""
+        result_json = mcp_sch._tool_manager._tools["compare_schematic_pcb"].fn(
+            schematic_path=str(sample_schematic_path),
+            board_path=str(sample_board_path),
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert "summary" in result
+        assert "missing_from_pcb" in result
+        assert "missing_from_schematic" in result
+        assert "footprint_mismatches" in result
+        assert "value_mismatches" in result
+
+    def test_compare_detects_missing_from_pcb(self, mcp_sch: FastMCP,
+                                               sample_schematic_path: Path,
+                                               sample_board_path: Path):
+        """Mock schematic has R1, U1. Mock PCB has R1, R2, U1.
+        So schematic is missing R2 perspective: nothing missing from PCB
+        since the mock schematic only returns R1 and U1."""
+        result_json = mcp_sch._tool_manager._tools["compare_schematic_pcb"].fn(
+            schematic_path=str(sample_schematic_path),
+            board_path=str(sample_board_path),
+        )
+        result = json.loads(result_json)
+        summary = result["summary"]
+        # Mock schematic has R1, U1 (2 components)
+        # Mock PCB has R1, R2, U1 (3 components)
+        assert summary["schematic_components"] == 2
+        assert summary["pcb_components"] == 3
+        # R2 is in PCB but not in schematic
+        assert summary["missing_from_schematic"] == 1
+        assert result["missing_from_schematic"][0]["reference"] == "R2"
+
+    def test_compare_logic_directly(self):
+        """Test the comparison logic with controlled data by calling the tool
+        with a custom mock that has mismatches."""
+        from unittest.mock import MagicMock
+
+        # Build a minimal MCP + backend with controlled data
+        mcp = FastMCP("test")
+        mock_backend = MagicMock(spec=CompositeBackend)
+
+        sch_ops = MagicMock()
+        sch_ops.read_schematic.return_value = {
+            "symbols": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R", "footprint": "R_0805"},
+                {"reference": "R2", "value": "4.7k", "lib_id": "Device:R", "footprint": "R_0603"},
+                {"reference": "C1", "value": "100nF", "lib_id": "Device:C"},
+                {"reference": "#PWR01", "value": "GND", "lib_id": "power:GND", "is_power": True},
+            ],
+        }
+        pcb_ops = MagicMock()
+        pcb_ops.read_board.return_value = {
+            "components": [
+                {"reference": "R1", "value": "10k", "footprint": "R_0805"},
+                {"reference": "R2", "value": "4.7k", "footprint": "R_0805"},  # footprint mismatch
+                {"reference": "U1", "value": "ATmega", "footprint": "TQFP-44"},  # not in schematic
+            ],
+        }
+        mock_backend.get_schematic_ops.return_value = sch_ops
+        mock_backend.get_board_ops.return_value = pcb_ops
+
+        from kicad_mcp.utils.change_log import ChangeLog
+        change_log = ChangeLog(Path("/dev/null"))
+
+        from kicad_mcp.tools.schematic import register_tools
+        register_tools(mcp, mock_backend, change_log)
+
+        # Need valid file paths for validation — create temp files
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            sch = Path(td) / "test.kicad_sch"
+            pcb = Path(td) / "test.kicad_pcb"
+            sch.write_text("(kicad_sch)")
+            pcb.write_text("(kicad_pcb)")
+
+            result_json = mcp._tool_manager._tools["compare_schematic_pcb"].fn(
+                schematic_path=str(sch),
+                board_path=str(pcb),
+            )
+
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+
+        summary = result["summary"]
+        # Schematic: R1, R2, C1 (power symbol #PWR01 excluded) = 3
+        assert summary["schematic_components"] == 3
+        # PCB: R1, R2, U1 = 3
+        assert summary["pcb_components"] == 3
+
+        # C1 in schematic but not PCB
+        assert summary["missing_from_pcb"] == 1
+        assert result["missing_from_pcb"][0]["reference"] == "C1"
+
+        # U1 in PCB but not schematic
+        assert summary["missing_from_schematic"] == 1
+        assert result["missing_from_schematic"][0]["reference"] == "U1"
+
+        # R2 footprint mismatch: R_0603 (sch) vs R_0805 (pcb)
+        assert summary["footprint_mismatches"] == 1
+        fp_mm = result["footprint_mismatches"][0]
+        assert fp_mm["reference"] == "R2"
+        assert fp_mm["schematic_footprint"] == "R_0603"
+        assert fp_mm["pcb_footprint"] == "R_0805"
+
+        # R1 matches perfectly, R2 has mismatch => 1 matched
+        assert summary["matched"] == 1

@@ -137,6 +137,8 @@ class SchematicSymbol(BaseModel):
     lib_id: str = Field(default="", description="Library symbol identifier")
     position: Optional[Position] = None
     unit: int = Field(default=1, description="Symbol unit number")
+    footprint: str = Field(default="", description="Footprint library:name")
+    is_power: bool = Field(default=False, description="Whether this is a power symbol")
     properties: dict[str, str] = Field(default_factory=dict)
 
 
@@ -151,6 +153,14 @@ class SchematicLabel(BaseModel):
     label_type: str = Field(default="net_label", description="Label type: net_label, global_label, hierarchical_label")
 
 
+class SchematicNoConnect(BaseModel):
+    position: Position
+
+
+class SchematicJunction(BaseModel):
+    position: Position
+
+
 class SchematicInfo(BaseModel):
     file_path: str
     title: str = ""
@@ -160,6 +170,8 @@ class SchematicInfo(BaseModel):
     num_wires: int = 0
     num_labels: int = 0
     num_sheets: int = 0
+    num_no_connects: int = 0
+    num_junctions: int = 0
 
 
 class SchematicReadResult(BaseModel):
@@ -167,6 +179,8 @@ class SchematicReadResult(BaseModel):
     symbols: list[SchematicSymbol] = Field(default_factory=list)
     wires: list[SchematicWire] = Field(default_factory=list)
     labels: list[SchematicLabel] = Field(default_factory=list)
+    no_connects: list[SchematicNoConnect] = Field(default_factory=list)
+    junctions: list[SchematicJunction] = Field(default_factory=list)
 
 
 # --- Library Models ---

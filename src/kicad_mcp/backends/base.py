@@ -104,7 +104,9 @@ class SchematicOps(ABC):
 
     def add_component(
         self, path: Path, lib_id: str, reference: str, value: str,
-        x: float, y: float,
+        x: float, y: float, rotation: float = 0.0,
+        mirror: str | None = None, footprint: str = "",
+        properties: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Add a component symbol to the schematic."""
         raise NotImplementedError("This backend does not support schematic modification")
@@ -121,6 +123,26 @@ class SchematicOps(ABC):
         label_type: str = "net_label",
     ) -> dict[str, Any]:
         """Add a net label."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def get_symbol_pin_positions(
+        self, path: Path, reference: str,
+    ) -> dict[str, Any]:
+        """Get absolute schematic coordinates for each pin of a placed symbol."""
+        raise NotImplementedError("This backend does not support pin position queries")
+
+    def add_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        """Add a no-connect marker at the given position."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def add_power_symbol(
+        self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
+    ) -> dict[str, Any]:
+        """Add a power symbol (e.g. +3V3, GND) at the given position."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def add_junction(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        """Add a junction dot at the given position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
     def annotate(self, path: Path) -> dict[str, Any]:

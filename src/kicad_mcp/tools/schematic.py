@@ -42,6 +42,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         value: str,
         x: float,
         y: float,
+        rotation: float = 0.0,
+        mirror: str | None = None,
+        footprint: str = "",
+        properties: dict[str, str] | None = None,
     ) -> str:
         """Add a component symbol to the schematic.
 
@@ -52,6 +56,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             value: Component value (e.g. '10k', '100nF').
             x: X position in schematic units (mm).
             y: Y position in schematic units (mm).
+            rotation: Rotation in degrees (0, 90, 180, 270).
+            mirror: Mirror axis - 'x' or 'y', or None for no mirror.
+            footprint: Footprint lib_id (e.g. 'Resistor_SMD:R_0402_1005Metric').
+            properties: Additional properties dict (e.g. {'Datasheet': '...', 'MPN': '...'}).
 
         Returns:
             JSON with placed component details and UUID.
@@ -61,7 +69,11 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         backup = create_backup(p)
         ops = backend.get_schematic_ops()
-        result = ops.add_component(p, lib_id, reference, value, x, y)
+        result = ops.add_component(
+            p, lib_id, reference, value, x, y,
+            rotation=rotation, mirror=mirror,
+            footprint=footprint, properties=properties,
+        )
         change_log.record(
             "add_component",
             {"path": path, "lib_id": lib_id, "reference": reference, "value": value},
@@ -196,3 +208,121 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 "status": "info",
                 "message": "Netlist generation requires kicad-cli or KiCad IPC.",
             })
+
+    @mcp.tool()
+    def get_symbol_pin_positions(path: str, reference: str) -> str:
+        """Get absolute schematic coordinates for each pin of a placed symbol.
+
+        This is essential for knowing where to connect wires. It reads the symbol's
+        placement (position, rotation, mirror) and its library pin definitions,
+        then transforms each pin into absolute schematic coordinates.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the symbol (e.g. 'U1', 'R3').
+
+        Returns:
+            JSON with pin_positions mapping pin numbers to {x, y} coordinates.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        ops = backend.get_schematic_ops()
+        result = ops.get_symbol_pin_positions(p, reference)
+        change_log.record(
+            "get_symbol_pin_positions",
+            {"path": path, "reference": reference},
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_no_connect(path: str, x: float, y: float) -> str:
+        """Add a no-connect (X) marker to the schematic at the given position.
+
+        No-connect markers indicate that a pin is intentionally left unconnected.
+        Place them exactly on the pin endpoint.
+
+        Args:
+            path: Path to .kicad_sch file.
+            x: X position (should match pin endpoint).
+            y: Y position (should match pin endpoint).
+
+        Returns:
+            JSON with no-connect position and UUID.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        result = ops.add_no_connect(p, x, y)
+        change_log.record(
+            "add_no_connect",
+            {"path": path, "x": x, "y": y},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_power_symbol(
+        path: str,
+        name: str,
+        x: float,
+        y: float,
+        rotation: float = 0.0,
+    ) -> str:
+        """Add a power symbol (e.g. +3V3, GND, +5V) to the schematic.
+
+        Power symbols represent power nets. Common names: +3V3, +5V, GND, VCC, VDD.
+        The lib_id is automatically set to 'power:<name>'.
+
+        Args:
+            path: Path to .kicad_sch file.
+            name: Power net name (e.g. '+3V3', 'GND', '+5V', 'VCC').
+            x: X position.
+            y: Y position.
+            rotation: Rotation in degrees (e.g. 180 for GND symbols pointing down).
+
+        Returns:
+            JSON with power symbol details and UUID.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        result = ops.add_power_symbol(p, name, x, y, rotation)
+        change_log.record(
+            "add_power_symbol",
+            {"path": path, "name": name, "x": x, "y": y, "rotation": rotation},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_junction(path: str, x: float, y: float) -> str:
+        """Add a junction dot to the schematic at the given position.
+
+        Junctions indicate that crossing wires are electrically connected.
+        Place them at wire intersection points.
+
+        Args:
+            path: Path to .kicad_sch file.
+            x: X position (at wire intersection).
+            y: Y position (at wire intersection).
+
+        Returns:
+            JSON with junction position and UUID.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        result = ops.add_junction(p, x, y)
+        change_log.record(
+            "add_junction",
+            {"path": path, "x": x, "y": y},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)

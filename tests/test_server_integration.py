@@ -32,9 +32,9 @@ class TestServerCreation:
         config = KiCadMCPConfig(backend=BackendType.FILE, log_level="WARNING")
         mcp = create_server(config)
         tools = mcp._tool_manager._tools
-        # Should have 48 tools total (8+3+5+5+9+5+13)
-        # board(8) + drc(3) + export(5) + library(5) + library_manage(9) + project(5) + schematic(13)
-        assert len(tools) == 48
+        # Should have 49 tools total (8+3+5+5+9+5+14)
+        # board(8) + drc(3) + export(5) + library(5) + library_manage(9) + project(5) + schematic(14)
+        assert len(tools) == 49
 
     def test_server_auto_backend(self):
         """Server creates with auto-detection."""

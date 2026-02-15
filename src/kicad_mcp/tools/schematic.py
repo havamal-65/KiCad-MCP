@@ -1,4 +1,4 @@
-"""Schematic tools - 13 tools."""
+"""Schematic tools - 14 tools."""
 
 from __future__ import annotations
 
@@ -409,6 +409,128 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
              "property": property_name, "value": property_value},
             file_modified=path,
             backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def compare_schematic_pcb(schematic_path: str, board_path: str) -> str:
+        """Compare schematic and PCB to find mismatches.
+
+        Read-only diagnostic that detects reference designator mismatches,
+        missing components, footprint differences, and value differences
+        between a schematic and its associated PCB.
+
+        Power symbols (references starting with '#') are excluded from
+        the comparison since they don't appear in the PCB.
+
+        Args:
+            schematic_path: Path to .kicad_sch file.
+            board_path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON with comparison results: missing_from_pcb, missing_from_schematic,
+            footprint_mismatches, value_mismatches, and matched count.
+        """
+        sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
+        pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
+
+        sch_ops = backend.get_schematic_ops()
+        pcb_ops = backend.get_board_ops()
+
+        sch_data = sch_ops.read_schematic(sch_p)
+        pcb_data = pcb_ops.read_board(pcb_p)
+
+        # Build dicts keyed by reference, filtering out power symbols
+        sch_by_ref: dict[str, dict] = {}
+        for sym in sch_data.get("symbols", []):
+            ref = sym.get("reference", "")
+            if not ref or ref.startswith("#"):
+                continue
+            if sym.get("is_power"):
+                continue
+            sch_by_ref[ref] = sym
+
+        pcb_by_ref: dict[str, dict] = {}
+        for comp in pcb_data.get("components", []):
+            ref = comp.get("reference", "")
+            if ref:
+                pcb_by_ref[ref] = comp
+
+        all_refs = set(sch_by_ref) | set(pcb_by_ref)
+        missing_from_pcb = []
+        missing_from_schematic = []
+        footprint_mismatches = []
+        value_mismatches = []
+        matched = 0
+
+        for ref in sorted(all_refs):
+            in_sch = ref in sch_by_ref
+            in_pcb = ref in pcb_by_ref
+
+            if in_sch and not in_pcb:
+                missing_from_pcb.append({
+                    "reference": ref,
+                    "value": sch_by_ref[ref].get("value", ""),
+                    "lib_id": sch_by_ref[ref].get("lib_id", ""),
+                })
+                continue
+            if in_pcb and not in_sch:
+                missing_from_schematic.append({
+                    "reference": ref,
+                    "value": pcb_by_ref[ref].get("value", ""),
+                    "footprint": pcb_by_ref[ref].get("footprint", ""),
+                })
+                continue
+
+            # Both exist — compare
+            sch_sym = sch_by_ref[ref]
+            pcb_comp = pcb_by_ref[ref]
+            mismatch = False
+
+            sch_fp = sch_sym.get("footprint", "")
+            pcb_fp = pcb_comp.get("footprint", "")
+            if sch_fp and pcb_fp and sch_fp != pcb_fp:
+                footprint_mismatches.append({
+                    "reference": ref,
+                    "schematic_footprint": sch_fp,
+                    "pcb_footprint": pcb_fp,
+                })
+                mismatch = True
+
+            sch_val = sch_sym.get("value", "")
+            pcb_val = pcb_comp.get("value", "")
+            if sch_val and pcb_val and sch_val != pcb_val:
+                value_mismatches.append({
+                    "reference": ref,
+                    "schematic_value": sch_val,
+                    "pcb_value": pcb_val,
+                })
+                mismatch = True
+
+            if not mismatch:
+                matched += 1
+
+        result = {
+            "schematic": str(sch_p),
+            "board": str(pcb_p),
+            "summary": {
+                "schematic_components": len(sch_by_ref),
+                "pcb_components": len(pcb_by_ref),
+                "matched": matched,
+                "missing_from_pcb": len(missing_from_pcb),
+                "missing_from_schematic": len(missing_from_schematic),
+                "footprint_mismatches": len(footprint_mismatches),
+                "value_mismatches": len(value_mismatches),
+            },
+            "missing_from_pcb": missing_from_pcb,
+            "missing_from_schematic": missing_from_schematic,
+            "footprint_mismatches": footprint_mismatches,
+            "value_mismatches": value_mismatches,
+        }
+
+        change_log.record(
+            "compare_schematic_pcb",
+            {"schematic_path": schematic_path, "board_path": board_path},
         )
         return json.dumps({"status": "success", **result}, indent=2)
 

@@ -78,6 +78,22 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Enhancement Needed**: Ensure ERC/DRC tools work with file backend, or provide a validation tool that checks common issues (floating pins, missing connections).
 
+### 13. Generated Schematics Were Malformed for KiCad 8+ (FIXED)
+
+**Problem**: A user on Claude Desktop (sandboxed, no filesystem MCP) used the KiCad MCP to generate `.kicad_sch` files. KiCad refused to open them with `Expecting '(' in line 16, offset 3`. Root cause: `add_component` and `add_power_symbol` were emitting symbol instances without KiCad 8+ required fields — `(unit 1)`, `(in_bom yes)`, `(on_board yes)`, `(dnp no)`, and the `(instances ...)` block that maps symbol UUIDs to reference designators within sheet paths.
+
+**Impact**: Every schematic generated via MCP was broken in KiCad 8/9. Users had to hand-edit the raw s-expression to fix each symbol.
+
+**Fix Applied**: Both `add_component` and `add_power_symbol` now emit all required KiCad 8+ fields. A new `_find_schematic_uuid` helper reads the root schematic UUID so the `(instances (project "" (path "/UUID" ...)))` block is correctly populated. The sample fixture and all inline test schematics were updated to match.
+
+### 14. No Way to Create a Schematic from Scratch (FIXED)
+
+**Problem**: The MCP had tools to modify existing schematics (`add_component`, `add_wire`, etc.) but no way to create a new one. Users in sandboxed environments (e.g. Claude Desktop without filesystem MCP) had no way to produce a valid schematic file — they would need to manually write the s-expression boilerplate (`kicad_sch`, `version`, `generator`, `uuid`, `paper`, `lib_symbols`, `sheet_instances`) before any tools could operate on it.
+
+**Impact**: The MCP was useless for greenfield schematic design in sandboxed AI environments.
+
+**Fix Applied**: Added `create_schematic` tool that generates a minimal valid KiCad 8+ schematic with correct version, generator, UUID, paper size, empty `lib_symbols` section, and `sheet_instances`. Supports optional title block (title, revision). Guards against overwriting existing files.
+
 ---
 
 ## Enhancement Requirements (Prioritized)

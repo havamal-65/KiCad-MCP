@@ -163,6 +163,31 @@ class SchematicOps(ABC):
         """Update or add a property on a placed schematic symbol."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def remove_wire(
+        self, path: Path, start_x: float, start_y: float,
+        end_x: float, end_y: float,
+    ) -> dict[str, Any]:
+        """Remove a wire segment identified by its start/end coordinates."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def remove_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        """Remove a no-connect marker identified by its position."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def get_net_connections(self, path: Path, net_name: str) -> dict[str, Any]:
+        """Get all connections on a given net in the schematic."""
+        raise NotImplementedError("This backend does not support net connectivity queries")
+
+    def get_pin_net(self, path: Path, reference: str, pin_number: str) -> dict[str, Any]:
+        """Get the net name connected to a specific pin of a symbol."""
+        raise NotImplementedError("This backend does not support net connectivity queries")
+
+    def create_schematic(
+        self, path: Path, title: str = "", revision: str = "",
+    ) -> dict[str, Any]:
+        """Create a new, empty KiCad schematic file."""
+        raise NotImplementedError("This backend does not support schematic creation")
+
     def annotate(self, path: Path) -> dict[str, Any]:
         """Auto-annotate component references."""
         raise NotImplementedError("This backend does not support annotation")
@@ -240,6 +265,10 @@ class LibraryOps(ABC):
     def get_footprint_info(self, lib_id: str) -> dict[str, Any]:
         """Get detailed info about a footprint."""
         raise NotImplementedError("This backend does not support footprint info")
+
+    def suggest_footprints(self, lib_id: str) -> dict[str, Any]:
+        """Suggest matching footprints for a symbol based on its fp_filter patterns."""
+        raise NotImplementedError("This backend does not support footprint suggestions")
 
 
 class LibraryManageOps(ABC):

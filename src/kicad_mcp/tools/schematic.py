@@ -1,4 +1,4 @@
-"""Schematic tools - 14 tools."""
+"""Schematic tools - 16 tools."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
-from kicad_mcp.utils.validation import validate_kicad_path, validate_reference
+from kicad_mcp.utils.validation import validate_kicad_path, validate_reference, validate_writable_path
 
 logger = get_logger("tools.schematic")
 
@@ -32,6 +32,47 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         ops = backend.get_schematic_ops()
         result = ops.read_schematic(p)
         change_log.record("read_schematic", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def create_schematic(
+        path: str,
+        title: str = "",
+        revision: str = "",
+    ) -> str:
+        """Create a new, empty KiCad schematic file.
+
+        Generates a minimal valid KiCad 8+ schematic with proper structure
+        including version, generator, UUID, paper size, lib_symbols, and
+        sheet_instances. Components can then be added with add_component.
+
+        Args:
+            path: Path for the new .kicad_sch file. Parent directory must exist.
+            title: Optional schematic title for the title block.
+            revision: Optional revision string for the title block.
+
+        Returns:
+            JSON with created file path and UUID.
+        """
+        p = validate_writable_path(path, ".kicad_sch")
+        if p.exists():
+            return json.dumps({
+                "status": "error",
+                "message": f"File already exists: {p}. Use read_schematic to work with existing files.",
+            })
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.create_schematic(p, title=title, revision=revision)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Schematic creation not supported by current backend.",
+            })
+        change_log.record(
+            "create_schematic",
+            {"path": path, "title": title, "revision": revision},
+            file_modified=path,
+        )
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
@@ -331,6 +372,76 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def remove_wire(
+        path: str,
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+    ) -> str:
+        """Remove a wire segment from the schematic identified by its endpoints.
+
+        The wire is matched by comparing start/end coordinates within a small
+        tolerance (0.01 mm). Use read_schematic to find exact wire coordinates.
+
+        Args:
+            path: Path to .kicad_sch file.
+            start_x: Start X coordinate of the wire.
+            start_y: Start Y coordinate of the wire.
+            end_x: End X coordinate of the wire.
+            end_y: End Y coordinate of the wire.
+
+        Returns:
+            JSON confirming removal.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.remove_wire(p, start_x, start_y, end_x, end_y)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "remove_wire",
+            {"path": path, "start": [start_x, start_y], "end": [end_x, end_y]},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def remove_no_connect(path: str, x: float, y: float) -> str:
+        """Remove a no-connect (X) marker from the schematic at the given position.
+
+        The no-connect is matched by comparing its position within a small
+        tolerance (0.01 mm). Use read_schematic to find exact no-connect positions.
+
+        Args:
+            path: Path to .kicad_sch file.
+            x: X position of the no-connect marker.
+            y: Y position of the no-connect marker.
+
+        Returns:
+            JSON confirming removal.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.remove_no_connect(p, x, y)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "remove_no_connect",
+            {"path": path, "x": x, "y": y},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
     def move_schematic_component(
         path: str,
         reference: str,
@@ -533,6 +644,269 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             {"schematic_path": schematic_path, "board_path": board_path},
         )
         return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def get_pin_net(path: str, reference: str, pin_number: str) -> str:
+        """Get the net name connected to a specific pin of a placed symbol.
+
+        Uses schematic connectivity analysis (wires, labels, power symbols)
+        to determine which net a pin belongs to.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the symbol (e.g. 'R1', 'U1').
+            pin_number: Pin number as defined in the symbol library (e.g. '1', '2').
+
+        Returns:
+            JSON with reference, pin_number, net_name, and position.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.get_pin_net(p, reference, pin_number)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Net connectivity queries not supported by current backend.",
+            })
+        change_log.record(
+            "get_pin_net",
+            {"path": path, "reference": reference, "pin_number": pin_number},
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def get_net_connections(path: str, net_name: str) -> str:
+        """Get all connections on a named net in the schematic.
+
+        Returns every pin, label, and wire segment belonging to the given net,
+        determined by schematic connectivity analysis.
+
+        Args:
+            path: Path to .kicad_sch file.
+            net_name: The net name to query (e.g. 'VCC', 'GND', 'Net-(R1-1)').
+
+        Returns:
+            JSON with net_name, pins list, labels list, and wires list.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.get_net_connections(p, net_name)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Net connectivity queries not supported by current backend.",
+            })
+        change_log.record(
+            "get_net_connections",
+            {"path": path, "net_name": net_name},
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def sync_schematic_to_pcb(schematic_path: str, board_path: str) -> str:
+        """Synchronize schematic components to the PCB board.
+
+        Reads the schematic and PCB, compares them, and applies safe
+        automatic changes:
+        - Components missing from PCB are placed at auto-positioned locations.
+        - Value mismatches are updated on the PCB side.
+        - Footprint mismatches and extra PCB components are reported as warnings
+          (not auto-fixed, as they require manual review).
+
+        Args:
+            schematic_path: Path to .kicad_sch file.
+            board_path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON with summary of actions taken and warnings.
+        """
+        sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
+        pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
+
+        sch_ops = backend.get_schematic_ops()
+        pcb_ops = backend.get_board_ops()
+
+        sch_data = sch_ops.read_schematic(sch_p)
+        pcb_data = pcb_ops.read_board(pcb_p)
+
+        # Build dicts keyed by reference, filtering out power symbols
+        sch_by_ref: dict[str, dict] = {}
+        for sym in sch_data.get("symbols", []):
+            ref = sym.get("reference", "")
+            if not ref or ref.startswith("#"):
+                continue
+            if sym.get("is_power"):
+                continue
+            sch_by_ref[ref] = sym
+
+        pcb_by_ref: dict[str, dict] = {}
+        for comp in pcb_data.get("components", []):
+            ref = comp.get("reference", "")
+            if ref:
+                pcb_by_ref[ref] = comp
+
+        actions: list[dict] = []
+        warnings: list[dict] = []
+
+        # Try to get board_modify_ops for placing components
+        try:
+            board_modify_ops = backend.get_board_modify_ops()
+        except Exception:
+            board_modify_ops = None
+
+        # Auto-position grid for new components
+        place_x, place_y = 50.0, 50.0
+        place_step = 10.0
+
+        for ref in sorted(sch_by_ref):
+            if ref not in pcb_by_ref:
+                # Missing from PCB → place it
+                sym = sch_by_ref[ref]
+                footprint = sym.get("footprint", "")
+                if not footprint:
+                    warnings.append({
+                        "type": "no_footprint",
+                        "reference": ref,
+                        "message": f"{ref} has no footprint assigned in schematic, cannot place on PCB.",
+                    })
+                    continue
+
+                if board_modify_ops is not None:
+                    backup = create_backup(pcb_p)
+                    try:
+                        result = board_modify_ops.place_component(
+                            pcb_p, ref, footprint, place_x, place_y,
+                        )
+                        actions.append({
+                            "type": "placed",
+                            "reference": ref,
+                            "footprint": footprint,
+                            "position": {"x": place_x, "y": place_y},
+                        })
+                        place_x += place_step
+                        if place_x > 200.0:
+                            place_x = 50.0
+                            place_y += place_step
+                    except Exception as exc:
+                        warnings.append({
+                            "type": "place_failed",
+                            "reference": ref,
+                            "message": str(exc),
+                        })
+                else:
+                    warnings.append({
+                        "type": "missing_from_pcb",
+                        "reference": ref,
+                        "footprint": footprint,
+                        "message": f"{ref} missing from PCB (board modify not available).",
+                    })
+
+        for ref in sorted(pcb_by_ref):
+            if ref not in sch_by_ref:
+                warnings.append({
+                    "type": "extra_in_pcb",
+                    "reference": ref,
+                    "message": f"{ref} exists in PCB but not in schematic.",
+                })
+
+        # Check mismatches for components in both
+        for ref in sorted(set(sch_by_ref) & set(pcb_by_ref)):
+            sch_sym = sch_by_ref[ref]
+            pcb_comp = pcb_by_ref[ref]
+
+            sch_fp = sch_sym.get("footprint", "")
+            pcb_fp = pcb_comp.get("footprint", "")
+            if sch_fp and pcb_fp and sch_fp != pcb_fp:
+                warnings.append({
+                    "type": "footprint_mismatch",
+                    "reference": ref,
+                    "schematic_footprint": sch_fp,
+                    "pcb_footprint": pcb_fp,
+                    "message": f"{ref} footprint mismatch: schematic={sch_fp}, pcb={pcb_fp}",
+                })
+
+            sch_val = sch_sym.get("value", "")
+            pcb_val = pcb_comp.get("value", "")
+            if sch_val and pcb_val and sch_val != pcb_val:
+                # Update PCB value
+                if board_modify_ops is not None:
+                    try:
+                        # Update the Value property via text replacement
+                        content = pcb_p.read_text(encoding="utf-8")
+                        from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+                        location = find_footprint_block_by_reference(content, ref)
+                        if location:
+                            start, end = location
+                            block = content[start:end + 1]
+                            # Replace the Value property
+                            import re
+                            val_pattern = re.compile(
+                                r'(\(property\s+"Value"\s+)"([^"]*)"'
+                            )
+                            match = val_pattern.search(block)
+                            if match:
+                                new_block = (
+                                    block[:match.start(2)]
+                                    + sch_val
+                                    + block[match.end(2):]
+                                )
+                                content = content[:start] + new_block + content[end + 1:]
+                                pcb_p.write_text(content, encoding="utf-8")
+                                actions.append({
+                                    "type": "value_updated",
+                                    "reference": ref,
+                                    "old_value": pcb_val,
+                                    "new_value": sch_val,
+                                })
+                            else:
+                                warnings.append({
+                                    "type": "value_mismatch",
+                                    "reference": ref,
+                                    "message": f"Could not find Value property in PCB for {ref}.",
+                                })
+                        else:
+                            warnings.append({
+                                "type": "value_mismatch",
+                                "reference": ref,
+                                "message": f"Could not locate {ref} in PCB for value update.",
+                            })
+                    except Exception as exc:
+                        warnings.append({
+                            "type": "value_update_failed",
+                            "reference": ref,
+                            "message": str(exc),
+                        })
+                else:
+                    warnings.append({
+                        "type": "value_mismatch",
+                        "reference": ref,
+                        "schematic_value": sch_val,
+                        "pcb_value": pcb_val,
+                        "message": f"{ref} value mismatch (board modify not available).",
+                    })
+
+        summary = {
+            "components_placed": sum(1 for a in actions if a["type"] == "placed"),
+            "values_updated": sum(1 for a in actions if a["type"] == "value_updated"),
+            "warnings": len(warnings),
+        }
+
+        change_log.record(
+            "sync_schematic_to_pcb",
+            {"schematic_path": schematic_path, "board_path": board_path},
+            file_modified=board_path,
+        )
+        return json.dumps({
+            "status": "success",
+            "summary": summary,
+            "actions": actions,
+            "warnings": warnings,
+        }, indent=2)
 
     @mcp.tool()
     def add_junction(path: str, x: float, y: float) -> str:

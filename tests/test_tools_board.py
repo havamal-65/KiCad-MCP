@@ -84,3 +84,155 @@ class TestGetDesignRules:
         result = json.loads(result_json)
         assert result["status"] == "success"
         assert "rules" in result
+
+
+# --- File backend board modification tests ---
+
+MINIMAL_PCB = (
+    '(kicad_pcb (version 20240108) (generator "test")\n'
+    '  (net 0 "")\n'
+    '  (net 1 "VCC")\n'
+    '  (net 2 "GND")\n'
+    '  (footprint "Resistor_SMD:R_0805" (layer "F.Cu")\n'
+    '    (at 100 50)\n'
+    '    (property "Reference" "R1" (at 0 0 0)\n'
+    '      (effects (font (size 1 1) (thickness 0.15)))\n'
+    '    )\n'
+    '    (property "Value" "10k" (at 0 0 0)\n'
+    '      (effects (font (size 1 1) (thickness 0.15)))\n'
+    '    )\n'
+    '    (pad "1" smd roundrect (at -1 0) (size 1 1.2) (layers "F.Cu"))\n'
+    '    (pad "2" smd roundrect (at 1 0) (size 1 1.2) (layers "F.Cu"))\n'
+    '  )\n'
+    ')\n'
+)
+
+
+class TestFileBoardOps:
+    def test_place_component(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.place_component(pcb_file, "R2", "Resistor_SMD:R_0402", 120.0, 60.0)
+        assert result["reference"] == "R2"
+        assert result["footprint"] == "Resistor_SMD:R_0402"
+        assert result["position"] == {"x": 120.0, "y": 60.0}
+        assert "uuid" in result
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert '"R2"' in content
+        assert '"Resistor_SMD:R_0402"' in content
+        assert content.strip().endswith(")")
+
+    def test_move_component(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.move_component(pcb_file, "R1", 150.0, 80.0)
+        assert result["reference"] == "R1"
+        assert result["position"] == {"x": 150.0, "y": 80.0}
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert "(at 150.0 80.0)" in content
+        assert "(at 100 50)" not in content
+
+    def test_move_component_with_rotation(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.move_component(pcb_file, "R1", 100.0, 50.0, rotation=90.0)
+        assert result["rotation"] == 90.0
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert "(at 100.0 50.0 90.0)" in content
+
+    def test_move_component_not_found(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        with pytest.raises(ValueError, match="not found"):
+            ops.move_component(pcb_file, "C99", 0.0, 0.0)
+
+    def test_add_track(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.add_track(pcb_file, 10.0, 20.0, 30.0, 40.0, 0.25, "F.Cu", "VCC")
+        assert result["start"] == {"x": 10.0, "y": 20.0}
+        assert result["end"] == {"x": 30.0, "y": 40.0}
+        assert result["width"] == 0.25
+        assert result["net"] == "VCC"
+        assert "uuid" in result
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert "(segment" in content
+        assert "(net 1)" in content  # VCC is net 1
+
+    def test_add_track_new_net(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.add_track(pcb_file, 10.0, 20.0, 30.0, 40.0, 0.25, "F.Cu", "SDA")
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert '(net 3 "SDA")' in content  # New net assigned ID 3
+        assert "(net 3)" in content
+
+    def test_add_via(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.add_via(pcb_file, 50.0, 60.0, 0.8, 0.4, "GND")
+        assert result["position"] == {"x": 50.0, "y": 60.0}
+        assert result["net"] == "GND"
+        assert "uuid" in result
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert "(via" in content
+        assert "(net 2)" in content  # GND is net 2
+
+    def test_assign_net(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        result = ops.assign_net(pcb_file, "R1", "1", "VCC")
+        assert result["reference"] == "R1"
+        assert result["pad"] == "1"
+        assert result["net"] == "VCC"
+
+        content = pcb_file.read_text(encoding="utf-8")
+        assert '(net 1 "VCC")' in content
+
+    def test_assign_net_not_found(self, tmp_path: Path):
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        pcb_file = tmp_path / "test.kicad_pcb"
+        pcb_file.write_text(MINIMAL_PCB, encoding="utf-8")
+
+        ops = FileBoardOps()
+        with pytest.raises(ValueError, match="not found"):
+            ops.assign_net(pcb_file, "C99", "1", "VCC")

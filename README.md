@@ -8,14 +8,14 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **49 MCP Tools** across 7 categories:
-  - 📋 **Project Management** (5 tools): Create, validate, and manage KiCad projects
-  - 📐 **Schematic Operations** (14 tools): Read, modify, and analyze schematics with pin position queries, no-connects, junctions, power symbols, component removal, repositioning, property editing, and schematic-to-PCB comparison
-  - 🔌 **PCB Board Operations** (8 tools): Work with PCB layouts, components, tracks, and nets
-  - 📚 **Library Search** (5 tools): Query and inspect component/footprint libraries
+- **56 MCP Tools** across 7 categories:
+  - 📋 **Project Management** (5 tools): Open projects, list files, read/write metadata, query backend info
+  - 📐 **Schematic Operations** (20 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries, net connectivity analysis, schematic-to-PCB comparison and sync
+  - 🔌 **PCB Board Operations** (8 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules
+  - 📚 **Library Search** (6 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
   - ✅ **Design Rule Checks** (3 tools): Run DRC and ERC validations
-  - 📤 **Export Operations** (5 tools): Export schematics, boards, BOMs, and more
+  - 📤 **Export Operations** (5 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs
 
 - **Multiple Backend Support**:
   - **IPC Backend**: Direct communication with running KiCad instance
@@ -191,57 +191,75 @@ Add to your Cursor MCP settings:
 
 ## Available Tools
 
-### Project Management
-- `create_project`: Create a new KiCad project
-- `validate_project`: Validate project structure
-- `list_project_files`: List all files in a project
-- `get_project_metadata`: Get project information
-- `update_project_metadata`: Update project settings
+### Project Management (5 tools)
+- `open_project`: Open a KiCad project and return its structure
+- `list_project_files`: List all KiCad-related files in a project directory
+- `get_project_metadata`: Read detailed metadata from a KiCad project file
+- `save_project`: Trigger save for an open KiCad project (requires IPC backend)
+- `get_backend_info`: Get information about available backends and their capabilities
 
-### Schematic Operations (14 tools)
+### Schematic Operations (20 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
-- `add_component`: Place symbols with rotation, mirror, footprint, and custom properties
-- `add_wire`: Draw wire connections
+- `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
+- `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
+- `add_wire`: Draw wire connections between two points
 - `add_label`: Add net labels (net, global, hierarchical)
-- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol (essential for wire routing)
 - `add_no_connect`: Add no-connect (X) markers to unused pins
 - `add_power_symbol`: Add power symbols (+3V3, GND, VCC, etc.) with auto-incrementing references
 - `add_junction`: Add junction dots at wire intersections
 - `remove_component`: Remove a placed component by reference designator
+- `remove_wire`: Remove a wire segment by its endpoint coordinates
+- `remove_no_connect`: Remove a no-connect marker by its position
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
 - `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
+- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol (essential for wire routing)
+- `get_pin_net`: Get the net name connected to a specific pin of a symbol
+- `get_net_connections`: Get all connections (pins, labels, wires) on a named net
 - `compare_schematic_pcb`: Detect mismatches between schematic and PCB (missing components, footprint/value differences)
+- `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values)
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations
+### PCB Board Operations (8 tools)
 - `read_board`: Read complete board structure
-- `get_board_info`: Get board metadata
-- `list_board_components`: List footprints
-- `get_board_component`: Get footprint details
-- `update_board_component`: Modify footprint properties
-- `list_tracks`: List all tracks
-- `list_board_nets`: List PCB nets
-- `get_copper_zones`: Get copper fill zones
+- `get_board_info`: Get board metadata (title, revision, layers, counts)
+- `place_component`: Place a component footprint on the board
+- `move_component`: Move an existing component to a new position
+- `add_track`: Add a copper track segment
+- `add_via`: Add a via (through-hole, blind, or buried)
+- `assign_net`: Assign a net to a component pad
+- `get_design_rules`: Get the board's design rules (clearances, track widths, via sizes)
 
-### Library Management
-- `list_libraries`: List available libraries
-- `search_library`: Search for components
-- `get_library_info`: Get library metadata
-- `list_library_components`: List components in a library
-- `get_library_component`: Get component details
+### Library Search (6 tools)
+- `search_symbols`: Search for schematic symbols across installed libraries
+- `search_footprints`: Search for PCB footprints across installed libraries
+- `list_libraries`: List all available symbol and footprint libraries
+- `get_symbol_info`: Get detailed information about a specific symbol
+- `get_footprint_info`: Get detailed information about a specific footprint
+- `suggest_footprints`: Suggest matching footprints for a symbol based on its footprint filters
 
-### Design Rule Checks
-- `run_erc`: Run electrical rule check on schematic
-- `run_drc`: Run design rule check on board
-- `get_netlist`: Generate and validate netlist
+### Library Management (9 tools)
+- `clone_library_repo`: Clone a remote KiCad library repository
+- `register_library_source`: Register a local directory as a searchable library source
+- `list_library_sources`: List all registered external library sources
+- `unregister_library_source`: Remove a library source registration
+- `search_library_sources`: Search for symbols/footprints across registered external sources
+- `create_project_library`: Create an empty project-local KiCad library
+- `import_symbol`: Copy a symbol from one .kicad_sym library to another
+- `import_footprint`: Copy a footprint from one .pretty directory to another
+- `register_project_library`: Register a library in a project's sym-lib-table or fp-lib-table
 
-### Export Operations
-- `export_schematic`: Export schematic (PDF, SVG, PNG)
-- `export_board`: Export PCB (PDF, SVG, PNG, Gerber)
-- `export_bom`: Generate bill of materials
-- `export_netlist`: Export netlist
-- `export_step`: Export 3D STEP model
+### Design Rule Checks (3 tools)
+- `run_drc`: Run Design Rule Check on a PCB board
+- `run_erc`: Run Electrical Rules Check on a schematic
+- `get_board_design_rules`: Get the design rules configured for a board
+
+### Export Operations (5 tools)
+- `export_gerbers`: Export Gerber manufacturing files from a PCB board
+- `export_drill`: Export drill files (Excellon format)
+- `export_bom`: Export Bill of Materials (CSV, JSON, etc.)
+- `export_pick_and_place`: Export pick-and-place component placement file
+- `export_pdf`: Export a board or schematic to PDF
 
 ## Backend Details
 

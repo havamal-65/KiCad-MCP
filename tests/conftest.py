@@ -146,8 +146,30 @@ class MockSchematicOps(SchematicOps):
     def update_component_property(self, path, reference, property_name, property_value):
         return {"reference": reference, "property": property_name, "value": property_value}
 
+    def remove_wire(self, path, start_x, start_y, end_x, end_y):
+        return {"start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y}, "removed": True}
+
+    def remove_no_connect(self, path, x, y):
+        return {"position": {"x": x, "y": y}, "removed": True}
+
+    def create_schematic(self, path, title="", revision=""):
+        return {"path": str(path), "uuid": "mock-uuid", "title": title, "revision": revision}
+
     def add_label(self, path, text, x, y, label_type="net_label"):
         return {"text": text, "position": {"x": x, "y": y}}
+
+    def get_pin_net(self, path, reference, pin_number):
+        return {"reference": reference, "pin_number": pin_number,
+                "net_name": "VCC", "position": {"x": 100.0, "y": 50.0}}
+
+    def get_net_connections(self, path, net_name):
+        return {
+            "net_name": net_name,
+            "pins": [{"reference": "R1", "pin_number": "1", "position": {"x": 100.0, "y": 50.0}}],
+            "labels": [{"text": net_name, "position": {"x": 100.0, "y": 50.0}}],
+            "wires": [],
+        }
 
 
 class MockExportOps(ExportOps):
@@ -199,6 +221,15 @@ class MockLibraryOps(LibraryOps):
 
     def get_footprint_info(self, lib_id):
         return {"name": "R_0805", "library": "Resistor_SMD", "pad_count": 2, "smd": True}
+
+    def suggest_footprints(self, lib_id):
+        return {
+            "lib_id": lib_id,
+            "fp_filters": ["R_*", "Resistor_*"],
+            "footprints": [
+                {"name": "R_0805", "library": "Resistor_SMD", "lib_id": "Resistor_SMD:R_0805"},
+            ],
+        }
 
 
 class MockLibraryManageOps(LibraryManageOps):

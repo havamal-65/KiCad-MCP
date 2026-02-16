@@ -21,8 +21,12 @@ from kicad_mcp.logging_config import get_logger
 from kicad_mcp.models.errors import GitOperationError, LibraryImportError, LibraryManageError
 from kicad_mcp.utils.library_sources import LibrarySourceRegistry
 from kicad_mcp.utils.sexp_parser import (
+    _walk_balanced_parens,
     extract_sexp_block,
+    find_footprint_block_by_reference,
+    find_no_connect_block_by_position,
     find_symbol_block_by_reference,
+    find_wire_block_by_endpoints,
     parse_sexp_file,
     remove_sexp_block,
 )
@@ -102,6 +106,235 @@ class FileBoardOps(BoardOps):
             if isinstance(node, list) and len(node) > 0 and node[0] == "setup":
                 return _parse_setup(node)
         return {}
+
+    @staticmethod
+    def _resolve_net_id(content: str, net_name: str) -> tuple[str, int]:
+        """Resolve a net name to its numeric ID in the PCB file.
+
+        Scans for ``(net N "name")`` patterns. If the net is not found,
+        adds a new net entry and returns its ID.
+
+        Returns:
+            Tuple of (possibly modified content, net ID).
+        """
+        if not net_name:
+            return content, 0
+
+        # Find all existing net definitions
+        net_pattern = re.compile(r'\(net\s+(\d+)\s+"([^"]*?)"\)')
+        max_id = 0
+        for m in net_pattern.finditer(content):
+            net_id = int(m.group(1))
+            if net_id > max_id:
+                max_id = net_id
+            if m.group(2) == net_name:
+                return content, net_id
+
+        # Net not found — add a new entry
+        new_id = max_id + 1
+        net_entry = f'  (net {new_id} "{net_name}")\n'
+        # Insert after the last existing net entry, or before the first footprint
+        last_net = None
+        for m in net_pattern.finditer(content):
+            last_net = m
+        if last_net:
+            insert_pos = last_net.end()
+            content = content[:insert_pos] + "\n" + net_entry + content[insert_pos:]
+        else:
+            # Insert before the first footprint or before final paren
+            fp_idx = content.find("(footprint ")
+            if fp_idx != -1:
+                content = content[:fp_idx] + net_entry + "\n" + content[fp_idx:]
+            else:
+                last_paren = content.rfind(")")
+                if last_paren >= 0:
+                    content = content[:last_paren] + net_entry + content[last_paren:]
+        return content, new_id
+
+    def place_component(
+        self, path: Path, reference: str, footprint: str,
+        x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
+    ) -> dict[str, Any]:
+        import uuid
+        fp_uuid = str(uuid.uuid4())
+
+        rot_clause = f" {rotation}" if rotation else ""
+        fp_sexp = (
+            f'  (footprint "{footprint}" (layer "{layer}")\n'
+            f'    (at {x} {y}{rot_clause})\n'
+            f'    (property "Reference" "{reference}" (at 0 0 0)\n'
+            f'      (effects (font (size 1 1) (thickness 0.15)))\n'
+            f'    )\n'
+            f'    (property "Value" "" (at 0 0 0)\n'
+            f'      (effects (font (size 1 1) (thickness 0.15)))\n'
+            f'    )\n'
+            f'    (uuid "{fp_uuid}")\n'
+            f'  )\n'
+        )
+
+        content = path.read_text(encoding="utf-8")
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + fp_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "footprint": footprint,
+            "position": {"x": x, "y": y},
+            "layer": layer,
+            "rotation": rotation,
+            "uuid": fp_uuid,
+        }
+
+    def move_component(
+        self, path: Path, reference: str, x: float, y: float,
+        rotation: float | None = None,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
+        start, end = location
+        block = content[start:end + 1]
+
+        # Find the footprint-level (at x y [rot]) — first occurrence
+        at_match = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)', block)
+        if at_match is None:
+            raise ValueError(f"Footprint '{reference}' has no (at ...) clause")
+
+        old_rot = float(at_match.group(3)) if at_match.group(3) else 0.0
+        new_rot = rotation if rotation is not None else old_rot
+
+        rot_clause = f" {new_rot}" if new_rot else ""
+        new_at = f"(at {x} {y}{rot_clause})"
+        new_block = block[:at_match.start()] + new_at + block[at_match.end():]
+
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "position": {"x": x, "y": y},
+            "rotation": new_rot,
+        }
+
+    def add_track(
+        self, path: Path, start_x: float, start_y: float,
+        end_x: float, end_y: float, width: float,
+        layer: str = "F.Cu", net: str = "",
+    ) -> dict[str, Any]:
+        import uuid
+        track_uuid = str(uuid.uuid4())
+
+        content = path.read_text(encoding="utf-8")
+        content, net_id = self._resolve_net_id(content, net)
+
+        track_sexp = (
+            f'  (segment (start {start_x} {start_y}) (end {end_x} {end_y})'
+            f' (width {width}) (layer "{layer}") (net {net_id})'
+            f' (uuid "{track_uuid}"))\n'
+        )
+
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + track_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "start": {"x": start_x, "y": start_y},
+            "end": {"x": end_x, "y": end_y},
+            "width": width,
+            "layer": layer,
+            "net": net,
+            "uuid": track_uuid,
+        }
+
+    def add_via(
+        self, path: Path, x: float, y: float,
+        size: float = 0.8, drill: float = 0.4,
+        net: str = "", via_type: str = "through",
+    ) -> dict[str, Any]:
+        import uuid
+        via_uuid = str(uuid.uuid4())
+
+        content = path.read_text(encoding="utf-8")
+        content, net_id = self._resolve_net_id(content, net)
+
+        via_sexp = (
+            f'  (via (at {x} {y}) (size {size}) (drill {drill})'
+            f' (layers "F.Cu" "B.Cu") (net {net_id})'
+            f' (uuid "{via_uuid}"))\n'
+        )
+
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + via_sexp + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+
+        return {
+            "position": {"x": x, "y": y},
+            "size": size,
+            "drill": drill,
+            "net": net,
+            "via_type": via_type,
+            "uuid": via_uuid,
+        }
+
+    def assign_net(
+        self, path: Path, reference: str, pad: str, net: str,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
+
+        content, net_id = self._resolve_net_id(content, net)
+        # Re-locate after possible content modification from _resolve_net_id
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found after net resolve")
+
+        start, end = location
+        block = content[start:end + 1]
+
+        # Find the pad sub-block
+        escaped_pad = re.escape(pad)
+        pad_pattern = re.compile(rf'\(pad\s+"{escaped_pad}"\s')
+        pad_match = pad_pattern.search(block)
+        if pad_match is None:
+            # Try unquoted pad number
+            pad_pattern = re.compile(rf'\(pad\s+{escaped_pad}\s')
+            pad_match = pad_pattern.search(block)
+        if pad_match is None:
+            raise ValueError(f"Pad '{pad}' not found in footprint '{reference}'")
+
+        pad_start = pad_match.start()
+        pad_end_abs = _walk_balanced_parens(block, pad_start)
+        if pad_end_abs is None:
+            raise ValueError(f"Unbalanced pad block for pad '{pad}' in '{reference}'")
+
+        pad_block = block[pad_start:pad_end_abs + 1]
+
+        # Replace or insert (net ...) in the pad block
+        net_in_pad = re.search(r'\(net\s+\d+(?:\s+"[^"]*")?\)', pad_block)
+        net_clause = f'(net {net_id} "{net}")'
+
+        if net_in_pad:
+            new_pad_block = pad_block[:net_in_pad.start()] + net_clause + pad_block[net_in_pad.end():]
+        else:
+            # Insert before the closing paren of the pad block
+            new_pad_block = pad_block[:-1] + f" {net_clause})"
+
+        new_block = block[:pad_start] + new_pad_block + block[pad_end_abs + 1:]
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "pad": pad,
+            "net": net,
+        }
 
 
 class FileSchematicOps(SchematicOps):
@@ -369,6 +602,58 @@ class FileSchematicOps(SchematicOps):
         )
         return new_content
 
+    @staticmethod
+    def _find_schematic_uuid(content: str) -> str:
+        """Extract the root schematic UUID from file content."""
+        m = re.search(r'\(uuid\s+"([^"]+)"\)', content)
+        return m.group(1) if m else ""
+
+    def create_schematic(
+        self, path: Path, title: str = "", revision: str = "",
+    ) -> dict[str, Any]:
+        import uuid as _uuid
+        sch_uuid = str(_uuid.uuid4())
+
+        title_block = ""
+        if title or revision:
+            tb_lines = []
+            if title:
+                tb_lines.append(f'    (title "{title}")')
+            if revision:
+                tb_lines.append(f'    (rev "{revision}")')
+            title_block = (
+                "  (title_block\n"
+                + "\n".join(tb_lines)
+                + "\n  )\n\n"
+            )
+
+        content = (
+            f'(kicad_sch\n'
+            f'  (version 20231120)\n'
+            f'  (generator "kicad_mcp")\n'
+            f'  (generator_version "9.0")\n'
+            f'  (uuid "{sch_uuid}")\n'
+            f'\n'
+            f'  (paper "A4")\n'
+            f'\n'
+            f'{title_block}'
+            f'  (lib_symbols\n'
+            f'  )\n'
+            f'\n'
+            f'  (sheet_instances\n'
+            f'    (path "/" (page "1"))\n'
+            f'  )\n'
+            f')\n'
+        )
+
+        path.write_text(content, encoding="utf-8")
+        return {
+            "path": str(path),
+            "uuid": sch_uuid,
+            "title": title,
+            "revision": revision,
+        }
+
     def add_component(
         self, path: Path, lib_id: str, reference: str, value: str,
         x: float, y: float, rotation: float = 0.0,
@@ -413,15 +698,25 @@ class FileSchematicOps(SchematicOps):
                 )
                 offset += 2
 
+        content = path.read_text(encoding="utf-8")
+        content = self._ensure_lib_symbol_cached(content, lib_id)
+        sch_uuid = self._find_schematic_uuid(content)
+
         sym_sexp = (
-            f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause}\n'
+            f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit 1)\n'
+            f'    (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'{prop_lines}'
+            f'    (instances\n'
+            f'      (project ""\n'
+            f'        (path "/{sch_uuid}"\n'
+            f'          (reference "{reference}") (unit 1)\n'
+            f'        )\n'
+            f'      )\n'
+            f'    )\n'
             f'  )\n'
         )
 
-        content = path.read_text(encoding="utf-8")
-        content = self._ensure_lib_symbol_cached(content, lib_id)
         last_paren = content.rfind(")")
         if last_paren >= 0:
             content = content[:last_paren] + sym_sexp + content[last_paren:]
@@ -527,14 +822,24 @@ class FileSchematicOps(SchematicOps):
         lib_id = f"power:{name}"
         content = self._ensure_lib_symbol_cached(content, lib_id)
 
+        sch_uuid = self._find_schematic_uuid(content)
+
         sym_sexp = (
-            f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation})\n'
+            f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation}) (unit 1)\n'
+            f'    (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'    (property "Reference" "{pwr_ref}" (at {x} {y - 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)) hide)\n'
             f'    )\n'
             f'    (property "Value" "{name}" (at {x} {y + 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)))\n'
+            f'    )\n'
+            f'    (instances\n'
+            f'      (project ""\n'
+            f'        (path "/{sch_uuid}"\n'
+            f'          (reference "{pwr_ref}") (unit 1)\n'
+            f'        )\n'
+            f'      )\n'
             f'    )\n'
             f'  )\n'
         )
@@ -685,6 +990,40 @@ class FileSchematicOps(SchematicOps):
         path.write_text(content, encoding="utf-8")
         return {"reference": reference, "removed": True}
 
+    def remove_wire(
+        self, path: Path, start_x: float, start_y: float,
+        end_x: float, end_y: float,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_wire_block_by_endpoints(content, start_x, start_y, end_x, end_y)
+        if location is None:
+            raise ValueError(
+                f"Wire from ({start_x}, {start_y}) to ({end_x}, {end_y}) not found in {path}"
+            )
+        start, end = location
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "start": {"x": start_x, "y": start_y},
+            "end": {"x": end_x, "y": end_y},
+            "removed": True,
+        }
+
+    def remove_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        location = find_no_connect_block_by_position(content, x, y)
+        if location is None:
+            raise ValueError(
+                f"No-connect at ({x}, {y}) not found in {path}"
+            )
+        start, end = location
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "position": {"x": x, "y": y},
+            "removed": True,
+        }
+
     def get_symbol_pin_positions(
         self, path: Path, reference: str,
     ) -> dict[str, Any]:
@@ -809,6 +1148,213 @@ class FileSchematicOps(SchematicOps):
         }
 
 
+    def _build_connectivity(self, path: Path) -> dict[str, list[dict[str, Any]]]:
+        """Build schematic net connectivity from wires, labels, and pin positions.
+
+        Uses a Union-Find over coordinate endpoints to group connected items
+        into nets, then names each group from labels or power symbols.
+
+        Returns:
+            Mapping of net_name -> list of {reference, pin_number, position}.
+        """
+        data = self.read_schematic(path)
+        symbols = data.get("symbols", [])
+        wires = data.get("wires", [])
+        labels = data.get("labels", [])
+
+        TOLERANCE = 0.02  # mm coordinate matching tolerance
+
+        # --- Union-Find ---
+        parent: dict[str, str] = {}
+
+        def _key(x: float, y: float) -> str:
+            return f"{round(x / TOLERANCE) * TOLERANCE:.4f},{round(y / TOLERANCE) * TOLERANCE:.4f}"
+
+        def find(k: str) -> str:
+            while parent.get(k, k) != k:
+                parent[k] = parent.get(parent[k], parent[k])
+                k = parent[k]
+            return k
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # Collect wire endpoints and union them
+        for w in wires:
+            s = w.get("start", {})
+            e = w.get("end", {})
+            sk = _key(s.get("x", 0), s.get("y", 0))
+            ek = _key(e.get("x", 0), e.get("y", 0))
+            parent.setdefault(sk, sk)
+            parent.setdefault(ek, ek)
+            union(sk, ek)
+
+        # Collect label positions -> net names
+        label_names: dict[str, str] = {}  # key -> net_name
+        for lbl in labels:
+            pos = lbl.get("position", {})
+            lk = _key(pos.get("x", 0), pos.get("y", 0))
+            parent.setdefault(lk, lk)
+            label_names[lk] = lbl.get("text", "")
+            # Union with any wire at same position
+            for existing in list(parent):
+                if existing != lk and find(existing) != find(lk):
+                    # Check if any existing endpoint matches
+                    pass
+            # Just add to parent set; union happens via wire overlap
+
+        # Collect pin positions for all non-power symbols
+        pin_data: list[dict[str, Any]] = []  # {reference, pin_number, position, key}
+        power_pin_names: dict[str, str] = {}  # key -> power net name
+
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            if not ref or ref.startswith("#"):
+                continue
+            is_power = sym.get("is_power", False)
+
+            try:
+                pin_result = self.get_symbol_pin_positions(path, ref)
+            except Exception:
+                continue
+
+            pin_positions = pin_result.get("pin_positions", {})
+            for pin_num, pos in pin_positions.items():
+                pk = _key(pos["x"], pos["y"])
+                parent.setdefault(pk, pk)
+
+                if is_power:
+                    # Power symbol pin defines a net name (use Value)
+                    power_pin_names[pk] = sym.get("value", ref)
+                else:
+                    pin_data.append({
+                        "reference": ref,
+                        "pin_number": pin_num,
+                        "position": pos,
+                        "key": pk,
+                    })
+
+        # Also handle power symbols with # refs
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            is_power = sym.get("is_power", False)
+            if not is_power and not ref.startswith("#"):
+                continue
+            if not ref:
+                continue
+            try:
+                pin_result = self.get_symbol_pin_positions(path, ref)
+            except Exception:
+                continue
+            pin_positions = pin_result.get("pin_positions", {})
+            for pin_num, pos in pin_positions.items():
+                pk = _key(pos["x"], pos["y"])
+                parent.setdefault(pk, pk)
+                power_pin_names[pk] = sym.get("value", ref)
+
+        # Union all points at the same coordinates
+        all_keys = list(parent.keys())
+        for pk in [p["key"] for p in pin_data] + list(label_names) + list(power_pin_names):
+            for k2 in all_keys:
+                if pk == k2:
+                    continue
+                if find(pk) == find(k2):
+                    continue
+                # They are at the same rounded coordinate — already same key
+            # Keys are already rounded, so same position = same key = implicitly unioned
+            # But we need to union pin keys with wire endpoint keys
+            if pk in parent:
+                union(pk, pk)  # no-op, but ensures it's in parent
+
+        # Build groups by root
+        groups: dict[str, list[str]] = {}
+        for k in parent:
+            root = find(k)
+            groups.setdefault(root, []).append(k)
+
+        # Name each group
+        net_map: dict[str, list[dict[str, Any]]] = {}
+        for root, members in groups.items():
+            # Determine net name from labels or power symbols
+            net_name = ""
+            for m in members:
+                if m in label_names:
+                    net_name = label_names[m]
+                    break
+                if m in power_pin_names:
+                    net_name = power_pin_names[m]
+                    break
+
+            # Find pins in this group
+            group_pins = []
+            for pd in pin_data:
+                if find(pd["key"]) == root:
+                    group_pins.append({
+                        "reference": pd["reference"],
+                        "pin_number": pd["pin_number"],
+                        "position": pd["position"],
+                    })
+
+            if not group_pins:
+                continue
+
+            if not net_name:
+                # Auto-name from first pin
+                p = group_pins[0]
+                net_name = f"Net-({p['reference']}-{p['pin_number']})"
+
+            net_map.setdefault(net_name, []).extend(group_pins)
+
+        return net_map
+
+    def get_pin_net(self, path: Path, reference: str, pin_number: str) -> dict[str, Any]:
+        connectivity = self._build_connectivity(path)
+
+        for net_name, pins in connectivity.items():
+            for pin in pins:
+                if pin["reference"] == reference and str(pin["pin_number"]) == str(pin_number):
+                    return {
+                        "reference": reference,
+                        "pin_number": pin_number,
+                        "net_name": net_name,
+                        "position": pin["position"],
+                    }
+
+        return {
+            "reference": reference,
+            "pin_number": pin_number,
+            "net_name": None,
+            "error": f"Pin {pin_number} of {reference} not found in connectivity map",
+        }
+
+    def get_net_connections(self, path: Path, net_name: str) -> dict[str, Any]:
+        connectivity = self._build_connectivity(path)
+
+        if net_name not in connectivity:
+            return {
+                "net_name": net_name,
+                "pins": [],
+                "error": f"Net '{net_name}' not found in schematic connectivity",
+            }
+
+        data = self.read_schematic(path)
+        labels_on_net = []
+        for lbl in data.get("labels", []):
+            if lbl.get("text") == net_name:
+                labels_on_net.append(lbl)
+
+        wires_on_net = []  # Simplified: return all wires (full wire-to-net mapping is complex)
+
+        return {
+            "net_name": net_name,
+            "pins": connectivity[net_name],
+            "labels": labels_on_net,
+            "wires": wires_on_net,
+        }
+
+
 class FileLibraryOps(LibraryOps):
     """Library operations via direct file searching."""
 
@@ -896,6 +1442,46 @@ class FileLibraryOps(LibraryOps):
                     tree = parse_sexp_file(fp_file)
                     return _parse_footprint_detail(tree, lib_name, fp_name)
         return {"error": f"Footprint not found: {lib_id}"}
+
+    def suggest_footprints(self, lib_id: str) -> dict[str, Any]:
+        import fnmatch
+
+        sym_info = self.get_symbol_info(lib_id)
+        if "error" in sym_info:
+            return sym_info
+
+        fp_filters = sym_info.get("fp_filters", [])
+        if not fp_filters:
+            return {
+                "lib_id": lib_id,
+                "fp_filters": [],
+                "footprints": [],
+                "message": "Symbol has no footprint filters defined.",
+            }
+
+        all_footprints = self.search_footprints("")
+        matched: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for fp in all_footprints:
+            fp_name = fp["name"]
+            if fp_name in seen:
+                continue
+            for pattern in fp_filters:
+                if fnmatch.fnmatch(fp_name, pattern):
+                    matched.append({
+                        "name": fp_name,
+                        "library": fp["library"],
+                        "lib_id": fp["lib_id"],
+                    })
+                    seen.add(fp_name)
+                    break
+
+        return {
+            "lib_id": lib_id,
+            "fp_filters": fp_filters,
+            "footprints": matched,
+        }
 
 
 class FileLibraryManageOps(LibraryManageOps):
@@ -1199,6 +1785,7 @@ class FileBackend(KiCadBackend):
     def capabilities(self) -> set[BackendCapability]:
         return {
             BackendCapability.BOARD_READ,
+            BackendCapability.BOARD_MODIFY,
             BackendCapability.SCHEMATIC_READ,
             BackendCapability.SCHEMATIC_MODIFY,
             BackendCapability.LIBRARY_SEARCH,
@@ -1402,6 +1989,8 @@ def _parse_symbol_detail(node: list, lib_name: str) -> dict[str, Any]:
                 info["description"] = prop_val
             elif prop_name == "ki_keywords":
                 info["keywords"] = prop_val
+            elif prop_name == "ki_fp_filters":
+                info["fp_filters"] = prop_val.split() if isinstance(prop_val, str) else []
             elif prop_name == "Datasheet":
                 info["datasheet"] = prop_val
         elif tag == "pin":

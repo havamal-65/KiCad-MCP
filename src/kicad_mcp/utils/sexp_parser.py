@@ -282,6 +282,160 @@ def remove_sexp_block(content: str, start: int, end: int) -> str:
         return after
 
 
+def find_footprint_block_by_reference(content: str, reference: str) -> tuple[int, int] | None:
+    """Locate a PCB footprint block by its Reference property.
+
+    PCB footprint instances look like::
+
+        (footprint "Resistor_SMD:R_0805" (layer "F.Cu") (at 100 50)
+          ...
+          (property "Reference" "R1" ...)
+          ...
+        )
+
+    This function scans for every ``(footprint `` occurrence, extracts the
+    full balanced block, and checks whether the block contains a
+    ``(property "Reference" "<reference>" ...)`` child.
+
+    Also handles the older ``(fp_text reference "R1" ...)`` format.
+
+    Args:
+        content: Full PCB file text.
+        reference: The reference designator to find (e.g. ``"R1"``).
+
+    Returns:
+        ``(start_index, end_index)`` of the block in the text (end is
+        inclusive of the closing ``)``) , or ``None`` if not found.
+    """
+    escaped_ref = re.escape(reference)
+    ref_pattern = re.compile(
+        rf'\(property\s+"Reference"\s+"{escaped_ref}"'
+    )
+    fp_text_pattern = re.compile(
+        rf'\(fp_text\s+reference\s+"{escaped_ref}"'
+    )
+
+    search_start = 0
+    while True:
+        idx = content.find("(footprint ", search_start)
+        if idx == -1:
+            break
+
+        end = _walk_balanced_parens(content, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+
+        block_text = content[idx:end + 1]
+
+        if ref_pattern.search(block_text) or fp_text_pattern.search(block_text):
+            return (idx, end)
+
+        search_start = end + 1
+
+    return None
+
+
+def find_wire_block_by_endpoints(
+    content: str,
+    start_x: float, start_y: float,
+    end_x: float, end_y: float,
+    tolerance: float = 0.01,
+) -> tuple[int, int] | None:
+    """Locate a wire block by its start/end coordinates.
+
+    Scans for ``(wire (pts (xy sx sy) (xy ex ey)) ...)`` blocks and checks
+    whether both endpoints match the given coordinates within *tolerance*.
+
+    Args:
+        content: Full schematic file text.
+        start_x: Expected start X coordinate.
+        start_y: Expected start Y coordinate.
+        end_x: Expected end X coordinate.
+        end_y: Expected end Y coordinate.
+        tolerance: Maximum allowed difference per coordinate (mm).
+
+    Returns:
+        ``(start_index, end_index)`` inclusive, or ``None`` if not found.
+    """
+    search_start = 0
+    while True:
+        idx = content.find("(wire ", search_start)
+        if idx == -1:
+            break
+
+        end = _walk_balanced_parens(content, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+
+        block = content[idx:end + 1]
+
+        # Extract the two (xy ...) values from (pts ...)
+        pts_match = re.search(
+            r'\(pts\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\)',
+            block,
+        )
+        if pts_match:
+            wx1 = float(pts_match.group(1))
+            wy1 = float(pts_match.group(2))
+            wx2 = float(pts_match.group(3))
+            wy2 = float(pts_match.group(4))
+
+            if (abs(wx1 - start_x) <= tolerance and abs(wy1 - start_y) <= tolerance
+                    and abs(wx2 - end_x) <= tolerance and abs(wy2 - end_y) <= tolerance):
+                return (idx, end)
+
+        search_start = end + 1
+
+    return None
+
+
+def find_no_connect_block_by_position(
+    content: str,
+    x: float, y: float,
+    tolerance: float = 0.01,
+) -> tuple[int, int] | None:
+    """Locate a no_connect block by its position.
+
+    Scans for ``(no_connect (at x y) ...)`` blocks and checks whether
+    the position matches within *tolerance*.
+
+    Args:
+        content: Full schematic file text.
+        x: Expected X coordinate.
+        y: Expected Y coordinate.
+        tolerance: Maximum allowed difference per coordinate (mm).
+
+    Returns:
+        ``(start_index, end_index)`` inclusive, or ``None`` if not found.
+    """
+    search_start = 0
+    while True:
+        idx = content.find("(no_connect ", search_start)
+        if idx == -1:
+            break
+
+        end = _walk_balanced_parens(content, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+
+        block = content[idx:end + 1]
+
+        at_match = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)\)', block)
+        if at_match:
+            nx = float(at_match.group(1))
+            ny = float(at_match.group(2))
+
+            if abs(nx - x) <= tolerance and abs(ny - y) <= tolerance:
+                return (idx, end)
+
+        search_start = end + 1
+
+    return None
+
+
 def extract_sexp_block(content: str, tag: str, name: str) -> str | None:
     """Extract a complete S-expression block from raw text by tag and name.
 

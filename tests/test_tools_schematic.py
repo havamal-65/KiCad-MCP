@@ -48,6 +48,127 @@ class TestAddComponent:
         assert result["status"] == "success"
         assert result["reference"] == "R5"
 
+    def test_add_file_backend_kicad8_fields(self, tmp_path: Path):
+        """Test that add_component produces KiCad 8+ required fields."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_content = (
+            '(kicad_sch (version 20231120) (generator "test")\n'
+            '  (uuid "aaaa-bbbb-cccc-dddd")\n'
+            '  (lib_symbols\n'
+            '  )\n'
+            ')\n'
+        )
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(sch_content, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        ops._symbol_libs = []
+        result = ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+        assert result["reference"] == "R1"
+
+        content = sch_file.read_text(encoding="utf-8")
+        assert "(unit 1)" in content
+        assert "(in_bom yes)" in content
+        assert "(on_board yes)" in content
+        assert "(dnp no)" in content
+        assert "(instances" in content
+        assert '(path "/aaaa-bbbb-cccc-dddd"' in content
+        assert '(reference "R1")' in content
+
+
+class TestCreateSchematic:
+    def test_create_via_mock(self, mcp_sch: FastMCP, tmp_path: Path):
+        """Test create_schematic tool via mock backend."""
+        sch_file = tmp_path / "new.kicad_sch"
+        result_json = mcp_sch._tool_manager._tools["create_schematic"].fn(
+            path=str(sch_file),
+            title="Test Schematic",
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["title"] == "Test Schematic"
+
+    def test_create_refuses_overwrite(self, mcp_sch: FastMCP, tmp_path: Path):
+        """Test that create_schematic refuses to overwrite an existing file."""
+        sch_file = tmp_path / "existing.kicad_sch"
+        sch_file.write_text("(kicad_sch)", encoding="utf-8")
+        result_json = mcp_sch._tool_manager._tools["create_schematic"].fn(
+            path=str(sch_file),
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "error"
+        assert "already exists" in result["message"]
+
+    def test_create_file_backend(self, tmp_path: Path):
+        """Test FileSchematicOps.create_schematic generates valid structure."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "new.kicad_sch"
+        ops = FileSchematicOps()
+        result = ops.create_schematic(sch_file, title="My Circuit", revision="1.0")
+        assert result["title"] == "My Circuit"
+        assert result["revision"] == "1.0"
+        assert result["uuid"]
+
+        content = sch_file.read_text(encoding="utf-8")
+        assert "(kicad_sch" in content
+        assert '(version 20231120)' in content
+        assert '(generator "kicad_mcp")' in content
+        assert f'(uuid "{result["uuid"]}")' in content
+        assert '(paper "A4")' in content
+        assert "(lib_symbols" in content
+        assert "(sheet_instances" in content
+        assert '(title "My Circuit")' in content
+        assert '(rev "1.0")' in content
+
+    def test_create_then_add_component(self, tmp_path: Path):
+        """Test end-to-end: create schematic then add a component."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        ops = FileSchematicOps()
+        ops._symbol_libs = []
+
+        create_result = ops.create_schematic(sch_file)
+        add_result = ops.add_component(sch_file, "Device:R", "R1", "10k", 100.0, 50.0)
+
+        assert add_result["reference"] == "R1"
+        content = sch_file.read_text(encoding="utf-8")
+        assert '(lib_id "Device:R")' in content
+        assert "(in_bom yes)" in content
+        assert "(instances" in content
+        assert f'(path "/{create_result["uuid"]}"' in content
+
+
+class TestAddPowerSymbolKiCad8:
+    def test_power_symbol_kicad8_fields(self, tmp_path: Path):
+        """Test that add_power_symbol produces KiCad 8+ required fields."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_content = (
+            '(kicad_sch (version 20231120) (generator "test")\n'
+            '  (uuid "aaaa-bbbb-cccc-dddd")\n'
+            '  (lib_symbols\n'
+            '  )\n'
+            ')\n'
+        )
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(sch_content, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        ops._symbol_libs = []
+        result = ops.add_power_symbol(sch_file, "GND", 100.0, 80.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        assert "(unit 1)" in content
+        assert "(in_bom yes)" in content
+        assert "(on_board yes)" in content
+        assert "(dnp no)" in content
+        assert "(instances" in content
+        assert '(path "/aaaa-bbbb-cccc-dddd"' in content
+        assert f'(reference "{result["reference"]}")' in content
+
 
 class TestAddWire:
     def test_add(self, mcp_sch: FastMCP, sample_schematic_path: Path):
@@ -728,3 +849,444 @@ class TestLibSymbolsCache:
         assert "(lib_symbols" in content
         assert '(symbol "Device:R"' in content
         assert '(symbol "Device:R_0_1"' in content
+
+
+# --- Net connectivity tool tests ---
+
+class TestNetConnectivity:
+    def test_get_pin_net_via_mock(self, mcp_sch: FastMCP, sample_schematic_path: Path):
+        """Test get_pin_net tool returns expected mock data."""
+        result_json = mcp_sch._tool_manager._tools["get_pin_net"].fn(
+            path=str(sample_schematic_path),
+            reference="R1",
+            pin_number="1",
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["reference"] == "R1"
+        assert result["pin_number"] == "1"
+        assert result["net_name"] == "VCC"
+
+    def test_get_net_connections_via_mock(self, mcp_sch: FastMCP, sample_schematic_path: Path):
+        """Test get_net_connections tool returns expected mock data."""
+        result_json = mcp_sch._tool_manager._tools["get_net_connections"].fn(
+            path=str(sample_schematic_path),
+            net_name="VCC",
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["net_name"] == "VCC"
+        assert len(result["pins"]) > 0
+        assert result["pins"][0]["reference"] == "R1"
+
+    def test_connectivity_with_wired_schematic(self, tmp_path: Path):
+        """Test _build_connectivity with a schematic that has wires and labels."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        # Create a schematic with:
+        # - R1 at (100, 50), pins at (100, 48.73) and (100, 51.27) (lib pin at 0,±1.27)
+        # - A wire from (100, 48.73) to (100, 40)
+        # - A label "VCC" at (100, 40)
+        sch_content = (
+            '(kicad_sch (version 20230121) (generator "test")\n'
+            '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+            '  (lib_symbols\n'
+            '    (symbol "Device:R"\n'
+            '      (symbol "Device:R_0_1"\n'
+            '        (polyline (pts (xy 0 -1.016) (xy 0 1.016)))\n'
+            '      )\n'
+            '      (symbol "Device:R_1_1"\n'
+            '        (pin passive line (at 0 1.27 270) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "1" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '        (pin passive line (at 0 -1.27 90) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "2" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '      )\n'
+            '    )\n'
+            '  )\n'
+            '  (wire (pts (xy 100 48.73) (xy 100 40))\n'
+            '    (stroke (width 0) (type default))\n'
+            '    (uuid "aaaa")\n'
+            '  )\n'
+            '  (label "VCC" (at 100 40 0)\n'
+            '    (effects (font (size 1.27 1.27)))\n'
+            '    (uuid "bbbb")\n'
+            '  )\n'
+            '  (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)\n'
+            '    (uuid "cccc")\n'
+            '    (property "Reference" "R1" (at 100 48 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 100 52 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '  )\n'
+            ')\n'
+        )
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(sch_content, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        connectivity = ops._build_connectivity(sch_file)
+
+        # Should have at least one net
+        assert len(connectivity) > 0
+
+        # Check that R1 pin 1 is in the connectivity map
+        found_r1_pin1 = False
+        for net_name, pins in connectivity.items():
+            for pin in pins:
+                if pin["reference"] == "R1" and pin["pin_number"] == "1":
+                    found_r1_pin1 = True
+        assert found_r1_pin1, "R1 pin 1 should be in connectivity map"
+
+    def test_get_pin_net_file_backend(self, tmp_path: Path):
+        """Test get_pin_net returns a result for a simple schematic."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_content = (
+            '(kicad_sch (version 20230121) (generator "test")\n'
+            '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+            '  (lib_symbols\n'
+            '    (symbol "Device:R"\n'
+            '      (symbol "Device:R_1_1"\n'
+            '        (pin passive line (at 0 1.27 270) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "1" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '        (pin passive line (at 0 -1.27 90) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "2" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '      )\n'
+            '    )\n'
+            '  )\n'
+            '  (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)\n'
+            '    (uuid "cccc")\n'
+            '    (property "Reference" "R1" (at 100 48 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 100 52 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '  )\n'
+            ')\n'
+        )
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(sch_content, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        result = ops.get_pin_net(sch_file, "R1", "1")
+        assert result["reference"] == "R1"
+        assert result["pin_number"] == "1"
+        # With no wires/labels, the net will be auto-named
+        assert result.get("net_name") is not None
+
+
+# --- Sync schematic to PCB tests ---
+
+class TestSyncSchematicToPcb:
+    def test_sync_places_missing_components(self):
+        """Test that sync places components missing from PCB."""
+        from unittest.mock import MagicMock
+
+        mcp = FastMCP("test")
+        mock_backend = MagicMock(spec=CompositeBackend)
+
+        sch_ops = MagicMock()
+        sch_ops.read_schematic.return_value = {
+            "symbols": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R",
+                 "footprint": "Resistor_SMD:R_0805"},
+                {"reference": "R2", "value": "4.7k", "lib_id": "Device:R",
+                 "footprint": "Resistor_SMD:R_0402"},
+                {"reference": "#PWR01", "value": "GND", "lib_id": "power:GND", "is_power": True},
+            ],
+        }
+        pcb_ops = MagicMock()
+        pcb_ops.read_board.return_value = {
+            "components": [
+                {"reference": "R1", "value": "10k", "footprint": "Resistor_SMD:R_0805"},
+            ],
+        }
+
+        board_modify_ops = MagicMock()
+        board_modify_ops.place_component.return_value = {
+            "reference": "R2", "footprint": "Resistor_SMD:R_0402",
+            "position": {"x": 50.0, "y": 50.0},
+        }
+
+        mock_backend.get_schematic_ops.return_value = sch_ops
+        mock_backend.get_board_ops.return_value = pcb_ops
+        mock_backend.get_board_modify_ops.return_value = board_modify_ops
+
+        from kicad_mcp.utils.change_log import ChangeLog
+        change_log = ChangeLog(Path("/dev/null"))
+        from kicad_mcp.tools.schematic import register_tools
+        register_tools(mcp, mock_backend, change_log)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sch = Path(td) / "test.kicad_sch"
+            pcb = Path(td) / "test.kicad_pcb"
+            sch.write_text("(kicad_sch)")
+            pcb.write_text("(kicad_pcb)")
+
+            result_json = mcp._tool_manager._tools["sync_schematic_to_pcb"].fn(
+                schematic_path=str(sch),
+                board_path=str(pcb),
+            )
+
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["summary"]["components_placed"] == 1
+        # R2 should have been placed
+        placed = [a for a in result["actions"] if a["type"] == "placed"]
+        assert len(placed) == 1
+        assert placed[0]["reference"] == "R2"
+
+    def test_sync_reports_value_mismatch(self):
+        """Test that sync updates value mismatches."""
+        from unittest.mock import MagicMock
+
+        mcp = FastMCP("test")
+        mock_backend = MagicMock(spec=CompositeBackend)
+
+        sch_ops = MagicMock()
+        sch_ops.read_schematic.return_value = {
+            "symbols": [
+                {"reference": "R1", "value": "22k", "lib_id": "Device:R",
+                 "footprint": "Resistor_SMD:R_0805"},
+            ],
+        }
+        pcb_ops = MagicMock()
+        pcb_ops.read_board.return_value = {
+            "components": [
+                {"reference": "R1", "value": "10k", "footprint": "Resistor_SMD:R_0805"},
+            ],
+        }
+        board_modify_ops = MagicMock()
+        mock_backend.get_schematic_ops.return_value = sch_ops
+        mock_backend.get_board_ops.return_value = pcb_ops
+        mock_backend.get_board_modify_ops.return_value = board_modify_ops
+
+        from kicad_mcp.utils.change_log import ChangeLog
+        change_log = ChangeLog(Path("/dev/null"))
+        from kicad_mcp.tools.schematic import register_tools
+        register_tools(mcp, mock_backend, change_log)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sch = Path(td) / "test.kicad_sch"
+            pcb = Path(td) / "test.kicad_pcb"
+            sch.write_text("(kicad_sch)")
+            # Write a real PCB with R1 so the value can be updated
+            pcb_content = (
+                '(kicad_pcb (version 20240108) (generator "test")\n'
+                '  (footprint "Resistor_SMD:R_0805" (layer "F.Cu")\n'
+                '    (at 100 50)\n'
+                '    (property "Reference" "R1" (at 0 0 0))\n'
+                '    (property "Value" "10k" (at 0 0 0))\n'
+                '  )\n'
+                ')\n'
+            )
+            pcb.write_text(pcb_content)
+
+            result_json = mcp._tool_manager._tools["sync_schematic_to_pcb"].fn(
+                schematic_path=str(sch),
+                board_path=str(pcb),
+            )
+
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        # Value should have been updated
+        value_updates = [a for a in result["actions"] if a["type"] == "value_updated"]
+        assert len(value_updates) == 1
+        assert value_updates[0]["old_value"] == "10k"
+        assert value_updates[0]["new_value"] == "22k"
+
+    def test_sync_reports_extra_and_footprint_mismatch(self):
+        """Test that sync reports extra PCB components and footprint mismatches."""
+        from unittest.mock import MagicMock
+
+        mcp = FastMCP("test")
+        mock_backend = MagicMock(spec=CompositeBackend)
+
+        sch_ops = MagicMock()
+        sch_ops.read_schematic.return_value = {
+            "symbols": [
+                {"reference": "R1", "value": "10k", "lib_id": "Device:R",
+                 "footprint": "Resistor_SMD:R_0402"},
+            ],
+        }
+        pcb_ops = MagicMock()
+        pcb_ops.read_board.return_value = {
+            "components": [
+                {"reference": "R1", "value": "10k", "footprint": "Resistor_SMD:R_0805"},
+                {"reference": "U1", "value": "ATmega", "footprint": "TQFP-44"},
+            ],
+        }
+        board_modify_ops = MagicMock()
+        mock_backend.get_schematic_ops.return_value = sch_ops
+        mock_backend.get_board_ops.return_value = pcb_ops
+        mock_backend.get_board_modify_ops.return_value = board_modify_ops
+
+        from kicad_mcp.utils.change_log import ChangeLog
+        change_log = ChangeLog(Path("/dev/null"))
+        from kicad_mcp.tools.schematic import register_tools
+        register_tools(mcp, mock_backend, change_log)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sch = Path(td) / "test.kicad_sch"
+            pcb = Path(td) / "test.kicad_pcb"
+            sch.write_text("(kicad_sch)")
+            pcb.write_text("(kicad_pcb)")
+
+            result_json = mcp._tool_manager._tools["sync_schematic_to_pcb"].fn(
+                schematic_path=str(sch),
+                board_path=str(pcb),
+            )
+
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+
+        # U1 extra in PCB
+        extra = [w for w in result["warnings"] if w["type"] == "extra_in_pcb"]
+        assert len(extra) == 1
+        assert extra[0]["reference"] == "U1"
+
+        # R1 footprint mismatch
+        fp_mm = [w for w in result["warnings"] if w["type"] == "footprint_mismatch"]
+        assert len(fp_mm) == 1
+        assert fp_mm[0]["reference"] == "R1"
+
+    def test_sync_via_mock_tool(self, mcp_sch: FastMCP, sample_schematic_path: Path,
+                                 sample_board_path: Path):
+        """Test sync tool runs through mock backend without error."""
+        result_json = mcp_sch._tool_manager._tools["sync_schematic_to_pcb"].fn(
+            schematic_path=str(sample_schematic_path),
+            board_path=str(sample_board_path),
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert "summary" in result
+        assert "actions" in result
+        assert "warnings" in result
+
+
+# --- remove_wire tests ---
+
+WIRE_TEST_SCHEMATIC = (
+    '(kicad_sch (version 20230121) (generator "test")\n'
+    '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+    '  (lib_symbols)\n'
+    '  (wire (pts (xy 100 50) (xy 120 50))\n'
+    '    (stroke (width 0) (type default))\n'
+    '    (uuid "aaaa-1111")\n'
+    '  )\n'
+    '  (wire (pts (xy 200 80) (xy 200 100))\n'
+    '    (stroke (width 0) (type default))\n'
+    '    (uuid "aaaa-2222")\n'
+    '  )\n'
+    ')\n'
+)
+
+
+class TestRemoveWire:
+    def test_remove_via_mock(self, mcp_sch: FastMCP, sample_schematic_path: Path):
+        """Test remove_wire tool via mock backend."""
+        result_json = mcp_sch._tool_manager._tools["remove_wire"].fn(
+            path=str(sample_schematic_path),
+            start_x=10.0, start_y=20.0,
+            end_x=30.0, end_y=40.0,
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["removed"] is True
+
+    def test_remove_file_backend(self, tmp_path: Path):
+        """Test remove_wire via FileSchematicOps on a real file."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(WIRE_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        result = ops.remove_wire(sch_file, 100, 50, 120, 50)
+        assert result["removed"] is True
+        assert result["start"] == {"x": 100, "y": 50}
+        assert result["end"] == {"x": 120, "y": 50}
+
+        modified = sch_file.read_text(encoding="utf-8")
+        assert "aaaa-1111" not in modified
+        # Second wire should remain
+        assert "aaaa-2222" in modified
+        assert "(xy 200 80)" in modified
+
+    def test_remove_not_found(self, tmp_path: Path):
+        """Test removing a non-existent wire raises ValueError."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(WIRE_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        with pytest.raises(ValueError, match="not found"):
+            ops.remove_wire(sch_file, 999, 999, 888, 888)
+
+
+# --- remove_no_connect tests ---
+
+NO_CONNECT_TEST_SCHEMATIC = (
+    '(kicad_sch (version 20230121) (generator "test")\n'
+    '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+    '  (lib_symbols)\n'
+    '  (no_connect (at 100 50) (uuid "nc-1111"))\n'
+    '  (no_connect (at 200 80) (uuid "nc-2222"))\n'
+    ')\n'
+)
+
+
+class TestRemoveNoConnect:
+    def test_remove_via_mock(self, mcp_sch: FastMCP, sample_schematic_path: Path):
+        """Test remove_no_connect tool via mock backend."""
+        result_json = mcp_sch._tool_manager._tools["remove_no_connect"].fn(
+            path=str(sample_schematic_path),
+            x=50.0, y=60.0,
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["removed"] is True
+
+    def test_remove_file_backend(self, tmp_path: Path):
+        """Test remove_no_connect via FileSchematicOps on a real file."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(NO_CONNECT_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        result = ops.remove_no_connect(sch_file, 100, 50)
+        assert result["removed"] is True
+        assert result["position"] == {"x": 100, "y": 50}
+
+        modified = sch_file.read_text(encoding="utf-8")
+        assert "nc-1111" not in modified
+        # Second no_connect should remain
+        assert "nc-2222" in modified
+        assert "(at 200 80)" in modified
+
+    def test_remove_not_found(self, tmp_path: Path):
+        """Test removing a non-existent no_connect raises ValueError."""
+        from kicad_mcp.backends.file_backend import FileSchematicOps
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(NO_CONNECT_TEST_SCHEMATIC, encoding="utf-8")
+
+        ops = FileSchematicOps()
+        with pytest.raises(ValueError, match="not found"):
+            ops.remove_no_connect(sch_file, 999, 999)

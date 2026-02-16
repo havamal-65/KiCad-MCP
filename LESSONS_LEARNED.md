@@ -36,11 +36,11 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: Added `compare_schematic_pcb` tool that detects missing components, footprint mismatches, and value mismatches between schematic and PCB. Power symbols (references starting with `#`) are automatically excluded. Reports missing_from_pcb, missing_from_schematic, footprint_mismatches, and value_mismatches with a summary count.
 
-### 6. No Schematic-to-PCB Sync Tool (PARTIALLY FIXED)
+### 6. No Schematic-to-PCB Sync Tool (FIXED)
 
 **Problem**: After modifying the schematic, there's no MCP tool to sync changes to the PCB. Users must open KiCad GUI and run "Update PCB from Schematic" manually.
 
-**Fix Applied (partial)**: `compare_schematic_pcb` provides the diagnostic side — detects what's out of sync. Full programmatic sync (`sync_schematic_to_pcb`) still requires kicad-cli or KiCad IPC backend.
+**Fix Applied**: Added `sync_schematic_to_pcb` tool that compares schematic and PCB, then auto-places missing components and updates value mismatches. Footprint mismatches and extra PCB components are reported as warnings for manual review. Also added `compare_schematic_pcb` for read-only diagnostics.
 
 ### 7. No Way to Delete or Modify Placed Components (FIXED)
 
@@ -48,11 +48,11 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: Added `remove_component`, `move_schematic_component`, and `update_component_property` tools. All use text-level S-expression block finding (via `find_symbol_block_by_reference()`) to locate the exact symbol instance while skipping the `lib_symbols` cache section. The move tool shifts all property label positions by the same delta. The update tool can modify existing properties or append new ones (hidden by default).
 
-### 8. Library Symbol Cache Management
+### 8. Library Symbol Cache Management (FIXED)
 
 **Problem**: When adding symbols to a schematic via file manipulation, the `lib_symbols` section must contain the symbol definition for KiCad to render it. Power symbols especially need their lib_symbols cache entry. Currently `add_power_symbol` just inserts the instance and warns if the cache is missing.
 
-**Enhancement Needed**: Auto-populate `lib_symbols` cache when adding components, or provide a `refresh_lib_symbols_cache` tool.
+**Fix Applied**: `add_component` and `add_power_symbol` now auto-populate the `lib_symbols` cache by looking up the symbol definition from installed KiCad libraries and injecting it into the schematic file. Sub-symbols are correctly renamed with the library prefix.
 
 ### 9. No Hierarchical Sheet Support
 
@@ -60,17 +60,17 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Enhancement Needed**: Support for reading and navigating hierarchical sheets.
 
-### 10. Footprint-to-Symbol Mapping Is Manual
+### 10. Footprint-to-Symbol Mapping Is Manual (FIXED)
 
 **Problem**: When placing a component, the user must know the exact footprint lib_id string. No tool helps find the right footprint for a given symbol.
 
-**Enhancement Needed**: `suggest_footprints(symbol_lib_id)` tool that reads the symbol's default footprint filter.
+**Fix Applied**: Added `suggest_footprints` tool that reads the symbol's `fp_filter` patterns and searches installed footprint libraries for matching footprints.
 
-### 11. No Net-Aware Operations
+### 11. No Net-Aware Operations (FIXED)
 
 **Problem**: Can't query "what net is this pin on?" or "show me all connections to net +3V3". Wire routing is blind — connect points and hope the netlist is correct.
 
-**Enhancement Needed**: `get_net_connections(path, net_name)`, `get_pin_net(path, reference, pin)` tools.
+**Fix Applied**: Added `get_pin_net` (get the net connected to a specific pin) and `get_net_connections` (get all pins, labels, and wires on a named net) tools. Uses file-based connectivity analysis that traces wires, labels, and power symbols.
 
 ### 12. No ERC/DRC from MCP After Modifications
 
@@ -90,24 +90,26 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 2 | `remove_component` (schematic) | **DONE** | Can't fix mistakes without delete capability |
 | 3 | `move_schematic_component` (schematic) | **DONE** | Repositioning without delete+re-add |
 | 4 | `update_component_property` | **DONE** | Change footprint, value, or custom props on existing symbols |
-| 5 | Auto-populate `lib_symbols` cache | Planned | Components added via MCP should be renderable in KiCad immediately |
+| 5 | Auto-populate `lib_symbols` cache | **DONE** | Components added via MCP are renderable in KiCad immediately |
+| 6 | `create_schematic` | **DONE** | Create valid KiCad 8+ schematic files from scratch via MCP |
+| 7 | KiCad 8+ s-expression fields | **DONE** | `(unit)`, `(in_bom)`, `(on_board)`, `(dnp)`, `(instances)` emitted by add_component/add_power_symbol |
 
 ### P1 — Important for Practical Workflows
 
-| # | Enhancement | Why |
-|---|------------|-----|
-| 6 | `sync_schematic_to_pcb` | Programmatic "Update PCB from Schematic" |
-| 7 | `suggest_footprints(lib_id)` | Help users find correct footprint for a symbol |
-| 8 | `get_net_connections` / `get_pin_net` | Net-aware queries for intelligent wire routing |
-| 9 | `remove_wire` / `remove_no_connect` | Undo/fix wiring mistakes |
-| 10 | Hierarchical sheet read support | Real projects use sub-sheets |
+| # | Enhancement | Status | Why |
+|---|------------|--------|-----|
+| 8 | `sync_schematic_to_pcb` | **DONE** | Programmatic "Update PCB from Schematic" |
+| 9 | `suggest_footprints(lib_id)` | **DONE** | Help users find correct footprint for a symbol |
+| 10 | `get_net_connections` / `get_pin_net` | **DONE** | Net-aware queries for intelligent wire routing |
+| 11 | `remove_wire` / `remove_no_connect` | **DONE** | Undo/fix wiring mistakes |
+| 12 | Hierarchical sheet read support | Planned | Real projects use sub-sheets |
 
 ### P2 — Nice to Have
 
 | # | Enhancement | Why |
 |---|------------|-----|
-| 11 | `validate_schematic` (file-based ERC lite) | Check floating pins, unconnected nets without KiCad CLI |
-| 12 | `auto_place_components` | Suggest initial component placement based on connectivity |
-| 13 | `add_text` / `add_graphic` (schematic) | Annotations like "AIRFLOW ->" on the PCB |
-| 14 | Batch operations | Place multiple components/wires in one call for performance |
-| 15 | Undo/redo support | Track changes and allow rollback beyond file backups |
+| 13 | `validate_schematic` (file-based ERC lite) | Check floating pins, unconnected nets without KiCad CLI |
+| 14 | `auto_place_components` | Suggest initial component placement based on connectivity |
+| 15 | `add_text` / `add_graphic` (schematic) | Annotations like "AIRFLOW ->" on the PCB |
+| 16 | Batch operations | Place multiple components/wires in one call for performance |
+| 17 | Undo/redo support | Track changes and allow rollback beyond file backups |

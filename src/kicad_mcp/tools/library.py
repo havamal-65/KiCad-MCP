@@ -1,4 +1,4 @@
-"""Component library tools - 5 tools."""
+"""Component library tools - 6 tools."""
 
 from __future__ import annotations
 
@@ -108,4 +108,22 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         ops = backend.get_library_ops()
         result = ops.get_footprint_info(lib_id)
         change_log.record("get_footprint_info", {"lib_id": lib_id})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def suggest_footprints(lib_id: str) -> str:
+        """Suggest matching footprints for a symbol based on its footprint filters.
+
+        Reads the symbol's ki_fp_filters property (glob patterns like 'DIP*', 'SOIC*')
+        and matches them against all available footprint names.
+
+        Args:
+            lib_id: Symbol identifier in 'Library:Symbol' format (e.g. 'Device:R', 'MCU_Microchip:ATmega328P-AU').
+
+        Returns:
+            JSON with fp_filters used and matching footprints list.
+        """
+        ops = backend.get_library_ops()
+        result = ops.suggest_footprints(lib_id)
+        change_log.record("suggest_footprints", {"lib_id": lib_id})
         return json.dumps({"status": "success", **result}, indent=2)

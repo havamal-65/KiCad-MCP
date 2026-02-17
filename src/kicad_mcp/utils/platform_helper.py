@@ -148,6 +148,123 @@ def detect_kicad_version() -> str | None:
     return None
 
 
+def find_java() -> Path | None:
+    """Find a Java executable on this system.
+
+    Checks PATH first, then JAVA_HOME, then platform-specific default locations.
+
+    Returns:
+        Path to java executable if found, None otherwise.
+    """
+    # Check PATH first
+    java_in_path = shutil.which("java")
+    if java_in_path:
+        logger.debug("Found java in PATH: %s", java_in_path)
+        return Path(java_in_path)
+
+    # Check JAVA_HOME
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        java_bin = Path(java_home) / "bin" / ("java.exe" if get_platform() == "windows" else "java")
+        if java_bin.exists():
+            logger.debug("Found java via JAVA_HOME: %s", java_bin)
+            return java_bin
+
+    platform = get_platform()
+    candidates: list[Path] = []
+
+    if platform == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        # Eclipse Adoptium / Temurin
+        adoptium_base = Path(program_files) / "Eclipse Adoptium"
+        if adoptium_base.exists():
+            for jre_dir in sorted(adoptium_base.iterdir(), reverse=True):
+                candidates.append(jre_dir / "bin" / "java.exe")
+        # Oracle / OpenJDK
+        java_base = Path(program_files) / "Java"
+        if java_base.exists():
+            for jdk_dir in sorted(java_base.iterdir(), reverse=True):
+                candidates.append(jdk_dir / "bin" / "java.exe")
+
+    elif platform == "macos":
+        candidates.extend([
+            Path("/usr/bin/java"),
+            Path("/Library/Java/JavaVirtualMachines"),
+        ])
+        # Homebrew
+        for brew_dir in [Path("/opt/homebrew/opt/openjdk/bin/java"),
+                         Path("/usr/local/opt/openjdk/bin/java")]:
+            candidates.append(brew_dir)
+
+    else:  # linux
+        candidates.extend([
+            Path("/usr/bin/java"),
+            Path("/usr/local/bin/java"),
+        ])
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            logger.debug("Found java at: %s", candidate)
+            return candidate
+
+    logger.debug("java not found on this system")
+    return None
+
+
+def find_freerouting_jar() -> Path | None:
+    """Find a FreeRouting JAR file on this system.
+
+    Checks ~/.kicad-mcp/freerouting/ first, then common KiCad plugin directories.
+
+    Returns:
+        Path to freerouting JAR if found, None otherwise.
+    """
+    search_dirs: list[Path] = []
+
+    # User data directory
+    if os.name == "nt":
+        base = Path(os.environ.get("USERPROFILE", str(Path.home())))
+    else:
+        base = Path.home()
+    search_dirs.append(base / ".kicad-mcp" / "freerouting")
+
+    # KiCad plugin directories
+    platform = get_platform()
+    if platform == "windows":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            for version in ["9.0", "8.0", "7.0"]:
+                search_dirs.append(
+                    Path(appdata) / "kicad" / version / "3rdparty" / "plugins"
+                    / "com_github_freerouting_freerouting" / "plugins" / "jar"
+                )
+        documents = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
+        for version in ["9.0", "8.0", "7.0"]:
+            search_dirs.append(
+                documents / "KiCad" / version / "3rdparty" / "plugins"
+                / "com_github_freerouting_freerouting" / "plugins" / "jar"
+            )
+    elif platform == "macos":
+        search_dirs.append(
+            Path.home() / "Library" / "Preferences" / "kicad" / "scripting" / "plugins"
+        )
+    else:
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        search_dirs.append(config_home / "kicad" / "scripting" / "plugins")
+
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        # Find JAR files matching freerouting pattern
+        jars = sorted(search_dir.glob("freerouting*.jar"), reverse=True)
+        if jars:
+            logger.debug("Found FreeRouting JAR: %s", jars[0])
+            return jars[0]
+
+    logger.debug("FreeRouting JAR not found on this system")
+    return None
+
+
 def get_platform_info() -> dict:
     """Return comprehensive platform information."""
     return {

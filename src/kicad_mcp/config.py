@@ -68,6 +68,14 @@ class KiCadMCPConfig(BaseSettings):
         default=None,
         description="Path to change audit log. Defaults to ~/.kicad-mcp/logs/changes.jsonl",
     )
+    freerouting_jar: Optional[Path] = Field(
+        default=None,
+        description="Path to FreeRouting JAR file for auto-routing",
+    )
+    java_path: Optional[Path] = Field(
+        default=None,
+        description="Path to java executable for running FreeRouting",
+    )
     sse_host: str = Field(default="127.0.0.1", description="SSE server host")
     sse_port: int = Field(default=8765, description="SSE server port")
 

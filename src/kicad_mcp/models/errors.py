@@ -77,3 +77,7 @@ class GitOperationError(LibraryManageError):
 
 class LibraryImportError(LibraryManageError):
     """Error importing a symbol or footprint between libraries."""
+
+
+class RoutingError(KiCadMCPError):
+    """Error during auto-routing operations."""

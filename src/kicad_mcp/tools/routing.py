@@ -15,7 +15,11 @@ from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.config import KiCadMCPConfig
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
-from kicad_mcp.utils.platform_helper import find_java, find_freerouting_jar
+from kicad_mcp.utils.platform_helper import (
+    download_freerouting,
+    find_freerouting_jar,
+    find_java,
+)
 from kicad_mcp.utils.validation import validate_kicad_path
 
 logger = get_logger("tools.routing")
@@ -286,6 +290,7 @@ print(f"TRACKS_AFTER={{after}}")
 
         Executes the FreeRouting Java application to auto-route the PCB.
         Auto-detects Java and FreeRouting JAR if not provided.
+        Downloads FreeRouting automatically if not found on the system.
 
         Args:
             dsn_path: Path to input .dsn file.
@@ -331,10 +336,16 @@ print(f"TRACKS_AFTER={{after}}")
         else:
             jar = find_freerouting_jar()
 
+        # Auto-download if not found
+        if jar is None or not jar.exists():
+            logger.info("FreeRouting JAR not found, downloading automatically...")
+            jar = download_freerouting()
+
         if jar is None or not jar.exists():
             return json.dumps({
                 "status": "error",
-                "message": "FreeRouting JAR not found. Download from "
+                "message": "FreeRouting JAR not found and auto-download failed. "
+                           "Download manually from "
                            "https://github.com/freerouting/freerouting/releases "
                            "or set KICAD_MCP_FREEROUTING_JAR environment variable.",
             })

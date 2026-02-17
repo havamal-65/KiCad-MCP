@@ -8,7 +8,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **56 MCP Tools** across 7 categories:
+- **61 MCP Tools** across 8 categories:
   - 📋 **Project Management** (5 tools): Open projects, list files, read/write metadata, query backend info
   - 📐 **Schematic Operations** (20 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries, net connectivity analysis, schematic-to-PCB comparison and sync
   - 🔌 **PCB Board Operations** (8 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules
@@ -16,6 +16,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
   - ✅ **Design Rule Checks** (3 tools): Run DRC and ERC validations
   - 📤 **Export Operations** (5 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs
+  - 🔀 **Auto-Routing** (5 tools): PCB trace auto-routing via FreeRouting (optional, requires FreeRouting)
 
 - **Multiple Backend Support**:
   - **IPC Backend**: Direct communication with running KiCad instance
@@ -55,6 +56,11 @@ For IPC backend (direct KiCad communication):
 ```bash
 pip install kicad-mcp[ipc]
 ```
+
+For auto-routing functionality (requires Java and FreeRouting):
+- Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
+- Ensure Java Runtime Environment (JRE) is installed
+- Set `KICAD_MCP_FREEROUTING_JAR` and `KICAD_MCP_JAVA_PATH` environment variables (or let the tool auto-detect)
 
 For development:
 ```bash
@@ -261,6 +267,18 @@ Add to your Cursor MCP settings:
 - `export_pick_and_place`: Export pick-and-place component placement file
 - `export_pdf`: Export a board or schematic to PDF
 
+### Auto-Routing (5 tools) - Optional
+**Requires:** [FreeRouting](https://github.com/freerouting/freerouting) and Java
+
+These tools provide automated PCB trace routing capabilities:
+- `export_dsn`: Export PCB to Specctra DSN format for FreeRouting
+- `import_ses`: Import routed SES session file back into PCB
+- `run_freerouter`: Execute FreeRouting auto-router on a DSN file
+- `clean_board_for_routing`: Remove keepouts and problematic tracks before routing
+- `autoroute`: Complete pipeline (clean → export → route → import)
+
+> **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without FreeRouting or Java.
+
 ## Backend Details
 
 ### Backend Priority
@@ -342,6 +360,12 @@ KiCad-MCP/
 
 ## Troubleshooting
 
+### Does KiCad-MCP require FreeRouting?
+
+**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 56 tools work without FreeRouting or Java.
+
+If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
+
 ### Backend Not Available
 
 Run `python -m kicad_mcp --check` to see which backends are available. Install missing dependencies:
@@ -350,6 +374,19 @@ Run `python -m kicad_mcp --check` to see which backends are available. Install m
 - SWIG: `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH
 - File: Always available (pure Python)
+
+### Auto-Routing Not Working
+
+Auto-routing requires both Java and FreeRouting:
+
+1. Install Java Runtime Environment (JRE)
+2. Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
+3. Either:
+   - Place the JAR in `~/.kicad-mcp/freerouting/`
+   - Set `KICAD_MCP_FREEROUTING_JAR` environment variable to JAR path
+   - Provide `freerouting_jar` parameter to the tool
+
+The tool will auto-detect Java and FreeRouting if properly installed.
 
 ### Logging
 

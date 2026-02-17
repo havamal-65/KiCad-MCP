@@ -8,7 +8,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **56 MCP Tools** across 7 categories:
+- **61 MCP Tools** across 8 categories:
   - 📋 **Project Management** (5 tools): Open projects, list files, read/write metadata, query backend info
   - 📐 **Schematic Operations** (20 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries, net connectivity analysis, schematic-to-PCB comparison and sync
   - 🔌 **PCB Board Operations** (8 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules
@@ -362,7 +362,7 @@ KiCad-MCP/
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 51 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 56 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

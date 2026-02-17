@@ -265,6 +265,88 @@ def find_freerouting_jar() -> Path | None:
     return None
 
 
+def detect_java_major_version(java_path: Path) -> int | None:
+    """Detect the major version of a Java installation.
+
+    Args:
+        java_path: Path to java executable.
+
+    Returns:
+        Major version number (e.g. 17, 21, 25) or None if undetectable.
+    """
+    import re
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [str(java_path), "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output = result.stderr + result.stdout
+        match = re.search(r'"(\d+)', output)
+        if match:
+            return int(match.group(1))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def download_freerouting(target_dir: Path | None = None) -> Path | None:
+    """Download a compatible FreeRouting JAR from GitHub releases.
+
+    Detects the installed Java version and downloads a compatible release:
+    - Java 25+: downloads latest (v2.x)
+    - Java 17-24: downloads v1.9.0 (last version supporting Java 17)
+
+    Args:
+        target_dir: Directory to save the JAR. Defaults to ~/.kicad-mcp/freerouting/.
+
+    Returns:
+        Path to the downloaded JAR, or None if download failed.
+    """
+    import urllib.request
+
+    if target_dir is None:
+        if os.name == "nt":
+            base = Path(os.environ.get("USERPROFILE", str(Path.home())))
+        else:
+            base = Path.home()
+        target_dir = base / ".kicad-mcp" / "freerouting"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine compatible version based on Java
+    java = find_java()
+    java_version = detect_java_major_version(java) if java else None
+
+    if java_version and java_version >= 25:
+        jar_name = "freerouting-2.1.0.jar"
+        url = "https://github.com/freerouting/freerouting/releases/download/v2.1.0/freerouting-2.1.0.jar"
+    else:
+        # v1.9.0 is the last version compatible with Java 17
+        jar_name = "freerouting-1.9.0.jar"
+        url = "https://github.com/freerouting/freerouting/releases/download/v1.9.0/freerouting-1.9.0.jar"
+
+    target_path = target_dir / jar_name
+    if target_path.exists():
+        logger.info("FreeRouting already downloaded: %s", target_path)
+        return target_path
+
+    logger.info("Downloading FreeRouting from %s ...", url)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "kicad-mcp"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+        target_path.write_bytes(data)
+        logger.info("Downloaded FreeRouting: %s (%d bytes)", target_path, len(data))
+        return target_path
+    except Exception as e:
+        logger.error("Failed to download FreeRouting: %s", e)
+        return None
+
+
 def get_platform_info() -> dict:
     """Return comprehensive platform information."""
     return {

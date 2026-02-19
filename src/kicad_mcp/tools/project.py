@@ -1,4 +1,4 @@
-"""Project management tools - 5 tools."""
+"""Project management tools - 6 tools."""
 
 from __future__ import annotations
 
@@ -153,6 +153,32 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 "message": "Save requires KiCad running with IPC backend. "
                            "File-based operations auto-save on modification.",
             })
+
+    @mcp.tool()
+    def get_active_project() -> str:
+        """Get the currently open KiCad project from a running KiCad instance.
+
+        Queries KiCad via IPC to discover which project is currently open,
+        along with any open schematic and PCB editor documents. Requires
+        KiCad 9+ running with IPC enabled.
+
+        Returns:
+            JSON with project_name, project_path, and open_documents list.
+        """
+        from kicad_mcp.backends.base import BackendCapability
+        if not backend.has_capability(BackendCapability.REAL_TIME_SYNC):
+            return json.dumps({
+                "status": "unavailable",
+                "message": "IPC backend is not available. Ensure KiCad 9+ is running "
+                           "with IPC enabled and the kipy package is installed.",
+            })
+
+        try:
+            result = backend.get_active_project()
+            change_log.record("get_active_project", {})
+            return json.dumps({"status": "success", **result}, indent=2)
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
 
     @mcp.tool()
     def get_backend_info() -> str:

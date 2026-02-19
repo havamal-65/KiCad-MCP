@@ -15,7 +15,7 @@ from kicad_mcp.backends.base import (
     SchematicOps,
 )
 from kicad_mcp.logging_config import get_logger
-from kicad_mcp.models.errors import CapabilityNotSupportedError
+from kicad_mcp.models.errors import CapabilityNotSupportedError, KiCadFileOpenError
 
 logger = get_logger("backend.composite")
 
@@ -58,6 +58,29 @@ class CompositeBackend:
             )
         return backend
 
+    def _check_file_write_safety(self, operation: str) -> None:
+        """Raise if a file-backend write would conflict with a running KiCad instance.
+
+        When KiCad is running (IPC backend available / REAL_TIME_SYNC capability),
+        it holds .kicad_sch and .kicad_pcb files open in memory. Direct file writes
+        would be silently overwritten when KiCad saves, corrupting the user's work.
+        """
+        if not self.has_capability(BackendCapability.REAL_TIME_SYNC):
+            return  # No IPC = no KiCad running, file writes are safe
+        raise KiCadFileOpenError(
+            f"Cannot {operation} via direct file write while KiCad is running. "
+            f"KiCad has files open in memory and would overwrite changes on save. "
+            f"Close KiCad first, or use IPC-capable operations."
+        )
+
+    def check_file_write_safe(self, operation: str) -> None:
+        """Public version of the file-write safety check.
+
+        Tools that bypass the backend routing (e.g. direct file writes in
+        sync_schematic_to_pcb) can call this to enforce the same guard.
+        """
+        self._check_file_write_safety(operation)
+
     def get_board_ops(self) -> BoardOps:
         """Get board operations from the best available backend."""
         backend = self._get_backend_for(BackendCapability.BOARD_READ)
@@ -71,6 +94,8 @@ class CompositeBackend:
     def get_board_modify_ops(self) -> BoardOps:
         """Get board modification operations (requires BOARD_MODIFY capability)."""
         backend = self._get_backend_for(BackendCapability.BOARD_MODIFY)
+        if backend.name == "file" and self.has_capability(BackendCapability.REAL_TIME_SYNC):
+            self._check_file_write_safety("modify PCB board")
         ops = backend.get_board_ops()
         if ops is None:
             raise CapabilityNotSupportedError(
@@ -88,6 +113,21 @@ class CompositeBackend:
             )
         return ops
 
+    def get_schematic_modify_ops(self) -> SchematicOps:
+        """Get schematic modification operations (requires SCHEMATIC_MODIFY capability).
+
+        Guards against direct file writes when KiCad is running.
+        """
+        backend = self._get_backend_for(BackendCapability.SCHEMATIC_MODIFY)
+        if backend.name == "file" and self.has_capability(BackendCapability.REAL_TIME_SYNC):
+            self._check_file_write_safety("modify schematic")
+        ops = backend.get_schematic_ops()
+        if ops is None:
+            raise CapabilityNotSupportedError(
+                f"Backend '{backend.name}' claims SCHEMATIC_MODIFY but returned no SchematicOps"
+            )
+        return ops
+
     def get_export_ops(self) -> ExportOps:
         """Get export operations from the best available backend."""
         backend = self._get_backend_for(BackendCapability.EXPORT_GERBER)
@@ -100,11 +140,19 @@ class CompositeBackend:
 
     def get_drc_ops(self) -> DRCOps:
         """Get DRC operations from the best available backend."""
-        backend = self._get_backend_for(BackendCapability.DRC)
+        backend = self._capability_map.get(BackendCapability.DRC)
+        if backend is None:
+            # Fall back to ERC-only backend (e.g. file backend for run_erc)
+            backend = self._capability_map.get(BackendCapability.ERC)
+        if backend is None:
+            raise CapabilityNotSupportedError(
+                "No backend available for DRC or ERC. "
+                f"Available capabilities: {[c.name for c in self._capability_map]}"
+            )
         ops = backend.get_drc_ops()
         if ops is None:
             raise CapabilityNotSupportedError(
-                f"Backend '{backend.name}' claims DRC but returned no DRCOps"
+                f"Backend '{backend.name}' claims DRC/ERC but returned no DRCOps"
             )
         return ops
 
@@ -127,6 +175,11 @@ class CompositeBackend:
                 f"Backend '{backend.name}' claims LIBRARY_MANAGE but returned no LibraryManageOps"
             )
         return ops
+
+    def get_active_project(self) -> dict[str, Any]:
+        """Query the currently open KiCad project (requires REAL_TIME_SYNC)."""
+        backend = self._get_backend_for(BackendCapability.REAL_TIME_SYNC)
+        return backend.get_active_project()
 
     def has_capability(self, capability: BackendCapability) -> bool:
         """Check if any backend provides a given capability."""

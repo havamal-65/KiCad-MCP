@@ -174,6 +174,14 @@ class SchematicOps(ABC):
         """Remove a no-connect marker identified by its position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def get_sheet_hierarchy(self, path: Path) -> dict[str, Any]:
+        """Get hierarchical sheet tree structure from a root schematic."""
+        raise NotImplementedError("This backend does not support hierarchy queries")
+
+    def validate_schematic(self, path: Path) -> dict[str, Any]:
+        """Run file-based electrical rules validation (no kicad-cli needed)."""
+        raise NotImplementedError("This backend does not support schematic validation")
+
     def get_net_connections(self, path: Path, net_name: str) -> dict[str, Any]:
         """Get all connections on a given net in the schematic."""
         raise NotImplementedError("This backend does not support net connectivity queries")
@@ -368,3 +376,11 @@ class KiCadBackend(ABC):
     def get_library_manage_ops(self) -> LibraryManageOps | None:
         """Get library management (write) operations handler, or None if not supported."""
         return None
+
+    def get_active_project(self) -> dict[str, Any]:
+        """Query the currently open KiCad project via IPC.
+
+        Returns:
+            Dict with project_name, project_path, and open_documents list.
+        """
+        raise NotImplementedError("This backend does not support active project queries")

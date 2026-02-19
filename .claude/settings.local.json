@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(git remote:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(grep:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(find /d/GitHub/KiCad_MCP/tests -name \"test_*.py\" -exec sh -c 'echo \"\"=== {} ===\"\" && grep \"\"^def test_\\\\|^async def test_\"\" \"\"$1\"\"' _ {} ;)",
+      "Bash(python3:*)",
+      "Bash(wc:*)",
+      "Bash(find:*)"
     ]
   }
 }

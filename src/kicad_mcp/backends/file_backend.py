@@ -12,6 +12,7 @@ from typing import Any
 from kicad_mcp.backends.base import (
     BackendCapability,
     BoardOps,
+    DRCOps,
     KiCadBackend,
     LibraryManageOps,
     LibraryOps,
@@ -411,9 +412,10 @@ class FileSchematicOps(SchematicOps):
                         label_data["position"] = pos
                 labels.append(label_data)
 
-        # Parse no_connects and junctions via sexp fallback (skip doesn't expose these well)
+        # Parse no_connects, junctions, and sheets via sexp fallback (skip doesn't expose these well)
         no_connects = []
         junctions = []
+        sheets = []
         try:
             tree = parse_sexp_file(path)
             for node in tree:
@@ -428,6 +430,10 @@ class FileSchematicOps(SchematicOps):
                     jn = _parse_position_node(node)
                     if jn:
                         junctions.append(jn)
+                elif tag == "sheet":
+                    sh = _parse_sheet_node(node)
+                    if sh:
+                        sheets.append(sh)
         except Exception:
             pass  # Non-critical, skip if parsing fails
 
@@ -439,12 +445,14 @@ class FileSchematicOps(SchematicOps):
                 "num_labels": len(labels),
                 "num_no_connects": len(no_connects),
                 "num_junctions": len(junctions),
+                "num_sheets": len(sheets),
             },
             "symbols": symbols,
             "wires": wires,
             "labels": labels,
             "no_connects": no_connects,
             "junctions": junctions,
+            "sheets": sheets,
         }
 
     def _read_with_sexp(self, path: Path) -> dict[str, Any]:
@@ -454,6 +462,7 @@ class FileSchematicOps(SchematicOps):
         labels = []
         no_connects = []
         junctions = []
+        sheets = []
 
         for node in tree:
             if not isinstance(node, list) or len(node) < 1:
@@ -479,6 +488,10 @@ class FileSchematicOps(SchematicOps):
                 jn = _parse_position_node(node)
                 if jn:
                     junctions.append(jn)
+            elif tag == "sheet":
+                sh = _parse_sheet_node(node)
+                if sh:
+                    sheets.append(sh)
 
         return {
             "info": {
@@ -488,12 +501,14 @@ class FileSchematicOps(SchematicOps):
                 "num_labels": len(labels),
                 "num_no_connects": len(no_connects),
                 "num_junctions": len(junctions),
+                "num_sheets": len(sheets),
             },
             "symbols": symbols,
             "wires": wires,
             "labels": labels,
             "no_connects": no_connects,
             "junctions": junctions,
+            "sheets": sheets,
         }
 
     def get_symbols(self, path: Path) -> list[dict[str, Any]]:
@@ -1355,6 +1370,237 @@ class FileSchematicOps(SchematicOps):
         }
 
 
+    def get_sheet_hierarchy(self, path: Path) -> dict[str, Any]:
+        """Recursively read the hierarchical sheet tree from a root schematic."""
+        visited: set[str] = set()
+
+        def _build_tree(sch_path: Path) -> dict[str, Any]:
+            resolved = str(sch_path.resolve())
+            if resolved in visited:
+                return {
+                    "name": sch_path.stem,
+                    "file": str(sch_path),
+                    "error": "circular reference detected",
+                    "sheets": [],
+                }
+            visited.add(resolved)
+
+            try:
+                data = self.read_schematic(sch_path)
+            except Exception as exc:
+                return {
+                    "name": sch_path.stem,
+                    "file": str(sch_path),
+                    "error": str(exc),
+                    "sheets": [],
+                }
+
+            info = data.get("info", {})
+            sheets_data = data.get("sheets", [])
+            children = []
+
+            for sh in sheets_data:
+                sheetfile = sh.get("sheetfile", "")
+                if not sheetfile:
+                    continue
+                # Resolve relative to parent schematic directory
+                child_path = sch_path.parent / sheetfile
+                if child_path.exists():
+                    child_tree = _build_tree(child_path)
+                    child_tree["name"] = sh.get("sheetname", child_path.stem)
+                    child_tree["pins"] = sh.get("pins", [])
+                    children.append(child_tree)
+                else:
+                    children.append({
+                        "name": sh.get("sheetname", sheetfile),
+                        "file": str(child_path),
+                        "error": "file not found",
+                        "sheets": [],
+                    })
+
+            return {
+                "name": sch_path.stem,
+                "file": str(sch_path),
+                "symbols_count": info.get("num_symbols", 0),
+                "wires_count": info.get("num_wires", 0),
+                "labels_count": info.get("num_labels", 0),
+                "sheets": children,
+            }
+
+        return _build_tree(path)
+
+    def validate_schematic(self, path: Path) -> dict[str, Any]:
+        """File-based electrical rules validation (no kicad-cli needed).
+
+        Checks for:
+        1. Duplicate reference designators (error)
+        2. Floating pins — not connected and no no-connect marker (warning)
+        3. Missing power connections (warning)
+        """
+        data = self.read_schematic(path)
+        symbols = data.get("symbols", [])
+        no_connects = data.get("no_connects", [])
+
+        violations: list[dict[str, Any]] = []
+        error_count = 0
+        warning_count = 0
+
+        TOLERANCE = 0.02
+
+        def _near(a: dict, b: dict) -> bool:
+            return (abs(a.get("x", 0) - b.get("x", 0)) < TOLERANCE
+                    and abs(a.get("y", 0) - b.get("y", 0)) < TOLERANCE)
+
+        # --- Check 1: Duplicate reference designators ---
+        ref_counts: dict[str, list[dict]] = {}
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            if not ref or ref.startswith("#"):
+                continue
+            if sym.get("is_power"):
+                continue
+            ref_counts.setdefault(ref, []).append(sym)
+
+        for ref, syms in ref_counts.items():
+            if len(syms) > 1:
+                positions = [s.get("position", {}) for s in syms]
+                violations.append({
+                    "severity": "error",
+                    "type": "duplicate_reference",
+                    "description": f"Duplicate reference designator '{ref}' ({len(syms)} instances)",
+                    "reference": ref,
+                    "positions": positions,
+                })
+                error_count += 1
+
+        # --- Check 2: Floating pins ---
+        # Build connectivity and find unconnected pins
+        try:
+            connectivity = self._build_connectivity(path)
+        except Exception:
+            connectivity = {}
+
+        # Collect all connected pin keys (reference + pin_number)
+        connected_pins: set[str] = set()
+        for net_name, pins in connectivity.items():
+            if len(pins) >= 2 or net_name:
+                for pin in pins:
+                    connected_pins.add(f"{pin['reference']}:{pin['pin_number']}")
+
+        # Build set of no-connect positions
+        nc_positions = [nc.get("position", {}) for nc in no_connects]
+
+        # Check each non-power symbol's pins
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            if not ref or ref.startswith("#") or sym.get("is_power"):
+                continue
+
+            try:
+                pin_result = self.get_symbol_pin_positions(path, ref)
+            except Exception:
+                continue
+
+            pin_positions = pin_result.get("pin_positions", {})
+            for pin_num, pos in pin_positions.items():
+                pin_key = f"{ref}:{pin_num}"
+                if pin_key in connected_pins:
+                    continue
+
+                # Check if there's a no-connect marker at this pin
+                has_nc = any(_near(pos, nc_pos) for nc_pos in nc_positions)
+                if has_nc:
+                    continue
+
+                # Check if it's in a net with at least one other pin
+                in_any_net = False
+                for net_name, pins in connectivity.items():
+                    for pin in pins:
+                        if pin["reference"] == ref and str(pin["pin_number"]) == str(pin_num):
+                            if len(pins) >= 2:
+                                in_any_net = True
+                            break
+                    if in_any_net:
+                        break
+
+                if not in_any_net:
+                    violations.append({
+                        "severity": "warning",
+                        "type": "floating_pin",
+                        "description": f"Pin {pin_num} of {ref} is not connected and has no no-connect marker",
+                        "reference": ref,
+                        "pin": pin_num,
+                        "position": pos,
+                    })
+                    warning_count += 1
+
+        # --- Check 3: Missing power connections ---
+        # Check that power symbol pins are connected to at least one non-power component
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            is_power = sym.get("is_power", False)
+            if not is_power and not ref.startswith("#"):
+                continue
+            if not ref:
+                continue
+
+            value = sym.get("value", ref)
+            # Check if this power net has any non-power pins connected
+            has_connections = False
+            for net_name, pins in connectivity.items():
+                if net_name == value and len(pins) > 0:
+                    has_connections = True
+                    break
+
+            if not has_connections:
+                violations.append({
+                    "severity": "warning",
+                    "type": "unconnected_power",
+                    "description": f"Power symbol '{value}' ({ref}) is not connected to any component pins",
+                    "reference": ref,
+                    "position": sym.get("position", {}),
+                })
+                warning_count += 1
+
+        return {
+            "passed": error_count == 0,
+            "violations": violations,
+            "error_count": error_count,
+            "warning_count": warning_count,
+            "checks_performed": [
+                "duplicate_reference",
+                "floating_pin",
+                "unconnected_power",
+            ],
+        }
+
+
+class FileDRCOps:
+    """File-based DRC/ERC operations (lite, no kicad-cli needed)."""
+
+    def __init__(self, schematic_ops: FileSchematicOps) -> None:
+        self._sch_ops = schematic_ops
+
+    def run_erc(self, schematic_path: Path, output: Path | None = None) -> dict[str, Any]:
+        """Run file-based ERC using validate_schematic."""
+        result = self._sch_ops.validate_schematic(schematic_path)
+        result["backend"] = "file"
+        result["note"] = "File-based ERC lite. For full ERC, use kicad-cli backend."
+
+        if output:
+            import json
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            result["report_file"] = str(output)
+
+        return result
+
+    def run_drc(self, board_path: Path, output: Path | None = None) -> dict[str, Any]:
+        raise NotImplementedError(
+            "File-based DRC is not supported. Use kicad-cli backend for board DRC."
+        )
+
+
 class FileLibraryOps(LibraryOps):
     """Library operations via direct file searching."""
 
@@ -1788,6 +2034,7 @@ class FileBackend(KiCadBackend):
             BackendCapability.BOARD_MODIFY,
             BackendCapability.SCHEMATIC_READ,
             BackendCapability.SCHEMATIC_MODIFY,
+            BackendCapability.ERC,
             BackendCapability.LIBRARY_SEARCH,
             BackendCapability.LIBRARY_MANAGE,
         }
@@ -1800,6 +2047,9 @@ class FileBackend(KiCadBackend):
 
     def get_schematic_ops(self) -> FileSchematicOps:
         return FileSchematicOps()
+
+    def get_drc_ops(self) -> FileDRCOps:  # type: ignore[override]
+        return FileDRCOps(FileSchematicOps())
 
     def get_library_ops(self) -> FileLibraryOps:
         return FileLibraryOps()
@@ -1894,6 +2144,40 @@ def _parse_setup(node: list) -> dict[str, Any]:
             except (ValueError, TypeError):
                 rules[tag] = child[1]
     return rules
+
+
+def _parse_sheet_node(node: list) -> dict[str, Any] | None:
+    """Parse a (sheet ...) S-expression block from a KiCad schematic."""
+    if len(node) < 2:
+        return None
+    sheet: dict[str, Any] = {"pins": []}
+    for child in node[1:]:
+        if not isinstance(child, list) or len(child) < 2:
+            continue
+        tag = child[0] if isinstance(child[0], str) else ""
+        if tag == "at" and len(child) >= 3:
+            sheet["position"] = {"x": float(child[1]), "y": float(child[2])}
+        elif tag == "size" and len(child) >= 3:
+            sheet["size"] = {"w": float(child[1]), "h": float(child[2])}
+        elif tag == "uuid":
+            sheet["uuid"] = child[1]
+        elif tag == "property" and len(child) >= 3:
+            if child[1] == "Sheetname":
+                sheet["sheetname"] = child[2]
+            elif child[1] == "Sheetfile":
+                sheet["sheetfile"] = child[2]
+        elif tag == "pin":
+            pin_info: dict[str, Any] = {}
+            if len(child) >= 3:
+                pin_info["name"] = child[1]
+                pin_info["direction"] = child[2]
+            for sub in child[1:]:
+                if isinstance(sub, list) and len(sub) >= 3 and sub[0] == "at":
+                    pin_info["position"] = {"x": float(sub[1]), "y": float(sub[2])}
+                elif isinstance(sub, list) and len(sub) >= 2 and sub[0] == "uuid":
+                    pin_info["uuid"] = sub[1]
+            sheet["pins"].append(pin_info)
+    return sheet if "sheetfile" in sheet else None
 
 
 def _parse_sch_symbol(node: list) -> dict[str, Any] | None:

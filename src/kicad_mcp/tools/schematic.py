@@ -1,4 +1,4 @@
-"""Schematic tools - 16 tools."""
+"""Schematic tools - 17 tools."""
 
 from __future__ import annotations
 
@@ -35,6 +35,32 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def get_sheet_hierarchy(path: str) -> str:
+        """Read the hierarchical sheet tree from a root schematic.
+
+        Recursively reads the root schematic and all sub-sheets to build
+        a tree structure showing the design hierarchy. Useful for complex
+        designs with multiple sub-sheets.
+
+        Args:
+            path: Path to the root .kicad_sch file.
+
+        Returns:
+            JSON with tree structure: {name, file, symbols_count, wires_count, sheets: [children]}.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        ops = backend.get_schematic_ops()
+        try:
+            result = ops.get_sheet_hierarchy(p)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Sheet hierarchy queries not supported by current backend.",
+            })
+        change_log.record("get_sheet_hierarchy", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
     def create_schematic(
         path: str,
         title: str = "",
@@ -60,7 +86,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 "status": "error",
                 "message": f"File already exists: {p}. Use read_schematic to work with existing files.",
             })
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.create_schematic(p, title=title, revision=revision)
         except NotImplementedError:
@@ -109,7 +135,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         validate_reference(reference)
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_component(
             p, lib_id, reference, value, x, y,
             rotation=rotation, mirror=mirror,
@@ -146,7 +172,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_wire(p, start_x, start_y, end_x, end_y)
         change_log.record(
             "add_wire",
@@ -186,7 +212,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             })
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_label(p, text, x, y, label_type)
         change_log.record(
             "add_label",
@@ -210,7 +236,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         backup = create_backup(p)
         try:
-            ops = backend.get_schematic_ops()
+            ops = backend.get_schematic_modify_ops()
             result = ops.annotate(p)
             change_log.record(
                 "annotate_schematic", {"path": path},
@@ -294,7 +320,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_no_connect(p, x, y)
         change_log.record(
             "add_no_connect",
@@ -330,7 +356,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_power_symbol(p, name, x, y, rotation)
         change_log.record(
             "add_power_symbol",
@@ -358,7 +384,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         validate_reference(reference)
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_component(p, reference)
         except ValueError as exc:
@@ -397,7 +423,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_wire(p, start_x, start_y, end_x, end_y)
         except ValueError as exc:
@@ -428,7 +454,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_no_connect(p, x, y)
         except ValueError as exc:
@@ -471,7 +497,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         validate_reference(reference)
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.move_component(p, reference, x, y, rotation=rotation)
         except ValueError as exc:
@@ -509,7 +535,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         validate_reference(reference)
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         try:
             result = ops.update_component_property(p, reference, property_name, property_value)
         except ValueError as exc:
@@ -850,6 +876,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                             )
                             match = val_pattern.search(block)
                             if match:
+                                backend.check_file_write_safe("update PCB component value")
                                 new_block = (
                                     block[:match.start(2)]
                                     + sch_val
@@ -926,7 +953,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
 
         backup = create_backup(p)
-        ops = backend.get_schematic_ops()
+        ops = backend.get_schematic_modify_ops()
         result = ops.add_junction(p, x, y)
         change_log.record(
             "add_junction",

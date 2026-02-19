@@ -19,6 +19,14 @@ class BackendNotAvailableError(BackendError):
     """Requested backend is not available in this environment."""
 
 
+class KiCadFileOpenError(BackendError):
+    """File write blocked because KiCad has the file open in memory.
+
+    Writing directly to .kicad_sch or .kicad_pcb while KiCad is running
+    causes KiCad to overwrite changes on save with its stale in-memory state.
+    """
+
+
 class ConnectionError(BackendError):
     """Failed to connect to KiCad instance."""
 

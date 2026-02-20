@@ -6,8 +6,8 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -38,45 +38,76 @@ def _get_pcbnew():
         return None
 
 
-def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
-    """Run a Python script using KiCad's bundled Python interpreter.
+_HELPER_SCRIPT = Path(__file__).parent.parent / "utils" / "pcbnew_helper.py"
 
-    Falls back to subprocess execution when pcbnew is not importable
-    in the current Python environment.
 
-    Args:
-        script: Python code to execute.
-        timeout: Timeout in seconds.
+def _find_kicad_python() -> Path | None:
+    """Find KiCad's bundled Python interpreter on the current platform.
+
+    On macOS and Windows, KiCad ships its own Python that includes the
+    ``pcbnew`` module.  On Linux, ``pcbnew`` is typically importable
+    system-wide via ``/usr/bin/python3``.
 
     Returns:
-        Tuple of (success, output_text).
+        Path to the interpreter, or ``None`` if not found.
     """
     from kicad_mcp.utils.platform_helper import get_platform
 
     platform = get_platform()
-    kicad_python = None
 
     if platform == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         for version in ["9.0", "8.0", "7.0"]:
             candidate = Path(program_files) / "KiCad" / version / "bin" / "python.exe"
             if candidate.exists():
-                kicad_python = candidate
-                break
+                return candidate
     elif platform == "macos":
-        candidate = Path("/Applications/KiCad/KiCad.app/Contents/Frameworks/"
-                         "Python.framework/Versions/Current/bin/python3")
+        candidate = Path(
+            "/Applications/KiCad/KiCad.app/Contents/Frameworks/"
+            "Python.framework/Versions/Current/bin/python3"
+        )
         if candidate.exists():
-            kicad_python = candidate
+            return candidate
     else:
-        # On Linux, pcbnew is usually importable system-wide
-        kicad_python = Path("/usr/bin/python3")
+        # On Linux, pcbnew is typically importable from the system Python.
+        candidate = Path("/usr/bin/python3")
+        if candidate.exists():
+            return candidate
 
-    if kicad_python is None or not kicad_python.exists():
-        return False, "KiCad Python interpreter not found"
+    return None
+
+
+def _run_pcbnew_helper(
+    command: str,
+    args: list[str],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Invoke a pcbnew operation via the packaged helper script.
+
+    Uses KiCad's bundled Python interpreter so that the ``pcbnew`` module
+    is available even when it cannot be imported into the MCP server's own
+    Python environment (the common case on macOS and Windows).
+
+    Arguments are passed on the command line — no code generation — and the
+    result is returned as a parsed JSON dict from the helper's stdout.
+
+    Args:
+        command: Subcommand name (e.g. ``"export_dsn"``).
+        args: Positional string arguments for the subcommand.
+        timeout: Subprocess timeout in seconds.
+
+    Returns:
+        Parsed JSON dict from the helper.  Always contains ``"ok": bool``.
+        On failure, also contains ``"error": str``.
+    """
+    from kicad_mcp.utils.platform_helper import get_platform
+
+    kicad_python = _find_kicad_python()
+    if kicad_python is None:
+        return {"ok": False, "error": "KiCad Python interpreter not found"}
 
     env = os.environ.copy()
-    if platform == "windows":
+    if get_platform() == "windows":
         kicad_bin = kicad_python.parent
         env["PYTHONHOME"] = str(kicad_bin)
         env["PYTHONPATH"] = ";".join([
@@ -85,20 +116,31 @@ def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
             str(kicad_bin / "Lib"),
         ])
 
+    cmd = [str(kicad_python), "-S", str(_HELPER_SCRIPT), command, *args]
+    logger.debug("Running pcbnew helper: %s", " ".join(cmd))
+
     try:
         result = subprocess.run(
-            [str(kicad_python), "-S", "-c", script],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
             env=env,
         )
-        output = result.stdout + result.stderr
-        return result.returncode == 0, output
     except subprocess.TimeoutExpired:
-        return False, "Script timed out"
-    except OSError as e:
-        return False, f"Failed to run KiCad Python: {e}"
+        return {"ok": False, "error": f"pcbnew helper timed out after {timeout}s"}
+    except OSError as exc:
+        return {"ok": False, "error": f"Failed to run KiCad Python: {exc}"}
+
+    output = result.stdout.strip()
+    if not output:
+        error_detail = result.stderr.strip() or "no output"
+        return {"ok": False, "error": f"pcbnew helper produced no output: {error_detail}"}
+
+    try:
+        return json.loads(output.splitlines()[-1])
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"pcbnew helper returned non-JSON output: {output[:200]}"}
 
 
 def register_tools(
@@ -151,21 +193,15 @@ def register_tools(
                     "message": f"pcbnew DSN export failed: {e}",
                 })
         else:
-            # Fall back to KiCad Python subprocess
-            script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(p)!r})
-ok = pcbnew.ExportSpecctraDSN(board, {str(dsn_path)!r})
-if not ok:
-    print("EXPORT_FAILED")
-    sys.exit(1)
-print("EXPORT_OK")
-"""
-            ok, output_text = _run_pcbnew_script(script)
-            if not ok or "EXPORT_FAILED" in output_text:
+            # pcbnew not importable in this Python environment —
+            # delegate to the helper script running under KiCad's own Python.
+            helper_result = _run_pcbnew_helper(
+                "export_dsn", [str(p), str(dsn_path)]
+            )
+            if not helper_result.get("ok"):
                 return json.dumps({
                     "status": "error",
-                    "message": f"DSN export failed: {output_text}",
+                    "message": f"DSN export failed: {helper_result.get('error', 'unknown error')}",
                 })
 
         # Clean Unicode characters that FreeRouting can't handle
@@ -235,33 +271,18 @@ print("EXPORT_OK")
                     "message": f"SES import failed: {e}",
                 })
         else:
-            script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(p)!r})
-before = len(board.GetTracks())
-ok = pcbnew.ImportSpecctraSES(board, {str(ses)!r})
-if not ok:
-    print("IMPORT_FAILED")
-    sys.exit(1)
-after = len(board.GetTracks())
-pcbnew.SaveBoard({str(p)!r}, board)
-print(f"TRACKS_BEFORE={{before}}")
-print(f"TRACKS_AFTER={{after}}")
-"""
-            ok, output_text = _run_pcbnew_script(script)
-            if not ok or "IMPORT_FAILED" in output_text:
+            # pcbnew not importable in this Python environment —
+            # delegate to the helper script running under KiCad's own Python.
+            helper_result = _run_pcbnew_helper(
+                "import_ses", [str(p), str(ses)]
+            )
+            if not helper_result.get("ok"):
                 return json.dumps({
                     "status": "error",
-                    "message": f"SES import failed: {output_text}",
+                    "message": f"SES import failed: {helper_result.get('error', 'unknown error')}",
                 })
-            # Parse track counts from output
-            tracks_before = 0
-            tracks_after = 0
-            for line in output_text.splitlines():
-                if line.startswith("TRACKS_BEFORE="):
-                    tracks_before = int(line.split("=")[1])
-                elif line.startswith("TRACKS_AFTER="):
-                    tracks_after = int(line.split("=")[1])
+            tracks_before = helper_result.get("tracks_before", 0)
+            tracks_after = helper_result.get("tracks_after", 0)
 
         new_tracks = tracks_after - tracks_before
         change_log.record(
@@ -475,38 +496,19 @@ print(f"TRACKS_AFTER={{after}}")
                     "message": f"Board cleanup failed: {e}",
                 })
         else:
-            script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(p)!r})
-keepouts = 0
-tracks = 0
-if {remove_keepouts!r}:
-    zones = [z for z in board.Zones() if z.GetIsRuleArea()]
-    for z in zones:
-        board.Remove(z)
-    keepouts = len(zones)
-if {remove_unassigned_tracks!r}:
-    bad = [t for t in board.GetTracks() if not (t.GetNet() and t.GetNet().GetNetname())]
-    for t in bad:
-        board.Remove(t)
-    tracks = len(bad)
-pcbnew.SaveBoard({str(p)!r}, board)
-print(f"KEEPOUTS={{keepouts}}")
-print(f"TRACKS={{tracks}}")
-"""
-            ok, output_text = _run_pcbnew_script(script)
-            if not ok:
+            # pcbnew not importable in this Python environment —
+            # delegate to the helper script running under KiCad's own Python.
+            helper_result = _run_pcbnew_helper(
+                "clean_board",
+                [str(p), str(remove_keepouts), str(remove_unassigned_tracks)],
+            )
+            if not helper_result.get("ok"):
                 return json.dumps({
                     "status": "error",
-                    "message": f"Board cleanup failed: {output_text}",
+                    "message": f"Board cleanup failed: {helper_result.get('error', 'unknown error')}",
                 })
-            keepouts_removed = 0
-            tracks_removed = 0
-            for line in output_text.splitlines():
-                if line.startswith("KEEPOUTS="):
-                    keepouts_removed = int(line.split("=")[1])
-                elif line.startswith("TRACKS="):
-                    tracks_removed = int(line.split("=")[1])
+            keepouts_removed = helper_result.get("keepouts_removed", 0)
+            tracks_removed = helper_result.get("tracks_removed", 0)
 
         change_log.record(
             "clean_board_for_routing",

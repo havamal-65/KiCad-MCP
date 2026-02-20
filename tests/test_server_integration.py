@@ -32,8 +32,8 @@ class TestServerCreation:
         config = KiCadMCPConfig(backend=BackendType.FILE, log_level="WARNING")
         mcp = create_server(config)
         tools = mcp._tool_manager._tools
-        # Should have 64 tools total (8+4+5+5+6+9+6+21)
-        # board(8) + drc(4) + export(5) + routing(5) + library(6) + library_manage(9) + project(6) + schematic(21)
+        # Should have 64 tools total (8+3+5+5+6+9+6+22)
+        # board(8) + drc(3) + export(5) + routing(5) + library(6) + library_manage(9) + project(6) + schematic(22)
         assert len(tools) == 64
 
     def test_server_auto_backend(self):

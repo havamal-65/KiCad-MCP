@@ -8,9 +8,9 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **61 MCP Tools** across 8 categories:
-  - 📋 **Project Management** (5 tools): Open projects, list files, read/write metadata, query backend info
-  - 📐 **Schematic Operations** (20 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries, net connectivity analysis, schematic-to-PCB comparison and sync
+- **64 MCP Tools** across 8 categories:
+  - 📋 **Project Management** (6 tools): Open projects, list files, read/write metadata, query backend info, query active KiCad project via IPC
+  - 📐 **Schematic Operations** (22 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, file-based schematic validation, schematic-to-PCB comparison and sync
   - 🔌 **PCB Board Operations** (8 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules
   - 📚 **Library Search** (6 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
@@ -197,14 +197,15 @@ Add to your Cursor MCP settings:
 
 ## Available Tools
 
-### Project Management (5 tools)
+### Project Management (6 tools)
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
 - `get_project_metadata`: Read detailed metadata from a KiCad project file
 - `save_project`: Trigger save for an open KiCad project (requires IPC backend)
 - `get_backend_info`: Get information about available backends and their capabilities
+- `get_active_project`: Query the currently open KiCad project and documents (requires IPC backend)
 
-### Schematic Operations (20 tools)
+### Schematic Operations (22 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
 - `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
 - `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
@@ -218,9 +219,11 @@ Add to your Cursor MCP settings:
 - `remove_no_connect`: Remove a no-connect marker by its position
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
 - `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
-- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol (essential for wire routing)
+- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol; resolves `extends` chains so symbols like ATtiny85-20S and AMS1117-3.3 work correctly
 - `get_pin_net`: Get the net name connected to a specific pin of a symbol
 - `get_net_connections`: Get all connections (pins, labels, wires) on a named net
+- `get_sheet_hierarchy`: Get the hierarchical sheet tree from a root schematic
+- `validate_schematic`: Run file-based electrical rules validation (no kicad-cli required)
 - `compare_schematic_pcb`: Detect mismatches between schematic and PCB (missing components, footprint/value differences)
 - `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values)
 - `annotate_schematic`: Auto-annotate component reference designators
@@ -358,11 +361,33 @@ KiCad-MCP/
 - **Documentation Generation**: Auto-generate BOMs, netlists, and design docs
 - **Design Migration**: Convert or update designs programmatically
 
+## Examples
+
+### Air Quality Sensor (end-to-end test)
+
+`examples/air_quality_sensor/` contains a complete worked example that builds a real schematic from scratch using only the file backend — no KiCad installation required.
+
+**BOM**: ATtiny85-20S (MCU) · SCD41 (CO₂/temp/humidity) · SGP41 (VOC/NOx) · AMS1117-3.3 (LDO) · 2× 4.7 kΩ pullups · 6× decoupling caps · power connector · I2C debug header
+
+**What it exercises**:
+- `create_schematic` — create a new KiCad 8+ schematic
+- `add_component` — place all 14 components (including symbols from a custom `.kicad_sym`)
+- `get_symbol_pin_positions` — query exact pin coordinates (resolves `extends` chains automatically)
+- `add_power_symbol` — annotate power rails (+5V, +3V3, GND) at each power pin
+- `add_label` — apply SDA / SCL net labels
+- `add_no_connect` — mark unused pins
+
+```bash
+python examples/air_quality_sensor/build_schematic.py
+```
+
+The script also demonstrates how to inject a custom symbol library into the file backend's search path, making the SCD41 and SGP41 symbols (not in the standard KiCad library) available to all MCP tools.
+
 ## Troubleshooting
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 56 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 59 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

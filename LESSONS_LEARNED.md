@@ -94,6 +94,22 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: Added `create_schematic` tool that generates a minimal valid KiCad 8+ schematic with correct version, generator, UUID, paper size, empty `lib_symbols` section, and `sheet_instances`. Supports optional title block (title, revision). Guards against overwriting existing files.
 
+### 15. `get_symbol_pin_positions` Returned Empty Results for Standard KiCad Symbols (FIXED)
+
+**Problem**: Many widely-used KiCad standard library symbols (e.g. `ATtiny85-20S`, `AMS1117-3.3`) use the `(extends "ParentName")` directive instead of defining their own pins. The `get_symbol_pin_positions` implementation only searched the `lib_symbols` section of the schematic file, where these cached copies only contain properties and the `extends` tag — no pin geometry at all. The tool returned an empty `pin_positions` dict for every such symbol, making it impossible to place power symbols or net labels programmatically for a large fraction of standard components.
+
+**Impact**: Any MCP workflow that called `get_symbol_pin_positions` on `ATtiny85-20S`, `AMS1117-3.3`, or any other `extends`-based symbol would silently get no coordinates and then place power symbols / labels at the wrong positions.
+
+**Fix Applied**: After extracting the cached lib symbol, the code now checks for an `(extends "Parent")` child. If present, it locates the source `.kicad_sym` library file via `_resolve_symbol_libs()`, parses it, and follows the `extends` chain (up to 5 levels deep) until it finds a symbol node that contains actual pin definitions. The full rotation and mirror transforms are then applied to those pins as before.
+
+### 16. `read_schematic` (via `skip` library) Crashed on `extends`-Based Symbols (FIXED)
+
+**Problem**: The `read_schematic` method uses the third-party `skip` library as its primary parser. `skip` crashed with `AttributeError: 'ParsedValue' object has no attribute 'symbol'` whenever the schematic's `lib_symbols` cache contained a symbol that uses `(extends ...)` and has no sub-symbol nodes. This happens for any schematic that includes `AMS1117-3.3`, `ATtiny85-20S`, or similar standard parts, causing `read_schematic`, `get_symbols`, and any tool that invokes them to fail completely.
+
+**Impact**: After using `add_component` with these symbols, the schematic file was correct but `read_schematic` / `get_symbols` would crash, preventing any subsequent read-based tool from working.
+
+**Fix Applied**: Added an `except Exception` fallback to `read_schematic` so that any `skip` parse failure automatically retries using the built-in s-expression parser (`_read_with_sexp`). The fallback is silent — callers receive correct data without needing to know which parser succeeded.
+
 ---
 
 ## Enhancement Requirements (Prioritized)
@@ -122,10 +138,13 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 ### P2 — Nice to Have
 
-| # | Enhancement | Why |
-|---|------------|-----|
-| 13 | `validate_schematic` (file-based ERC lite) | Check floating pins, unconnected nets without KiCad CLI |
-| 14 | `auto_place_components` | Suggest initial component placement based on connectivity |
-| 15 | `add_text` / `add_graphic` (schematic) | Annotations like "AIRFLOW ->" on the PCB |
-| 16 | Batch operations | Place multiple components/wires in one call for performance |
-| 17 | Undo/redo support | Track changes and allow rollback beyond file backups |
+| # | Enhancement | Status | Why |
+|---|------------|--------|-----|
+| 13 | `validate_schematic` (file-based ERC lite) | **DONE** | Check floating pins, unconnected nets without KiCad CLI |
+| 14 | `get_sheet_hierarchy` | **DONE** | Navigate hierarchical sheet tree from a root schematic |
+| 15 | `get_symbol_pin_positions` extends resolution | **DONE** | ATtiny85-20S, AMS1117-3.3 and all `extends`-based symbols now return correct pin coordinates |
+| 16 | `read_schematic` / `skip` crash fix | **DONE** | Graceful fallback to s-expression parser when `skip` fails on `extends`-based symbols |
+| 17 | `auto_place_components` | Planned | Suggest initial component placement based on connectivity |
+| 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
+| 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |
+| 20 | Undo/redo support | Planned | Track changes and allow rollback beyond file backups |

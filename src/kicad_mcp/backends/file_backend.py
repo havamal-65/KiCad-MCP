@@ -348,6 +348,9 @@ class FileSchematicOps(SchematicOps):
             return self._read_with_skip(sch, path)
         except ImportError:
             return self._read_with_sexp(path)
+        except Exception:
+            # skip library can fail on extended/custom symbols; fall back
+            return self._read_with_sexp(path)
 
     @staticmethod
     def _skip_at_to_pos(at: Any) -> dict[str, float] | None:
@@ -1108,17 +1111,71 @@ class FileSchematicOps(SchematicOps):
         if lib_sym is None:
             return {"error": f"Library symbol '{lib_id}' not found in lib_symbols cache"}
 
-        # 3. Extract pins from lib symbol (recurse into sub-symbols)
-        pins = []
-        for child in lib_sym[1:]:
-            if not isinstance(child, list) or len(child) < 2:
-                continue
-            if child[0] == "pin":
-                pins.append(_parse_pin_node(child))
-            elif child[0] == "symbol":
-                for sub_child in child[1:]:
-                    if isinstance(sub_child, list) and len(sub_child) >= 2 and sub_child[0] == "pin":
-                        pins.append(_parse_pin_node(sub_child))
+        # 3. Extract pins from lib symbol (recurse into sub-symbols).
+        # If the cached symbol uses (extends "ParentName"), the pin definitions
+        # live in the parent symbol inside the source .kicad_sym library file.
+        def _collect_pins_from_node(node: list) -> list[dict]:
+            collected: list[dict] = []
+            for child in node[1:]:
+                if not isinstance(child, list) or len(child) < 2:
+                    continue
+                if child[0] == "pin":
+                    collected.append(_parse_pin_node(child))
+                elif child[0] == "symbol":
+                    for sub_child in child[1:]:
+                        if (isinstance(sub_child, list) and len(sub_child) >= 2
+                                and sub_child[0] == "pin"):
+                            collected.append(_parse_pin_node(sub_child))
+            return collected
+
+        pins = _collect_pins_from_node(lib_sym)
+
+        if not pins:
+            # Check for (extends "ParentName") and resolve from source library
+            parent_name: str | None = None
+            for child in lib_sym[1:]:
+                if isinstance(child, list) and len(child) >= 2 and child[0] == "extends":
+                    parent_name = child[1]
+                    break
+
+            if parent_name is not None:
+                lib_name = lib_id.split(":", 1)[0] if ":" in lib_id else lib_id
+                lib_path: Path | None = None
+                for lp in self._resolve_symbol_libs():
+                    if lp.stem == lib_name:
+                        lib_path = lp
+                        break
+
+                if lib_path is not None:
+                    try:
+                        lib_tree = parse_sexp_file(lib_path)
+                        # Follow extends chain (up to 5 levels deep)
+                        resolved_name = parent_name
+                        for _ in range(5):
+                            parent_node: list | None = None
+                            for node in lib_tree:
+                                if (isinstance(node, list) and len(node) >= 2
+                                        and node[0] == "symbol"
+                                        and node[1] == resolved_name):
+                                    parent_node = node
+                                    break
+                            if parent_node is None:
+                                break
+                            pins = _collect_pins_from_node(parent_node)
+                            if pins:
+                                break
+                            # Look for another level of extends
+                            next_parent: str | None = None
+                            for child in parent_node[1:]:
+                                if (isinstance(child, list) and len(child) >= 2
+                                        and child[0] == "extends"):
+                                    next_parent = child[1]
+                                    break
+                            if next_parent is None:
+                                break
+                            resolved_name = next_parent
+                    except Exception:
+                        pass
 
         # 4. Transform pin positions to absolute schematic coordinates
         rad = math.radians(sym_rot)

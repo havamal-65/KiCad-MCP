@@ -173,7 +173,31 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 - Exercises all **64 tools** against the real project files
 - Saves permanent output to `examples/air_quality_sensor/`
 
-**Result**: 64/64 tools pass. 0 failures. 0 skips. Verified on Windows 11 with KiCad 9.
+**Result**: 63/64 tools pass. 0 failures. 1 skip (`run_freerouter` skipped when pcbnew is unavailable and `export_dsn` cannot produce a valid DSN file). Verified on Windows 11 with KiCad 9.
+
+### 24. `autoroute` Called `@mcp.tool()` Decorated Functions as Plain Callables (FIXED)
+
+**Problem**: Inside `register_tools()`, all 5 routing functions (`export_dsn`, `import_ses`, `run_freerouter`, `clean_board_for_routing`, `autoroute`) were inner functions decorated with `@mcp.tool()`. After decoration by fastmcp, they become `FunctionTool` objects — **not callable as plain Python functions**. The `autoroute` function called the other four directly (e.g. `result_json = export_dsn(path, str(dsn))`), causing `TypeError: 'FunctionTool' object is not callable` every time `autoroute` was invoked.
+
+**Impact**: `autoroute` was completely broken. Any call to the "full pipeline" tool crashed immediately at Step 1 (board cleanup).
+
+**Fix Applied**: Extracted the body of each of the four helper tools into module-level `_impl_*` functions (`_impl_export_dsn`, `_impl_import_ses`, `_impl_run_freerouter`, `_impl_clean_board_for_routing`). These plain Python functions accept `config` and `change_log` as parameters. The `@mcp.tool()` wrappers now simply call their corresponding `_impl_*` function. `autoroute` also calls the `_impl_*` functions directly, bypassing the `FunctionTool` layer entirely.
+
+**Rule**: In fastmcp, any function decorated with `@mcp.tool()` inside `register_tools()` becomes a `FunctionTool` object and can no longer be called as a plain function from other code in the same scope. Always extract shared logic into plain helper functions defined **outside** `register_tools()`.
+
+### 25. `run_freerouter` Subprocess Lacked `stdin=subprocess.DEVNULL` (FIXED)
+
+**Problem**: The `subprocess.run()` call for the FreeRouting Java process did not set `stdin=subprocess.DEVNULL`. In an MCP stdio session, the server's stdin is the JSON-RPC pipe. A subprocess that inherits stdin will block waiting for input on that pipe, potentially freezing the MCP server.
+
+**Fix Applied**: Added `stdin=subprocess.DEVNULL` to the FreeRouting `subprocess.run()` call, consistent with the same fix applied earlier to `clone_library_repo`.
+
+**Rule**: All subprocesses launched from inside an MCP stdio server **must** use `stdin=subprocess.DEVNULL`. Without it, the subprocess inherits the MCP JSON-RPC pipe as stdin and may block waiting for input, freezing the entire server.
+
+### 26. `run_freerouter` Test Must Use a Real DSN, Not a Dummy (FIXED)
+
+**Problem**: The original `test_run_freerouter` wrote a dummy `"(pcb dummy)\n"` DSN file and passed it to FreeRouting. FreeRouting IS installed and was actually invoked — reporting `ERROR: There was an error while reading DSN file`. A dummy DSN can never pass FreeRouting's file validation.
+
+**Fix Applied**: The test now checks whether `test_export_dsn` produced a valid DSN file (`exports/air_quality_sensor.dsn`). If it exists, that real DSN is passed to `run_freerouter`. If not (because `pcbnew` is unavailable and DSN export failed), the test is **skipped** with a clear message. This is correct behavior: `run_freerouter` cannot be meaningfully tested without a valid PCB DSN file.
 
 ---
 
@@ -212,7 +236,9 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 21 | Sub-symbol lib-prefix bug | **DONE** | KiCad 9 rejects `lib:sym_1_1` sub-symbol names; fix leaves sub-symbols with plain name (`sym_1_1`) |
 | 22 | Project-local sym-lib-table library resolution | **DONE** | Custom symbols (e.g. Sensors:SCD41) now found via project sym-lib-table |
 | 23 | `clone_library_repo` stdin hang in MCP stdio | **DONE** | git subprocess blocked on MCP pipe; fixed with DEVNULL + GIT_TERMINAL_PROMPT=0 |
-| 24 | End-to-end MCP protocol test suite | **DONE** | 64/64 tools verified via real stdio JSON-RPC (same as Claude Desktop) |
+| 24 | End-to-end MCP protocol test suite | **DONE** | 63/64 tools pass (1 skip: run_freerouter requires pcbnew for DSN export) |
+| 25 | `autoroute` FunctionTool bug | **DONE** | Extracted `_impl_*` helpers; autoroute now works end-to-end |
+| 26 | `run_freerouter` subprocess stdin | **DONE** | Added `stdin=DEVNULL`; prevents MCP pipe blocking |
 | 17 | `auto_place_components` | Planned | Suggest initial component placement based on connectivity |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |

@@ -882,10 +882,11 @@ def main() -> int:
     r.run("import_ses", t_import_ses)
 
     def t_run_freerouter():
-        # Needs FreeRouting JAR — skip if not configured
-        jar = os.environ.get("KICAD_MCP_FREEROUTING_JAR", "")
-        if not jar or not Path(jar).exists():
-            r.skip("KICAD_MCP_FREEROUTING_JAR not set / file missing")
+        from kicad_mcp.utils.platform_helper import find_freerouting_jar
+        jar_env = os.environ.get("KICAD_MCP_FREEROUTING_JAR", "")
+        jar = Path(jar_env) if jar_env else find_freerouting_jar()
+        if jar is None or not jar.exists():
+            r.skip("FreeRouting JAR not found (set KICAD_MCP_FREEROUTING_JAR or place JAR in ~/.kicad-mcp/freerouting/)")
         dummy_dsn = work / "dummy.dsn"
         dummy_dsn.write_text("(pcb dummy)\n")
         res = call(tools, "run_freerouter", dsn_path=str(dummy_dsn))
@@ -894,9 +895,11 @@ def main() -> int:
     r.run("run_freerouter", t_run_freerouter)
 
     def t_autoroute():
-        jar = os.environ.get("KICAD_MCP_FREEROUTING_JAR", "")
-        if not jar or not Path(jar).exists():
-            r.skip("KICAD_MCP_FREEROUTING_JAR not set / file missing")
+        from kicad_mcp.utils.platform_helper import find_freerouting_jar
+        jar_env = os.environ.get("KICAD_MCP_FREEROUTING_JAR", "")
+        jar = Path(jar_env) if jar_env else find_freerouting_jar()
+        if jar is None or not jar.exists():
+            r.skip("FreeRouting JAR not found (set KICAD_MCP_FREEROUTING_JAR or place JAR in ~/.kicad-mcp/freerouting/)")
         res = call(tools, "autoroute", path=str(mod_pcb))
         assert res["status"] in ("success", "info", "error")
         return res["status"]

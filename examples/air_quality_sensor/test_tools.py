@@ -209,14 +209,17 @@ async def build_project(session, runner: Runner) -> tuple[Path, Path, Path]:
     await ok(session, "create_schematic",
              path=str(sch), title="Air Quality Sensor", revision="1.0")
 
-    # Place components
+    # Place components — footprints are required so sync_schematic_to_pcb
+    # can actually place them on the board.
     await ok(session, "add_component", path=str(sch),
              lib_id="Connector_Generic:Conn_01x02", reference="J1",
-             value="Conn_01x02", x=J1_POS[0], y=J1_POS[1])
+             value="Conn_01x02", x=J1_POS[0], y=J1_POS[1],
+             footprint="Connector_PinHeader_2.54mm:PinHeader_1x02_P2.54mm_Vertical")
 
     await ok(session, "add_component", path=str(sch),
              lib_id="Regulator_Linear:AMS1117-3.3", reference="U4",
-             value="AMS1117-3.3", x=U4_POS[0], y=U4_POS[1])
+             value="AMS1117-3.3", x=U4_POS[0], y=U4_POS[1],
+             footprint="Package_TO_SOT_SMD:SOT-223-3_TabPin2")
 
     for ref, val, pos in [
         ("C6", "10uF",  C6_POS), ("C5", "100nF", C5_POS),
@@ -225,28 +228,34 @@ async def build_project(session, runner: Runner) -> tuple[Path, Path, Path]:
     ]:
         await ok(session, "add_component", path=str(sch),
                  lib_id="Device:C", reference=ref, value=val,
-                 x=pos[0], y=pos[1])
+                 x=pos[0], y=pos[1],
+                 footprint="Capacitor_SMD:C_0402_1005Metric")
 
     for ref, val, pos in [("R1", "4.7k", R1_POS), ("R2", "4.7k", R2_POS)]:
         await ok(session, "add_component", path=str(sch),
                  lib_id="Device:R", reference=ref, value=val,
-                 x=pos[0], y=pos[1])
+                 x=pos[0], y=pos[1],
+                 footprint="Resistor_SMD:R_0402_1005Metric")
 
     await ok(session, "add_component", path=str(sch),
              lib_id="MCU_Microchip_ATtiny:ATtiny85-20S", reference="U1",
-             value="ATtiny85-20S", x=U1_POS[0], y=U1_POS[1])
+             value="ATtiny85-20S", x=U1_POS[0], y=U1_POS[1],
+             footprint="Package_SO:SOIC-8_3.9x4.9mm_P1.27mm")
 
     await ok(session, "add_component", path=str(sch),
              lib_id="Sensors:SCD41", reference="U2",
-             value="SCD41", x=U2_POS[0], y=U2_POS[1])
+             value="SCD41", x=U2_POS[0], y=U2_POS[1],
+             footprint="Package_DFN_QFN:DFN-10_3x3mm_P0.5mm")
 
     await ok(session, "add_component", path=str(sch),
              lib_id="Sensors:SGP41", reference="U3",
-             value="SGP41", x=U3_POS[0], y=U3_POS[1])
+             value="SGP41", x=U3_POS[0], y=U3_POS[1],
+             footprint="Package_DFN_QFN:DFN-6_3x3mm_P1mm_PullbackPads0.25mm_BackPad")
 
     await ok(session, "add_component", path=str(sch),
              lib_id="Connector_Generic:Conn_01x04", reference="J2",
-             value="Conn_01x04", x=J2_POS[0], y=J2_POS[1])
+             value="Conn_01x04", x=J2_POS[0], y=J2_POS[1],
+             footprint="Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical")
 
     # Resolve pin positions via MCP
     print("  Resolving pin positions via MCP ...")
@@ -599,13 +608,10 @@ async def run_tests(session, runner: Runner,
         res = await call(session, "sync_schematic_to_pcb",
                          schematic_path=str(sch), board_path=str(pcb))
         assert res["status"] == "success"
-        # Components without footprints generate "no_footprint" warnings rather
-        # than "placed" actions.  Verify the tool ran and processed something.
-        processed = len(res.get("actions", [])) + len(res.get("warnings", []))
-        assert processed >= 1, f"Expected at least 1 action or warning: {res}"
         placed = [a for a in res.get("actions", []) if a.get("type") == "placed"]
-        warnings = res.get("warnings", [])
-        return f"placed={len(placed)}, warnings={len(warnings)}"
+        assert len(placed) >= 1, \
+            f"Expected at least 1 component placed on PCB, got 0. actions={res.get('actions')}"
+        return f"placed {len(placed)} components on PCB"
     await t("sync_schematic_to_pcb", test_sync_schematic_to_pcb())
 
     async def test_annotate_schematic():
@@ -1041,10 +1047,12 @@ async def run_tests(session, runner: Runner,
         if jar is None or not jar.exists():
             skip("FreeRouting JAR not found — place JAR in "
                  "~/.kicad-mcp/freerouting/ or set KICAD_MCP_FREEROUTING_JAR")
-        dummy_dsn = THIS_DIR / "_tmp_dummy.dsn"
-        dummy_dsn.write_text("(pcb dummy)\n", encoding="utf-8")
-        res = await call(session, "run_freerouter", dsn_path=str(dummy_dsn))
-        dummy_dsn.unlink(missing_ok=True)
+        # Use the real DSN produced by test_export_dsn — a dummy DSN will
+        # always fail because FreeRouting validates the file format.
+        real_dsn = exports / "air_quality_sensor.dsn"
+        if not real_dsn.exists():
+            skip("export_dsn did not produce a DSN file — cannot test run_freerouter")
+        res = await call(session, "run_freerouter", dsn_path=str(real_dsn))
         assert res["status"] in ("success", "info", "error")
         return res["status"]
     await t("run_freerouter", test_run_freerouter())

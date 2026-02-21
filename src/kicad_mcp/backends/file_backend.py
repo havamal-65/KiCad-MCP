@@ -604,12 +604,10 @@ class FileSchematicOps(SchematicOps):
             block,
             count=1,
         )
-        # Sub-symbols: (symbol "R_0_1" -> (symbol "Device:R_0_1"
-        block = re.sub(
-            rf'\(symbol\s+"{escaped_sym}_',
-            f'(symbol "{lib_id}_',
-            block,
-        )
+        # Sub-symbols keep the plain symbol name (no library prefix).
+        # KiCad 9 format: outer symbol is "Device:R", sub-symbols stay "R_0_1",
+        # "R_1_1", etc.  Prefixing sub-symbols with the lib name is invalid.
+        # (No replacement needed — leave sub-symbol names as-is.)
 
         # Insert the block before the closing ) of lib_symbols
         indent_block = "    " + block.replace("\n", "\n    ")
@@ -619,6 +617,26 @@ class FileSchematicOps(SchematicOps):
             + content[lib_sym_end:]
         )
         return new_content
+
+    @staticmethod
+    def _find_insertion_point(content: str) -> int:
+        """Finds the appropriate insertion point for new schematic elements.
+
+        This is typically after the (lib_symbols ...) block and before
+        the (sheet_instances ...) block, or before the final closing paren.
+        """
+        lib_sym_end = content.find("(lib_symbols")
+        if lib_sym_end != -1:
+            lib_sym_end = _walk_balanced_parens(content, lib_sym_end)
+            if lib_sym_end is not None:
+                # Insert after the lib_symbols block, plus its closing paren
+                return lib_sym_end + 1
+
+        # Fallback: insert before the last closing parenthesis
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            return last_paren
+        return len(content) # Should not happen for a valid schematic
 
     @staticmethod
     def _find_schematic_uuid(content: str) -> str:
@@ -735,10 +753,9 @@ class FileSchematicOps(SchematicOps):
             f'  )\n'
         )
 
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + sym_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + sym_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         result: dict[str, Any] = {
             "reference": reference,
@@ -768,10 +785,9 @@ class FileSchematicOps(SchematicOps):
         )
 
         content = path.read_text(encoding="utf-8")
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + wire_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + wire_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         return {
             "start": {"x": start_x, "y": start_y},
@@ -794,10 +810,9 @@ class FileSchematicOps(SchematicOps):
         )
 
         content = path.read_text(encoding="utf-8")
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + label_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + label_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         return {
             "text": text,
@@ -814,10 +829,9 @@ class FileSchematicOps(SchematicOps):
         )
 
         content = path.read_text(encoding="utf-8")
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + nc_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + nc_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         return {
             "position": {"x": x, "y": y},
@@ -862,10 +876,9 @@ class FileSchematicOps(SchematicOps):
             f'  )\n'
         )
 
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + sym_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + sym_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         return {
             "name": name,
@@ -886,10 +899,9 @@ class FileSchematicOps(SchematicOps):
         )
 
         content = path.read_text(encoding="utf-8")
-        last_paren = content.rfind(")")
-        if last_paren >= 0:
-            content = content[:last_paren] + jn_sexp + content[last_paren:]
-            path.write_text(content, encoding="utf-8")
+        insert_pos = self._find_insertion_point(content)
+        content = content[:insert_pos] + jn_sexp + content[insert_pos:]
+        path.write_text(content, encoding="utf-8")
 
         return {
             "position": {"x": x, "y": y},

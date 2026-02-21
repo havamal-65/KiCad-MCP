@@ -780,9 +780,9 @@ class TestLibSymbolsCache:
         content = sch_file.read_text(encoding="utf-8")
         # lib_symbols should contain the renamed symbol
         assert '(symbol "Device:R"' in content
-        # Sub-symbols should also be renamed
-        assert '(symbol "Device:R_0_1"' in content
-        assert '(symbol "Device:R_1_1"' in content
+        # Sub-symbols use plain name (no library prefix) per KiCad 9 format
+        assert '(symbol "R_0_1"' in content
+        assert '(symbol "R_1_1"' in content
         # The placed instance should still be there
         assert '(lib_id "Device:R")' in content
 
@@ -813,8 +813,8 @@ class TestLibSymbolsCache:
 
         content = sch_file.read_text(encoding="utf-8")
         assert '(symbol "power:GND"' in content
-        assert '(symbol "power:GND_0_1"' in content
-        assert '(symbol "power:GND_1_1"' in content
+        assert '(symbol "GND_0_1"' in content
+        assert '(symbol "GND_1_1"' in content
         assert "(power)" in content
 
     def test_lib_symbols_missing_library_graceful(self, tmp_path: Path):
@@ -848,7 +848,7 @@ class TestLibSymbolsCache:
         content = sch_file.read_text(encoding="utf-8")
         assert "(lib_symbols" in content
         assert '(symbol "Device:R"' in content
-        assert '(symbol "Device:R_0_1"' in content
+        assert '(symbol "R_0_1"' in content
 
 
 # --- Net connectivity tool tests ---
@@ -892,10 +892,10 @@ class TestNetConnectivity:
             '  (uuid "00000000-0000-0000-0000-000000000000")\n'
             '  (lib_symbols\n'
             '    (symbol "Device:R"\n'
-            '      (symbol "Device:R_0_1"\n'
+            '      (symbol "R_0_1"\n'
             '        (polyline (pts (xy 0 -1.016) (xy 0 1.016)))\n'
             '      )\n'
-            '      (symbol "Device:R_1_1"\n'
+            '      (symbol "R_1_1"\n'
             '        (pin passive line (at 0 1.27 270) (length 0.254)\n'
             '          (name "~" (effects (font (size 1.27 1.27))))\n'
             '          (number "1" (effects (font (size 1.27 1.27))))\n'
@@ -952,7 +952,7 @@ class TestNetConnectivity:
             '  (uuid "00000000-0000-0000-0000-000000000000")\n'
             '  (lib_symbols\n'
             '    (symbol "Device:R"\n'
-            '      (symbol "Device:R_1_1"\n'
+            '      (symbol "R_1_1"\n'
             '        (pin passive line (at 0 1.27 270) (length 0.254)\n'
             '          (name "~" (effects (font (size 1.27 1.27))))\n'
             '          (number "1" (effects (font (size 1.27 1.27))))\n'

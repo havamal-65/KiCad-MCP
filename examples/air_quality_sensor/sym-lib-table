@@ -1,0 +1,4 @@
+(sym_lib_table
+  (lib (name "Sensors") (type "KiCad") (uri "D:/GitHub/KiCad_MCP/examples/air_quality_sensor/libs/Sensors.kicad_sym") (options "") (descr ""))
+  (lib (name "ProjectSymbols")(type "KiCad")(uri "${KIPRJMOD}/ProjectSymbols.kicad_sym")(options "")(descr ""))
+)

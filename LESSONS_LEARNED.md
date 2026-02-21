@@ -140,6 +140,41 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Lesson**: Dependency resolution can be complex, especially in environments with existing packages. `PermissionError` during `pip uninstall` on Windows is a common and stubborn issue that often necessitates manual file system cleanup. It highlights the need for robust environment management or clearer error handling/guidance for such scenarios.
 
+### 20. Project-Local Symbol Libraries Not Resolved by `_ensure_lib_symbol_cached` (FIXED)
+
+**Problem**: `add_component` and `get_symbol_pin_positions` only searched system KiCad library paths. Custom libraries referenced in a project's `sym-lib-table` (e.g. `libs/Sensors.kicad_sym`) were silently ignored, causing `lib_symbols` caching to fail and `get_symbol_pin_positions` to return an empty error response.
+
+**Impact**: Any schematic using project-local symbol libraries (non-KiCad-standard symbols) could not be built or queried via MCP. `get_symbol_pin_positions` returned `{"status": "success", "error": "...not found in lib_symbols cache"}` — no `pin_positions` key — crashing downstream callers.
+
+**Fix Applied**: Added `_get_project_symbol_libs(schematic_path)` helper that reads the project's `sym-lib-table` and resolves `${PROJ_DIR}`/`${KIPRJMOD}` variables. Both `_ensure_lib_symbol_cached` and `get_symbol_pin_positions` now fall back to project libs when the system search fails. The caller must create a `sym-lib-table` in the project directory before adding custom components.
+
+### 21. `clone_library_repo` Hung Indefinitely in MCP Stdio Context (FIXED)
+
+**Problem**: `clone_library_repo` calls `subprocess.run(["git", "clone", ...])` with `capture_output=True` but no `stdin` specification. In the MCP server process, stdin is the MCP protocol pipe (connected to the client). When git tries to read stdin (e.g. for credential prompts or SSH confirmations), it reads from the MCP pipe and blocks forever since the client is waiting for the tool response, not sending data. The 300-second timeout was reached on every call.
+
+**Impact**: `clone_library_repo` was completely unusable in any MCP stdio session — the tool always timed out regardless of the URL.
+
+**Fix Applied**: Added `stdin=subprocess.DEVNULL` and `env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}` to the subprocess call. This prevents git from reading stdin and disables all interactive terminal prompts. Timeout reduced from 300s to 60s.
+
+### 22. fastmcp 2.14.5 Incompatible with rich 13.5.3 in User Site-Packages (WORKAROUND)
+
+**Problem**: When the MCP server subprocess starts, Python loads packages from the user AppData site-packages before system site-packages. The user AppData has fastmcp 2.14.5 (correct version) paired with rich 13.5.3 (older). fastmcp 2.14.5 calls `RichHandler(tracebacks_max_frames=3)` which is not a parameter in rich 13.5.3, causing `TypeError` on import — the server never starts.
+
+**Impact**: The MCP server subprocess crashed on import before serving any tools. `PYTHONNOUSERSITE=1` didn't help because the system site-packages has fastmcp 0.4.1 (wrong version, missing `click`). Upgrading rich via pip was blocked because `semgrep` pins `rich~=13.5.2`.
+
+**Workaround Applied**: Set `FASTMCP_LOG_ENABLED=false` in the server subprocess environment. This causes fastmcp to skip its entire `configure_logging()` call (which creates the incompatible `RichHandler`), allowing the module to import cleanly. The test runner (`test_tools.py`) includes this env var in `StdioServerParameters`.
+
+### 23. End-to-End MCP Protocol Test Suite — All 64 Tools Verified (DONE)
+
+**Achievement**: Built `examples/air_quality_sensor/test_tools.py` — a complete end-to-end integration test that:
+- Launches the KiCad MCP server as a real subprocess via **stdio JSON-RPC** (same transport as Claude Desktop)
+- Connects using `mcp.ClientSession` + `mcp.client.stdio.stdio_client` from the official MCP Python SDK
+- Builds the complete Air Quality Sensor schematic from scratch using MCP tool calls (custom `Sensors.kicad_sym` library, ATtiny85, AMS1117-3.3, SCD41, SGP41, passive components)
+- Exercises all **64 tools** against the real project files
+- Saves permanent output to `examples/air_quality_sensor/`
+
+**Result**: 64/64 tools pass. 0 failures. 0 skips. Verified on Windows 11 with KiCad 9.
+
 ---
 
 ## Enhancement Requirements (Prioritized)
@@ -175,6 +210,9 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 15 | `get_symbol_pin_positions` extends resolution | **DONE** | ATtiny85-20S, AMS1117-3.3 and all `extends`-based symbols now return correct pin coordinates |
 | 16 | `read_schematic` / `skip` crash fix | **DONE** | Graceful fallback to s-expression parser when `skip` fails on `extends`-based symbols |
 | 21 | Sub-symbol lib-prefix bug | **DONE** | KiCad 9 rejects `lib:sym_1_1` sub-symbol names; fix leaves sub-symbols with plain name (`sym_1_1`) |
+| 22 | Project-local sym-lib-table library resolution | **DONE** | Custom symbols (e.g. Sensors:SCD41) now found via project sym-lib-table |
+| 23 | `clone_library_repo` stdin hang in MCP stdio | **DONE** | git subprocess blocked on MCP pipe; fixed with DEVNULL + GIT_TERMINAL_PROMPT=0 |
+| 24 | End-to-end MCP protocol test suite | **DONE** | 64/64 tools verified via real stdio JSON-RPC (same as Claude Desktop) |
 | 17 | `auto_place_components` | Planned | Suggest initial component placement based on connectivity |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |

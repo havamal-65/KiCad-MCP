@@ -1,0 +1,8 @@
+{
+  "meta": { "filename": "air_quality_sensor.kicad_pro", "version": 1 },
+  "board": {},
+  "libraries": {},
+  "net_settings": {},
+  "schematic": { "annotate_start_num": 0 },
+  "text_variables": {}
+}

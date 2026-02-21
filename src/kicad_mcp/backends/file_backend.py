@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -525,12 +526,39 @@ class FileSchematicOps(SchematicOps):
             self._symbol_libs = find_symbol_libraries()
         return self._symbol_libs
 
-    def _ensure_lib_symbol_cached(self, content: str, lib_id: str) -> str:
+    def _get_project_symbol_libs(self, schematic_path: Path) -> list[Path]:
+        """Read a project-level sym-lib-table and return resolved library paths.
+
+        Supports ${PROJ_DIR} and ${KIPRJMOD} variable substitution.
+        """
+        result: list[Path] = []
+        proj_dir = schematic_path.parent
+        table_path = proj_dir / "sym-lib-table"
+        if not table_path.exists():
+            return result
+        try:
+            table_content = table_path.read_text(encoding="utf-8")
+            for m in re.finditer(r'\(uri\s+"([^"]+)"\)', table_content):
+                uri = m.group(1)
+                uri = uri.replace("${PROJ_DIR}", str(proj_dir))
+                uri = uri.replace("${KIPRJMOD}", str(proj_dir))
+                p = Path(uri)
+                if p.exists():
+                    result.append(p)
+        except Exception:
+            pass
+        return result
+
+    def _ensure_lib_symbol_cached(
+        self, content: str, lib_id: str,
+        schematic_path: "Path | None" = None,
+    ) -> str:
         """Inject a symbol definition into the schematic's lib_symbols section if missing.
 
-        Resolves the library file from system paths, extracts the symbol definition,
-        renames it from plain name to full lib_id (e.g. "R" -> "Device:R"), and
-        inserts it into the lib_symbols section.
+        Resolves the library file from system paths (and, optionally, from the
+        project-level sym-lib-table when *schematic_path* is supplied), extracts
+        the symbol definition, renames it from plain name to full lib_id
+        (e.g. "R" -> "Device:R"), and inserts it into the lib_symbols section.
 
         Returns the (possibly modified) schematic content.
         """
@@ -572,12 +600,18 @@ class FileSchematicOps(SchematicOps):
         if re.search(rf'\(symbol\s+"{escaped_lib_id}"', lib_sym_section):
             return content
 
-        # Find the library file
+        # Find the library file — check system libs first, then project sym-lib-table
         lib_path = None
         for p in self._resolve_symbol_libs():
             if p.stem == lib_name:
                 lib_path = p
                 break
+
+        if lib_path is None and schematic_path is not None:
+            for p in self._get_project_symbol_libs(schematic_path):
+                if p.stem == lib_name:
+                    lib_path = p
+                    break
 
         if lib_path is None:
             logger.warning("Library file not found for '%s', skipping lib_symbols cache", lib_name)
@@ -735,7 +769,7 @@ class FileSchematicOps(SchematicOps):
                 offset += 2
 
         content = path.read_text(encoding="utf-8")
-        content = self._ensure_lib_symbol_cached(content, lib_id)
+        content = self._ensure_lib_symbol_cached(content, lib_id, schematic_path=path)
         sch_uuid = self._find_schematic_uuid(content)
 
         sym_sexp = (
@@ -852,7 +886,7 @@ class FileSchematicOps(SchematicOps):
         pwr_ref = f"#PWR{next_num:03d}"
 
         lib_id = f"power:{name}"
-        content = self._ensure_lib_symbol_cached(content, lib_id)
+        content = self._ensure_lib_symbol_cached(content, lib_id, schematic_path=path)
 
         sch_uuid = self._find_schematic_uuid(content)
 
@@ -1121,7 +1155,33 @@ class FileSchematicOps(SchematicOps):
                 break
 
         if lib_sym is None:
-            return {"error": f"Library symbol '{lib_id}' not found in lib_symbols cache"}
+            # lib_symbols cache is missing this symbol — try to read directly from
+            # the library file (either system or project sym-lib-table).
+            lib_name_fallback = lib_id.split(":", 1)[0] if ":" in lib_id else lib_id
+            sym_name_fallback = lib_id.split(":", 1)[1] if ":" in lib_id else lib_id
+            lib_path_fallback: "Path | None" = None
+            for lp in self._resolve_symbol_libs():
+                if lp.stem == lib_name_fallback:
+                    lib_path_fallback = lp
+                    break
+            if lib_path_fallback is None:
+                for lp in self._get_project_symbol_libs(path):
+                    if lp.stem == lib_name_fallback:
+                        lib_path_fallback = lp
+                        break
+            if lib_path_fallback is not None:
+                try:
+                    fallback_tree = parse_sexp_file(lib_path_fallback)
+                    for node in fallback_tree:
+                        if (isinstance(node, list) and len(node) >= 2
+                                and node[0] == "symbol"
+                                and node[1] == sym_name_fallback):
+                            lib_sym = node
+                            break
+                except Exception:
+                    pass
+            if lib_sym is None:
+                return {"error": f"Library symbol '{lib_id}' not found in lib_symbols cache"}
 
         # 3. Extract pins from lib symbol (recurse into sub-symbols).
         # If the cached symbol uses (extends "ParentName"), the pin definitions
@@ -1831,8 +1891,10 @@ class FileLibraryManageOps(LibraryManageOps):
                 ["git", "clone", "--depth", "1", url, str(dest)],
                 check=True,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,  # prevent git from blocking on MCP stdio pipe
                 text=True,
-                timeout=300,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                timeout=60,
             )
         except FileNotFoundError:
             raise GitOperationError(
@@ -1846,7 +1908,7 @@ class FileLibraryManageOps(LibraryManageOps):
             )
         except subprocess.TimeoutExpired:
             raise GitOperationError(
-                "git clone timed out after 300 seconds",
+                "git clone timed out after 60 seconds",
                 details={"url": url},
             )
 

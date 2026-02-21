@@ -128,28 +128,7 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: `suggest_footprints` now iterates `self._footprint_libs` directly using `fnmatch`, capped at 100 matches, bypassing the `search_footprints` result cap entirely.
 
-### 19. Integration Test Suite Verified All 64 Tools (NEW)
-
-**Context**: After building the air quality sensor schematic and fixing multiple KiCad format bugs, we needed confidence that all 64 MCP tools actually work end-to-end against real files.
-
-**Approach**: Added `tests/integration/run_integration_tests.py` — a standalone script that:
-1. Creates a temp KiCad project (schematic + PCB + project file) using MCP tools
-2. Exercises every one of the 64 tools against real files
-3. Reports PASS / SKIP / FAIL for each tool with detail messages
-
-**Result**: 64/64 passed, 0 skipped, 0 failed (FreeRouting auto-detected from `~/.kicad-mcp/freerouting/`).
-
-**Lessons from writing the tests**:
-- Several tool response schemas had changed since the original assertions were written — test assertions must be derived from actual tool output, not assumed.
-- `assign_net` requires a footprint with real `(pad ...)` nodes in the PCB file; `place_component` creates a stub without pads. Tests that chain these two tools need a pre-built PCB fixture with real pads.
-- FreeRouting JAR detection should use `find_freerouting_jar()` (the same auto-detect logic the routing tools use), not a bare env-var check.
-
-**Run**:
-```bash
-python tests/integration/run_integration_tests.py
-```
-
-### 20. `fastmcp` Dependency Version Mismatch and Uninstallation Issues
+### 19. `fastmcp` Dependency Version Mismatch and Uninstallation Issues
 
 **Problem**: The `kicad-mcp` project requires `fastmcp` version `2.0` or higher (but less than `3.0`). However, during initial installation, an older version (`0.4.1`) was present in the environment, leading to `ImportError` when attempting to use `fastmcp.Client`.
 
@@ -196,8 +175,6 @@ python tests/integration/run_integration_tests.py
 | 15 | `get_symbol_pin_positions` extends resolution | **DONE** | ATtiny85-20S, AMS1117-3.3 and all `extends`-based symbols now return correct pin coordinates |
 | 16 | `read_schematic` / `skip` crash fix | **DONE** | Graceful fallback to s-expression parser when `skip` fails on `extends`-based symbols |
 | 21 | Sub-symbol lib-prefix bug | **DONE** | KiCad 9 rejects `lib:sym_1_1` sub-symbol names; fix leaves sub-symbols with plain name (`sym_1_1`) |
-| 22 | `suggest_footprints` 50-cap bug | **DONE** | Was calling `search_footprints("")` (capped at 50); now iterates footprint libs directly |
-| 23 | Integration test suite | **DONE** | `tests/integration/run_integration_tests.py` — 64/64 tools verified end-to-end |
 | 17 | `auto_place_components` | Planned | Suggest initial component placement based on connectivity |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |

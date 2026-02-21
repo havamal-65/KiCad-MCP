@@ -1774,23 +1774,30 @@ class FileLibraryOps(LibraryOps):
                 "message": "Symbol has no footprint filters defined.",
             }
 
-        all_footprints = self.search_footprints("")
+        # Iterate all footprint libraries directly to avoid the 50-result cap
+        # imposed by search_footprints().  Cap results at 100 total.
         matched: list[dict[str, Any]] = []
         seen: set[str] = set()
 
-        for fp in all_footprints:
-            fp_name = fp["name"]
-            if fp_name in seen:
-                continue
-            for pattern in fp_filters:
-                if fnmatch.fnmatch(fp_name, pattern):
-                    matched.append({
-                        "name": fp_name,
-                        "library": fp["library"],
-                        "lib_id": fp["lib_id"],
-                    })
-                    seen.add(fp_name)
+        for lib_dir in self._footprint_libs:
+            lib_name = lib_dir.stem.replace(".pretty", "")
+            for fp_file in lib_dir.glob("*.kicad_mod"):
+                fp_name = fp_file.stem
+                if fp_name in seen:
+                    continue
+                for pattern in fp_filters:
+                    if fnmatch.fnmatch(fp_name, pattern):
+                        matched.append({
+                            "name": fp_name,
+                            "library": lib_name,
+                            "lib_id": f"{lib_name}:{fp_name}",
+                        })
+                        seen.add(fp_name)
+                        break
+                if len(matched) >= 100:
                     break
+            if len(matched) >= 100:
+                break
 
         return {
             "lib_id": lib_id,

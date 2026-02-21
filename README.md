@@ -245,7 +245,7 @@ Add to your Cursor MCP settings:
 - `list_libraries`: List all available symbol and footprint libraries
 - `get_symbol_info`: Get detailed information about a specific symbol
 - `get_footprint_info`: Get detailed information about a specific footprint
-- `suggest_footprints`: Suggest matching footprints for a symbol based on its footprint filters
+- `suggest_footprints`: Suggest matching footprints for a symbol based on its footprint filters (searches all installed footprint libraries)
 
 ### Library Management (9 tools)
 - `clone_library_repo`: Clone a remote KiCad library repository
@@ -318,9 +318,19 @@ pip install -e .[dev]
 
 ### Run Tests
 
+Unit tests (191 tests, no KiCad installation required):
+
 ```bash
 pytest
 ```
+
+Integration tests (exercises all 64 MCP tools against real KiCad files in a temp directory):
+
+```bash
+python tests/integration/run_integration_tests.py
+```
+
+The integration test creates a complete KiCad project from scratch using MCP tools, exercises every tool, and prints a PASS / SKIP / FAIL summary. Expected result: **64/64 passed** (FreeRouting tools auto-detect the JAR from `~/.kicad-mcp/freerouting/`; all 5 export tools require `kicad-cli` and are gracefully skipped if not found).
 
 ### Code Quality
 
@@ -346,8 +356,11 @@ KiCad-MCP/
 │   ├── config.py          # Configuration
 │   ├── server.py          # MCP server setup
 │   └── __main__.py        # CLI entry point
-├── tests/                 # Test suite
-├── examples/              # Usage examples
+├── tests/
+│   ├── integration/       # End-to-end tool tests (run_integration_tests.py)
+│   └── *.py               # Unit tests (191 tests)
+├── examples/
+│   └── air_quality_sensor/  # Complete worked example
 ├── pyproject.toml         # Project metadata
 └── README.md
 ```

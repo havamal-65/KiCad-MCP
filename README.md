@@ -225,7 +225,7 @@ Add to your Cursor MCP settings:
 - `get_sheet_hierarchy`: Get the hierarchical sheet tree from a root schematic
 - `validate_schematic`: Run file-based electrical rules validation (no kicad-cli required)
 - `compare_schematic_pcb`: Detect mismatches between schematic and PCB (missing components, footprint/value differences)
-- `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values)
+- `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values, sync pin nets to pad net assignments)
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 

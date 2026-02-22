@@ -1164,6 +1164,105 @@ class TestSyncSchematicToPcb:
         assert len(fp_mm) == 1
         assert fp_mm[0]["reference"] == "R1"
 
+    def test_sync_assigns_pin_nets_to_pcb_pads_file_backend(self, tmp_path: Path):
+        """Test that sync propagates schematic pin nets to PCB pad net assignments."""
+        import re
+
+        from kicad_mcp.backends.file_backend import FileBackend
+
+        mcp = FastMCP("test")
+        backend = CompositeBackend([FileBackend()])
+        change_log = ChangeLog(tmp_path / "changes.jsonl")
+        register_tools(mcp, backend, change_log)
+
+        sch_content = (
+            '(kicad_sch (version 20230121) (generator "test")\n'
+            '  (uuid "00000000-0000-0000-0000-000000000000")\n'
+            '  (lib_symbols\n'
+            '    (symbol "Device:R"\n'
+            '      (symbol "R_1_1"\n'
+            '        (pin passive line (at 0 1.27 270) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "1" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '        (pin passive line (at 0 -1.27 90) (length 0.254)\n'
+            '          (name "~" (effects (font (size 1.27 1.27))))\n'
+            '          (number "2" (effects (font (size 1.27 1.27))))\n'
+            '        )\n'
+            '      )\n'
+            '    )\n'
+            '  )\n'
+            '  (wire (pts (xy 100 48.73) (xy 100 40))\n'
+            '    (stroke (width 0) (type default))\n'
+            '    (uuid "wire-vcc")\n'
+            '  )\n'
+            '  (label "VCC" (at 100 40 0)\n'
+            '    (effects (font (size 1.27 1.27)))\n'
+            '    (uuid "label-vcc")\n'
+            '  )\n'
+            '  (wire (pts (xy 100 51.27) (xy 100 60))\n'
+            '    (stroke (width 0) (type default))\n'
+            '    (uuid "wire-gnd")\n'
+            '  )\n'
+            '  (label "GND" (at 100 60 0)\n'
+            '    (effects (font (size 1.27 1.27)))\n'
+            '    (uuid "label-gnd")\n'
+            '  )\n'
+            '  (symbol (lib_id "Device:R") (at 100 50 0) (unit 1)\n'
+            '    (uuid "sym-r1")\n'
+            '    (property "Reference" "R1" (at 100 48 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 100 52 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '    (property "Footprint" "Resistor_SMD:R_0805" (at 100 54 0)\n'
+            '      (effects (font (size 1.27 1.27)))\n'
+            '    )\n'
+            '  )\n'
+            ')\n'
+        )
+        pcb_content = (
+            '(kicad_pcb (version 20240108) (generator "test")\n'
+            '  (net 0 "")\n'
+            '  (footprint "Resistor_SMD:R_0805" (layer "F.Cu")\n'
+            '    (at 100 50)\n'
+            '    (property "Reference" "R1" (at 0 0 0)\n'
+            '      (effects (font (size 1 1) (thickness 0.15)))\n'
+            '    )\n'
+            '    (property "Value" "10k" (at 0 0 0)\n'
+            '      (effects (font (size 1 1) (thickness 0.15)))\n'
+            '    )\n'
+            '    (pad "1" smd roundrect (at -1 0) (size 1 1.2) (layers "F.Cu"))\n'
+            '    (pad "2" smd roundrect (at 1 0) (size 1 1.2) (layers "F.Cu"))\n'
+            '  )\n'
+            ')\n'
+        )
+
+        sch_file = tmp_path / "test.kicad_sch"
+        pcb_file = tmp_path / "test.kicad_pcb"
+        sch_file.write_text(sch_content, encoding="utf-8")
+        pcb_file.write_text(pcb_content, encoding="utf-8")
+
+        result_json = mcp._tool_manager._tools["sync_schematic_to_pcb"].fn(
+            schematic_path=str(sch_file),
+            board_path=str(pcb_file),
+        )
+        result = json.loads(result_json)
+        assert result["status"] == "success"
+        assert result["summary"]["nets_assigned"] == 2
+
+        net_actions = [a for a in result["actions"] if a["type"] == "net_assigned"]
+        assert len(net_actions) == 2
+        assert any(a["reference"] == "R1" and a["pad"] == "1" and a["net"] == "VCC" for a in net_actions)
+        assert any(a["reference"] == "R1" and a["pad"] == "2" and a["net"] == "GND" for a in net_actions)
+
+        pcb_text = pcb_file.read_text(encoding="utf-8")
+        assert '(net 1 "VCC")' in pcb_text
+        assert '(net 2 "GND")' in pcb_text
+        assert re.search(r'\(pad\s+"1".*?\(net\s+1\s+"VCC"\)', pcb_text, re.DOTALL)
+        assert re.search(r'\(pad\s+"2".*?\(net\s+2\s+"GND"\)', pcb_text, re.DOTALL)
+
     def test_sync_via_mock_tool(self, mcp_sch: FastMCP, sample_schematic_path: Path,
                                  sample_board_path: Path):
         """Test sync tool runs through mock backend without error."""

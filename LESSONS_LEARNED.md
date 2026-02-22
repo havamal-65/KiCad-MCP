@@ -199,6 +199,14 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: The test now checks whether `test_export_dsn` produced a valid DSN file (`exports/air_quality_sensor.dsn`). If it exists, that real DSN is passed to `run_freerouter`. If not (because `pcbnew` is unavailable and DSN export failed), the test is **skipped** with a clear message. This is correct behavior: `run_freerouter` cannot be meaningfully tested without a valid PCB DSN file.
 
+### 27. `sync_schematic_to_pcb` Did Not Propagate Nets to PCB Pads (FIXED)
+
+**Problem**: `sync_schematic_to_pcb` handled placement and value updates, but it never applied schematic connectivity to PCB pad net assignments. Boards could end up with most pads on `<no net>` even when the schematic was correctly wired.
+
+**Impact**: DRC produced false-positive connectivity errors, routed tracks were disconnected from intended nets, and generated boards were not electrically equivalent to the schematic.
+
+**Fix Applied**: The sync flow now queries schematic connectivity (`get_symbol_pin_positions` + `get_pin_net`) and calls `assign_net` for each resolved `(reference, pin/pad, net)` mapping. The tool reports `net_assigned` actions and includes `nets_assigned` in the summary.
+
 ---
 
 ## Enhancement Requirements (Prioritized)
@@ -219,7 +227,7 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 | # | Enhancement | Status | Why |
 |---|------------|--------|-----|
-| 8 | `sync_schematic_to_pcb` | **DONE** | Programmatic "Update PCB from Schematic" |
+| 8 | `sync_schematic_to_pcb` | **DONE** | Programmatic "Update PCB from Schematic" including net-to-pad sync |
 | 9 | `suggest_footprints(lib_id)` | **DONE** | Help users find correct footprint for a symbol |
 | 10 | `get_net_connections` / `get_pin_net` | **DONE** | Net-aware queries for intelligent wire routing |
 | 11 | `remove_wire` / `remove_no_connect` | **DONE** | Undo/fix wiring mistakes |

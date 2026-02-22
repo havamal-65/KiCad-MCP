@@ -122,8 +122,8 @@ class FileBoardOps(BoardOps):
         if not net_name:
             return content, 0
 
-        # Find all existing net definitions
-        net_pattern = re.compile(r'\(net\s+(\d+)\s+"([^"]*?)"\)')
+        # Find top-level net definitions only (one per line), not pad-level net clauses.
+        net_pattern = re.compile(r'(?m)^[ \t]*\(net\s+(\d+)\s+"([^"]*?)"\)\s*$')
         max_id = 0
         for m in net_pattern.finditer(content):
             net_id = int(m.group(1))
@@ -406,10 +406,15 @@ class FileSchematicOps(SchematicOps):
         for label_type in ["label", "global_label", "hierarchical_label"]:
             for lbl in getattr(sch, label_type, []):
                 label_data: dict[str, Any] = {"label_type": label_type}
-                if hasattr(lbl, "text"):
-                    label_data["text"] = str(lbl.text)
-                elif hasattr(lbl, "name"):
-                    label_data["text"] = str(lbl.name)
+                text_value = getattr(lbl, "text", None) if hasattr(lbl, "text") else None
+                name_value = getattr(lbl, "name", None) if hasattr(lbl, "name") else None
+                if text_value not in (None, ""):
+                    label_data["text"] = str(text_value)
+                elif name_value not in (None, ""):
+                    label_data["text"] = str(name_value)
+                else:
+                    # Skip malformed/empty labels instead of inventing a literal "None" net name.
+                    continue
                 if hasattr(lbl, "at"):
                     pos = self._skip_at_to_pos(lbl.at)
                     if pos:
@@ -1301,7 +1306,9 @@ class FileSchematicOps(SchematicOps):
         Returns:
             Mapping of net_name -> list of {reference, pin_number, position}.
         """
-        data = self.read_schematic(path)
+        # Connectivity needs exact wire/label geometry; use sexp parsing directly
+        # instead of the optional skip parser to avoid lossy label handling.
+        data = self._read_with_sexp(path)
         symbols = data.get("symbols", [])
         wires = data.get("wires", [])
         labels = data.get("labels", [])

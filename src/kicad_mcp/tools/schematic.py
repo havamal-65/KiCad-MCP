@@ -741,6 +741,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         automatic changes:
         - Components missing from PCB are placed at auto-positioned locations.
         - Value mismatches are updated on the PCB side.
+        - Pin-to-net assignments are propagated from schematic connectivity to PCB pads.
         - Footprint mismatches and extra PCB components are reported as warnings
           (not auto-fixed, as they require manual review).
 
@@ -788,6 +789,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         # Auto-position grid for new components
         place_x, place_y = 50.0, 50.0
         place_step = 10.0
+        placed_refs: set[str] = set()
 
         for ref in sorted(sch_by_ref):
             if ref not in pcb_by_ref:
@@ -814,6 +816,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                             "footprint": footprint,
                             "position": {"x": place_x, "y": place_y},
                         })
+                        placed_refs.add(ref)
                         place_x += place_step
                         if place_x > 200.0:
                             place_x = 50.0
@@ -917,9 +920,106 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                         "message": f"{ref} value mismatch (board modify not available).",
                     })
 
+        # Propagate schematic pin nets to PCB pads when connectivity queries are available.
+        if board_modify_ops is not None:
+            net_assignments: list[dict[str, str]] = []
+            net_queries_supported = True
+
+            for ref in sorted(sch_by_ref):
+                # Only assign nets to components known to exist in PCB (pre-existing or newly placed).
+                if ref not in pcb_by_ref and ref not in placed_refs:
+                    continue
+
+                try:
+                    pin_info = sch_ops.get_symbol_pin_positions(sch_p, ref)
+                except NotImplementedError:
+                    net_queries_supported = False
+                    break
+                except Exception:
+                    continue
+
+                if not isinstance(pin_info, dict):
+                    continue
+                pin_positions = pin_info.get("pin_positions", {})
+                if not isinstance(pin_positions, dict):
+                    continue
+
+                for pin_number in sorted(pin_positions, key=lambda p: str(p)):
+                    pin_number_str = str(pin_number)
+                    try:
+                        pin_net = sch_ops.get_pin_net(sch_p, ref, pin_number_str)
+                    except NotImplementedError:
+                        net_queries_supported = False
+                        break
+                    except Exception:
+                        continue
+
+                    if not isinstance(pin_net, dict):
+                        continue
+                    net_name = pin_net.get("net_name", "")
+                    if not isinstance(net_name, str) or not net_name:
+                        continue
+                    if net_name.strip().lower() == "none":
+                        continue
+
+                    net_assignments.append({
+                        "reference": ref,
+                        "pad": pin_number_str,
+                        "net": net_name,
+                    })
+
+                if not net_queries_supported:
+                    break
+
+            if not net_queries_supported:
+                warnings.append({
+                    "type": "net_sync_not_supported",
+                    "message": "Schematic backend does not support pin/net connectivity queries.",
+                })
+            else:
+                seen_assignments: set[tuple[str, str, str]] = set()
+                for assignment in net_assignments:
+                    key = (assignment["reference"], assignment["pad"], assignment["net"])
+                    if key in seen_assignments:
+                        continue
+                    seen_assignments.add(key)
+
+                    try:
+                        board_modify_ops.assign_net(
+                            pcb_p,
+                            assignment["reference"],
+                            assignment["pad"],
+                            assignment["net"],
+                        )
+                        actions.append({
+                            "type": "net_assigned",
+                            **assignment,
+                        })
+                    except NotImplementedError:
+                        warnings.append({
+                            "type": "net_sync_not_supported",
+                            "message": "Board backend does not support assigning nets to pads.",
+                        })
+                        break
+                    except Exception as exc:
+                        warnings.append({
+                            "type": "net_assign_failed",
+                            "reference": assignment["reference"],
+                            "pad": assignment["pad"],
+                            "net": assignment["net"],
+                            "message": str(exc),
+                        })
+        else:
+            if any(ref in pcb_by_ref or ref in placed_refs for ref in sch_by_ref):
+                warnings.append({
+                    "type": "net_sync_unavailable",
+                    "message": "Board modify backend not available; schematic nets were not synced to PCB pads.",
+                })
+
         summary = {
             "components_placed": sum(1 for a in actions if a["type"] == "placed"),
             "values_updated": sum(1 for a in actions if a["type"] == "value_updated"),
+            "nets_assigned": sum(1 for a in actions if a["type"] == "net_assigned"),
             "warnings": len(warnings),
         }
 

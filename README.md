@@ -39,6 +39,8 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 ### From PyPI (Coming Soon)
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install kicad-mcp
 ```
 
@@ -51,6 +53,12 @@ pip install -e .
 ```
 
 ### Optional Dependencies
+
+Activate the venv first, then install the extras inside it:
+
+```bash
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
 
 For IPC backend (direct KiCad communication):
 ```bash
@@ -409,7 +417,7 @@ If you try to use auto-routing tools without FreeRouting, you'll get a helpful e
 Run `python -m kicad_mcp --check` to see which backends are available. Install missing dependencies:
 
 - IPC: Requires KiCad to be running
-- SWIG: `pip install kicad-mcp[ipc]`
+- SWIG: activate the venv then `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH
 - File: Always available (pure Python)
 

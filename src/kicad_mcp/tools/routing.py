@@ -25,6 +25,16 @@ from kicad_mcp.utils.validation import validate_kicad_path
 logger = get_logger("tools.routing")
 
 
+_BOARD_LOAD_FAILED_SENTINEL = "BOARD_LOAD_FAILED"
+_BOARD_OUTLINE_MISSING_SENTINEL = "BOARD_OUTLINE_MISSING"
+_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL = "BOARD_OUTLINE_NO_SEGMENTS"
+_BOARD_OUTLINE_OPEN_SENTINEL = "BOARD_OUTLINE_OPEN"
+_DSN_EXPORT_TIMEOUT_SECONDS = 900
+_SES_IMPORT_TIMEOUT_SECONDS = 900
+_BOARD_CLEAN_TIMEOUT_SECONDS = 300
+_BOARD_PREFLIGHT_TIMEOUT_SECONDS = 180
+
+
 def _get_pcbnew():
     """Try to import pcbnew module.
 
@@ -87,18 +97,315 @@ def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
 
     try:
         result = subprocess.run(
-            [str(kicad_python), "-S", "-c", script],
+            [str(kicad_python), "-S", "-u", "-c", script],
             capture_output=True,
             text=True,
             timeout=timeout,
             env=env,
         )
-        output = result.stdout + result.stderr
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0 and not output.strip():
+            output = (
+                f"KiCad Python exited with code {result.returncode} "
+                "and produced no diagnostic output."
+            )
         return result.returncode == 0, output
-    except subprocess.TimeoutExpired:
-        return False, "Script timed out"
+    except subprocess.TimeoutExpired as e:
+        partial_output = ""
+        if isinstance(e.stdout, str):
+            partial_output += e.stdout
+        elif isinstance(e.stdout, bytes):
+            partial_output += e.stdout.decode(errors="replace")
+        if isinstance(e.stderr, str):
+            partial_output += e.stderr
+        elif isinstance(e.stderr, bytes):
+            partial_output += e.stderr.decode(errors="replace")
+
+        normalized = _normalize_error_text(partial_output)
+        if normalized:
+            return False, (
+                f"Script timed out after {timeout} seconds. "
+                f"Partial output: {normalized}"
+            )
+        return False, f"Script timed out after {timeout} seconds with no output."
     except OSError as e:
         return False, f"Failed to run KiCad Python: {e}"
+
+
+def _normalize_error_text(text: str, max_chars: int = 1200) -> str:
+    """Normalize multiline stderr into a compact single-line message."""
+    compact = " ".join((text or "").split())
+    if len(compact) > max_chars:
+        return compact[:max_chars] + "..."
+    return compact
+
+
+def _malformed_board_message(board_path: Path, details: str = "") -> str:
+    message = (
+        f"Malformed board: KiCad could not load '{board_path}'. "
+        "Ensure the .kicad_pcb file is valid before running autoroute."
+    )
+    normalized = _normalize_error_text(details)
+    if normalized:
+        message += f" Details: {normalized}"
+    return message
+
+
+def _board_outline_error_message(board_path: Path, details: str = "") -> str:
+    message = (
+        f"Board outline error: '{board_path}' must include a closed Edge.Cuts outline "
+        "before running autoroute."
+    )
+    normalized = _normalize_error_text(details)
+    if normalized:
+        message += f" Details: {normalized}"
+    return message
+
+
+def _format_pcbnew_error(prefix: str, output_text: str, board_path: Path | None = None) -> str:
+    """Build a stable error message from pcbnew subprocess output."""
+    has_load_failed = _BOARD_LOAD_FAILED_SENTINEL in (output_text or "")
+    cleaned = (output_text or "").replace(_BOARD_LOAD_FAILED_SENTINEL, "")
+    normalized = _normalize_error_text(cleaned)
+
+    if board_path is not None and (has_load_failed or not normalized):
+        detail = normalized or "KiCad did not provide additional diagnostics."
+        return _malformed_board_message(board_path, detail)
+
+    if normalized:
+        return f"{prefix}: {normalized}"
+    return f"{prefix}: KiCad did not provide additional diagnostics."
+
+
+def _point_key(point: object) -> tuple[int, int] | None:
+    x = getattr(point, "x", None)
+    y = getattr(point, "y", None)
+    if x is None or y is None:
+        try:
+            return int(point[0]), int(point[1])  # type: ignore[index]
+        except Exception:
+            return None
+    return int(x), int(y)
+
+
+def _is_closed_outline_item(item: object) -> bool:
+    """Return True for closed geometric edge items (rectangles, polygons, circles)."""
+    if hasattr(item, "IsClosed"):
+        try:
+            if bool(item.IsClosed()):
+                return True
+        except Exception:
+            pass
+
+    # Fallback for APIs where IsClosed is unavailable/restricted.
+    if hasattr(item, "GetShapeStr"):
+        try:
+            shape = str(item.GetShapeStr()).lower()
+            if any(token in shape for token in ("rect", "polygon", "poly", "circle")):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _is_edge_cuts_item(item: object, board: object, edge_layer_id: int | None) -> bool:
+    if hasattr(item, "GetLayerName"):
+        try:
+            if item.GetLayerName() == "Edge.Cuts":
+                return True
+        except Exception:
+            pass
+
+    if hasattr(item, "GetLayer"):
+        try:
+            layer = int(item.GetLayer())
+            if edge_layer_id is not None:
+                return layer == edge_layer_id
+            if hasattr(board, "GetLayerName"):
+                return board.GetLayerName(layer) == "Edge.Cuts"
+        except Exception:
+            return False
+    return False
+
+
+def _check_edge_cuts_closed(board: object, edge_layer_id: int | None) -> tuple[bool, str]:
+    if not hasattr(board, "GetDrawings"):
+        return False, "Board API does not expose drawings for outline validation."
+
+    edge_items = 0
+    endpoint_counts: dict[tuple[int, int], int] = {}
+    closed_items = 0
+    drawings = board.GetDrawings()
+    for item in drawings:
+        if not _is_edge_cuts_item(item, board, edge_layer_id):
+            continue
+        edge_items += 1
+        if _is_closed_outline_item(item):
+            closed_items += 1
+            continue
+        if hasattr(item, "GetStart") and hasattr(item, "GetEnd"):
+            try:
+                start_key = _point_key(item.GetStart())
+                end_key = _point_key(item.GetEnd())
+            except Exception:
+                start_key = None
+                end_key = None
+            if start_key is not None and end_key is not None:
+                endpoint_counts[start_key] = endpoint_counts.get(start_key, 0) + 1
+                endpoint_counts[end_key] = endpoint_counts.get(end_key, 0) + 1
+
+    if edge_items == 0:
+        return False, "No Edge.Cuts geometry found."
+    if closed_items > 0 and not endpoint_counts:
+        return True, ""
+    if not endpoint_counts:
+        return False, "Edge.Cuts exists but no drawable outline segments were found."
+
+    unmatched = sum(1 for count in endpoint_counts.values() if count % 2 != 0)
+    if unmatched:
+        return False, f"Edge.Cuts outline appears open ({unmatched} unmatched endpoints)."
+    return True, ""
+
+
+def _validate_board_preflight(board_path: Path) -> tuple[bool, str]:
+    """Validate board loadability and basic outline integrity before routing."""
+    pcbnew = _get_pcbnew()
+    if pcbnew is not None:
+        try:
+            board = pcbnew.LoadBoard(str(board_path))
+            if board is None:
+                return False, _malformed_board_message(board_path)
+            edge_layer_id = getattr(pcbnew, "Edge_Cuts", None)
+            is_closed, details = _check_edge_cuts_closed(board, edge_layer_id)
+            if not is_closed:
+                return False, _board_outline_error_message(board_path, details)
+            return True, ""
+        except Exception as e:
+            return False, _format_pcbnew_error("Board preflight failed", str(e), board_path)
+
+    script = f"""
+import pcbnew, sys
+board = pcbnew.LoadBoard({str(board_path)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
+
+edge_layer_id = getattr(pcbnew, "Edge_Cuts", None)
+edge_items = 0
+endpoint_counts = {{}}
+closed_items = 0
+
+def point_key(point):
+    x = getattr(point, "x", None)
+    y = getattr(point, "y", None)
+    if x is None or y is None:
+        try:
+            return int(point[0]), int(point[1])
+        except Exception:
+            return None
+    return int(x), int(y)
+
+def is_edge_cuts(item):
+    if hasattr(item, "GetLayerName"):
+        try:
+            if item.GetLayerName() == "Edge.Cuts":
+                return True
+        except Exception:
+            pass
+    if hasattr(item, "GetLayer"):
+        try:
+            layer = int(item.GetLayer())
+            if edge_layer_id is not None:
+                return layer == edge_layer_id
+            if hasattr(board, "GetLayerName"):
+                return board.GetLayerName(layer) == "Edge.Cuts"
+        except Exception:
+            return False
+    return False
+
+def is_closed_item(item):
+    if hasattr(item, "IsClosed"):
+        try:
+            if bool(item.IsClosed()):
+                return True
+        except Exception:
+            pass
+    if hasattr(item, "GetShapeStr"):
+        try:
+            shape = str(item.GetShapeStr()).lower()
+            if ("rect" in shape or "polygon" in shape or "poly" in shape or "circle" in shape):
+                return True
+        except Exception:
+            pass
+    return False
+
+if not hasattr(board, "GetDrawings"):
+    print("{_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL}")
+    sys.exit(4)
+
+for item in board.GetDrawings():
+    if not is_edge_cuts(item):
+        continue
+    edge_items += 1
+    if is_closed_item(item):
+        closed_items += 1
+        continue
+    if hasattr(item, "GetStart") and hasattr(item, "GetEnd"):
+        try:
+            start_key = point_key(item.GetStart())
+            end_key = point_key(item.GetEnd())
+        except Exception:
+            start_key = None
+            end_key = None
+        if start_key is not None and end_key is not None:
+            endpoint_counts[start_key] = endpoint_counts.get(start_key, 0) + 1
+            endpoint_counts[end_key] = endpoint_counts.get(end_key, 0) + 1
+
+if edge_items == 0:
+    print("{_BOARD_OUTLINE_MISSING_SENTINEL}")
+    sys.exit(3)
+
+if closed_items > 0 and not endpoint_counts:
+    print("BOARD_PREFLIGHT_OK")
+    sys.exit(0)
+
+if not endpoint_counts:
+    print("{_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL}")
+    sys.exit(4)
+
+unmatched = sum(1 for count in endpoint_counts.values() if count % 2 != 0)
+if unmatched:
+    print(f"{_BOARD_OUTLINE_OPEN_SENTINEL}:{{unmatched}}")
+    sys.exit(5)
+
+print("BOARD_PREFLIGHT_OK")
+"""
+    ok, output_text = _run_pcbnew_script(script, timeout=_BOARD_PREFLIGHT_TIMEOUT_SECONDS)
+    if ok and "BOARD_PREFLIGHT_OK" in output_text:
+        return True, ""
+
+    output_text = output_text or ""
+    if _BOARD_LOAD_FAILED_SENTINEL in output_text:
+        return False, _malformed_board_message(board_path)
+    if _BOARD_OUTLINE_MISSING_SENTINEL in output_text:
+        return False, _board_outline_error_message(board_path, "No Edge.Cuts geometry found.")
+    if _BOARD_OUTLINE_NO_SEGMENTS_SENTINEL in output_text:
+        return False, _board_outline_error_message(
+            board_path,
+            "Edge.Cuts exists but no drawable outline segments were found.",
+        )
+    if _BOARD_OUTLINE_OPEN_SENTINEL in output_text:
+        detail = "Edge.Cuts outline appears open."
+        for line in output_text.splitlines():
+            if line.startswith(f"{_BOARD_OUTLINE_OPEN_SENTINEL}:"):
+                unmatched = line.split(":", 1)[1].strip()
+                if unmatched.isdigit():
+                    detail = f"Edge.Cuts outline appears open ({unmatched} unmatched endpoints)."
+                break
+        return False, _board_outline_error_message(board_path, detail)
+
+    return False, _format_pcbnew_error("Board preflight failed", output_text, board_path)
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +423,24 @@ def _impl_export_dsn(
     dsn_path = Path(output) if output else p.parent / "freerouting.dsn"
     dsn_path = dsn_path.resolve()
 
+    preflight_ok, preflight_message = _validate_board_preflight(p)
+    if not preflight_ok:
+        return json.dumps({
+            "status": "error",
+            "message": preflight_message,
+        })
+
     dsn_path.parent.mkdir(parents=True, exist_ok=True)
 
     pcbnew = _get_pcbnew()
     if pcbnew is not None:
         try:
             board = pcbnew.LoadBoard(str(p))
+            if board is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": _malformed_board_message(p),
+                })
             ok = pcbnew.ExportSpecctraDSN(board, str(dsn_path))
             if not ok:
                 return json.dumps({
@@ -132,23 +451,26 @@ def _impl_export_dsn(
         except Exception as e:
             return json.dumps({
                 "status": "error",
-                "message": f"pcbnew DSN export failed: {e}",
+                "message": _format_pcbnew_error("pcbnew DSN export failed", str(e), p),
             })
     else:
         script = f"""
 import pcbnew, sys
 board = pcbnew.LoadBoard({str(p)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
 ok = pcbnew.ExportSpecctraDSN(board, {str(dsn_path)!r})
 if not ok:
     print("EXPORT_FAILED")
     sys.exit(1)
 print("EXPORT_OK")
 """
-        ok, output_text = _run_pcbnew_script(script)
+        ok, output_text = _run_pcbnew_script(script, timeout=_DSN_EXPORT_TIMEOUT_SECONDS)
         if not ok or "EXPORT_FAILED" in output_text:
             return json.dumps({
                 "status": "error",
-                "message": f"DSN export failed: {output_text}",
+                "message": _format_pcbnew_error("DSN export failed", output_text, p),
             })
 
     # Clean Unicode characters that FreeRouting can't handle
@@ -195,6 +517,11 @@ def _impl_import_ses(
     if pcbnew is not None:
         try:
             board = pcbnew.LoadBoard(str(p))
+            if board is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": _malformed_board_message(p),
+                })
             tracks_before = len(board.GetTracks())
             ok = pcbnew.ImportSpecctraSES(board, str(ses))
             if not ok:
@@ -207,12 +534,15 @@ def _impl_import_ses(
         except Exception as e:
             return json.dumps({
                 "status": "error",
-                "message": f"SES import failed: {e}",
+                "message": _format_pcbnew_error("SES import failed", str(e), p),
             })
     else:
         script = f"""
 import pcbnew, sys
 board = pcbnew.LoadBoard({str(p)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
 before = len(board.GetTracks())
 ok = pcbnew.ImportSpecctraSES(board, {str(ses)!r})
 if not ok:
@@ -223,11 +553,11 @@ pcbnew.SaveBoard({str(p)!r}, board)
 print(f"TRACKS_BEFORE={{before}}")
 print(f"TRACKS_AFTER={{after}}")
 """
-        ok, output_text = _run_pcbnew_script(script)
+        ok, output_text = _run_pcbnew_script(script, timeout=_SES_IMPORT_TIMEOUT_SECONDS)
         if not ok or "IMPORT_FAILED" in output_text:
             return json.dumps({
                 "status": "error",
-                "message": f"SES import failed: {output_text}",
+                "message": _format_pcbnew_error("SES import failed", output_text, p),
             })
         for line in output_text.splitlines():
             if line.startswith("TRACKS_BEFORE="):
@@ -396,6 +726,11 @@ def _impl_clean_board_for_routing(
     if pcbnew is not None:
         try:
             board = pcbnew.LoadBoard(str(p))
+            if board is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": _malformed_board_message(p),
+                })
 
             if remove_keepouts:
                 zones_to_remove = []
@@ -421,12 +756,15 @@ def _impl_clean_board_for_routing(
         except Exception as e:
             return json.dumps({
                 "status": "error",
-                "message": f"Board cleanup failed: {e}",
+                "message": _format_pcbnew_error("Board cleanup failed", str(e), p),
             })
     else:
         script = f"""
 import pcbnew, sys
 board = pcbnew.LoadBoard({str(p)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
 keepouts = 0
 tracks = 0
 if {remove_keepouts!r}:
@@ -443,11 +781,11 @@ pcbnew.SaveBoard({str(p)!r}, board)
 print(f"KEEPOUTS={{keepouts}}")
 print(f"TRACKS={{tracks}}")
 """
-        ok, output_text = _run_pcbnew_script(script)
+        ok, output_text = _run_pcbnew_script(script, timeout=_BOARD_CLEAN_TIMEOUT_SECONDS)
         if not ok:
             return json.dumps({
                 "status": "error",
-                "message": f"Board cleanup failed: {output_text}",
+                "message": _format_pcbnew_error("Board cleanup failed", output_text, p),
             })
         for line in output_text.splitlines():
             if line.startswith("KEEPOUTS="):
@@ -599,6 +937,23 @@ def register_tools(
         dsn = p.parent / "freerouting.dsn"
         ses = p.parent / "freerouting.ses"
         report: dict = {"status": "success", "steps": []}
+
+        # Step 0: Preflight board validation
+        preflight_ok, preflight_message = _validate_board_preflight(p)
+        if not preflight_ok:
+            report["status"] = "error"
+            report["steps"].append({
+                "step": "preflight",
+                "status": "error",
+                "message": preflight_message,
+            })
+            report["message"] = f"Preflight failed: {preflight_message}"
+            return json.dumps(report, indent=2)
+        report["steps"].append({
+            "step": "preflight",
+            "status": "success",
+            "message": "Board preflight checks passed",
+        })
 
         # Step 1: Clean board (optional)
         if clean_board:

@@ -32,7 +32,7 @@ function Ensure-Venv {
     }
 
     # Check whether the package is importable inside the venv
-    & $VenvPython -c "import kicad_mcp" 2>$null | Out-Null
+    & $VenvPython -c "import kicad_mcp" *>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[kicad-mcp] Installing kicad-mcp into venv..." -ForegroundColor Cyan
         & $VenvPython -m pip install -e $ProjectDir --quiet

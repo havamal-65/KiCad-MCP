@@ -31,6 +31,9 @@ htmlcov/
 .kicad_mcp_backups/
 *.jsonl
 
+# Examples (local testing only)
+examples/
+
 # OS
 Thumbs.db
 .DS_Store

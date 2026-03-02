@@ -8,13 +8,13 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **64 MCP Tools** across 8 categories:
-  - 📋 **Project Management** (6 tools): Open projects, list files, read/write metadata, query backend info, query active KiCad project via IPC
-  - 📐 **Schematic Operations** (22 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, file-based schematic validation, schematic-to-PCB comparison and sync
-  - 🔌 **PCB Board Operations** (8 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules
+- **70 MCP Tools** across 8 categories:
+  - 📋 **Project Management** (9 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC
+  - 📐 **Schematic Operations** (21 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
+  - 🔌 **PCB Board Operations** (10 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules, refill copper zones, query layer stackup
   - 📚 **Library Search** (6 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
-  - ✅ **Design Rule Checks** (3 tools): Run DRC and ERC validations
+  - ✅ **Design Rule Checks** (4 tools): Run DRC and ERC validations, file-based schematic validation, query board design rules
   - 📤 **Export Operations** (5 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs
   - 🔀 **Auto-Routing** (5 tools): PCB trace auto-routing via FreeRouting (optional, requires FreeRouting)
 
@@ -165,16 +165,44 @@ mcp.run(transport="stdio")
 
 ## Client Integration
 
-### Claude Desktop
+The repo ships bootstrap scripts (`run.ps1` for Windows, `run.sh` for macOS/Linux) that automatically create a virtual environment and install all dependencies on first run — no manual setup needed.
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+### Claude Code (recommended)
+
+A `.mcp.json` is included at the repo root. Claude Code picks it up automatically when you open the folder, so no manual config is required.
+
+### Claude Desktop — Windows
+
+Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "kicad": {
-      "command": "python",
-      "args": ["-m", "kicad_mcp"],
+      "command": "powershell",
+      "args": [
+        "-ExecutionPolicy", "Bypass",
+        "-NonInteractive",
+        "-File", "C:\\path\\to\\KiCad-MCP\\run.ps1"
+      ],
+      "env": {
+        "KICAD_MCP_BACKEND": "auto",
+        "KICAD_MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop — macOS / Linux
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `~/.config/Claude/claude_desktop_config.json` (Linux):
+
+```json
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "/path/to/KiCad-MCP/run.sh",
       "env": {
         "KICAD_MCP_BACKEND": "auto",
         "KICAD_MCP_LOG_LEVEL": "INFO"
@@ -186,34 +214,34 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 ### Cursor
 
-Add to your Cursor MCP settings:
+Add to your Cursor MCP settings (use `run.ps1` on Windows, `run.sh` on macOS/Linux as above).
 
-```json
-{
-  "mcpServers": {
-    "kicad": {
-      "command": "python",
-      "args": ["-m", "kicad_mcp"],
-      "env": {
-        "KICAD_MCP_BACKEND": "auto",
-        "KICAD_MCP_LOG_LEVEL": "INFO"
-      }
-    }
-  }
-}
+### Manual setup (advanced)
+
+If you prefer to manage your own venv:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e .
+python -m kicad_mcp
 ```
 
 ## Available Tools
 
-### Project Management (6 tools)
+### Project Management (9 tools)
+- `open_kicad`: Launch KiCad (IPC backend only)
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
 - `get_project_metadata`: Read detailed metadata from a KiCad project file
 - `save_project`: Trigger save for an open KiCad project (requires IPC backend)
 - `get_backend_info`: Get information about available backends and their capabilities
 - `get_active_project`: Query the currently open KiCad project and documents (requires IPC backend)
+- `get_text_variables`: Get all project-level text variables (`${VAR}` substitutions)
+- `set_text_variables`: Set one or more project-level text variables
+- `create_project`: Create a new KiCad project with blank `.kicad_pro`, `.kicad_sch`, and `.kicad_pcb` files
 
-### Schematic Operations (22 tools)
+### Schematic Operations (21 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
 - `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
 - `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
@@ -231,13 +259,12 @@ Add to your Cursor MCP settings:
 - `get_pin_net`: Get the net name connected to a specific pin of a symbol
 - `get_net_connections`: Get all connections (pins, labels, wires) on a named net
 - `get_sheet_hierarchy`: Get the hierarchical sheet tree from a root schematic
-- `validate_schematic`: Run file-based electrical rules validation (no kicad-cli required)
 - `compare_schematic_pcb`: Detect mismatches between schematic and PCB (missing components, footprint/value differences)
 - `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values, sync pin nets to pad net assignments)
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (8 tools)
+### PCB Board Operations (10 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
@@ -246,6 +273,8 @@ Add to your Cursor MCP settings:
 - `add_via`: Add a via (through-hole, blind, or buried)
 - `assign_net`: Assign a net to a component pad
 - `get_design_rules`: Get the board's design rules (clearances, track widths, via sizes)
+- `refill_zones`: Refill all copper pour zones on a board
+- `get_stackup`: Get the layer stackup definition for a board
 
 ### Library Search (6 tools)
 - `search_symbols`: Search for schematic symbols across installed libraries
@@ -266,9 +295,10 @@ Add to your Cursor MCP settings:
 - `import_footprint`: Copy a footprint from one .pretty directory to another
 - `register_project_library`: Register a library in a project's sym-lib-table or fp-lib-table
 
-### Design Rule Checks (3 tools)
+### Design Rule Checks (4 tools)
 - `run_drc`: Run Design Rule Check on a PCB board
 - `run_erc`: Run Electrical Rules Check on a schematic
+- `validate_schematic`: File-based electrical rules validation (no kicad-cli required)
 - `get_board_design_rules`: Get the design rules configured for a board
 
 ### Export Operations (5 tools)
@@ -326,19 +356,19 @@ pip install -e .[dev]
 
 ### Run Tests
 
-Unit tests (191 tests, no KiCad installation required):
+Unit tests (no KiCad installation required):
 
 ```bash
 pytest
 ```
 
-Integration tests (exercises all 64 MCP tools against real KiCad files in a temp directory):
+Integration tests (exercises MCP tools against real KiCad files in a temp directory):
 
 ```bash
 python tests/integration/run_integration_tests.py
 ```
 
-The integration test creates a complete KiCad project from scratch using MCP tools, exercises every tool, and prints a PASS / SKIP / FAIL summary. Expected result: **64/64 passed** (FreeRouting tools auto-detect the JAR from `~/.kicad-mcp/freerouting/`; all 5 export tools require `kicad-cli` and are gracefully skipped if not found).
+The integration test creates a complete KiCad project from scratch using MCP tools, exercises every tool, and prints a PASS / SKIP / FAIL summary. FreeRouting tools auto-detect the JAR from `~/.kicad-mcp/freerouting/`; all 5 export tools require `kicad-cli` and are gracefully skipped if not found.
 
 ### Code Quality
 
@@ -408,7 +438,7 @@ The script also demonstrates how to inject a custom symbol library into the file
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 59 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 65 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

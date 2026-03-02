@@ -1,4 +1,4 @@
-"""Project management tools - 6 tools."""
+"""Project management tools - 9 tools."""
 
 from __future__ import annotations
 
@@ -190,3 +190,120 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         status = backend.get_status()
         change_log.record("get_backend_info", {})
         return json.dumps({"status": "success", **status}, indent=2)
+
+    @mcp.tool()
+    def get_text_variables(project_path: str) -> str:
+        """Get project text variables (${VAR} substitution table).
+
+        Returns all defined text variables used for title block and schematic
+        text substitution. Requires KiCad 9+ running with IPC enabled.
+
+        Args:
+            project_path: Path to the .kicad_pro file.
+
+        Returns:
+            JSON with variable names and values, or unavailable status.
+        """
+        p = validate_kicad_path(project_path, ".kicad_pro")
+        result = backend.get_text_variables(p)
+        if result.get("status") == "success":
+            change_log.record("get_text_variables", {"path": project_path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def set_text_variables(project_path: str, variables: dict) -> str:
+        """Set project text variables.
+
+        Updates ${VAR} substitution values used in title blocks, schematic
+        text, and board text. Requires KiCad 9+ running with IPC enabled.
+
+        Args:
+            project_path: Path to the .kicad_pro file.
+            variables: Dict mapping variable names to string values.
+
+        Returns:
+            JSON with set status and count of variables updated.
+        """
+        p = validate_kicad_path(project_path, ".kicad_pro")
+        result = backend.set_text_variables(p, variables)
+        if result.get("status") == "success":
+            change_log.record("set_text_variables", {"path": project_path, "count": len(variables)})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def create_project(
+        project_dir: str,
+        name: str,
+        title: str = "",
+        revision: str = "",
+    ) -> str:
+        """Create a new KiCad project with blank schematic and PCB files.
+
+        Creates <name>.kicad_pro, <name>.kicad_sch, and <name>.kicad_pcb
+        inside project_dir (which is created if it does not exist).
+
+        Args:
+            project_dir: Directory to create the project in.
+            name: Project name, used as the file stem (no extension).
+            title: Optional title for the title block of schematic and PCB.
+            revision: Optional revision string (e.g. "1.0").
+
+        Returns:
+            JSON with status and paths to all created files.
+        """
+        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
+        from kicad_mcp.utils.platform_helper import find_kicad_template_dir
+
+        proj_dir = Path(project_dir).resolve()
+        proj_dir.mkdir(parents=True, exist_ok=True)
+
+        stem = name.strip()
+        if not stem:
+            return json.dumps({"status": "error", "message": "name must not be empty"})
+
+        pro_path = proj_dir / f"{stem}.kicad_pro"
+        sch_path = proj_dir / f"{stem}.kicad_sch"
+        pcb_path = proj_dir / f"{stem}.kicad_pcb"
+
+        # --- .kicad_pro ---
+        _MINIMAL_PRO = {
+            "board": {"design_settings": {}},
+            "boards": [],
+            "libraries": {"pinned_footprint_libs": [], "pinned_symbol_libs": []},
+            "meta": {"filename": f"{stem}.kicad_pro", "version": 1},
+            "net_settings": {"classes": [], "meta": {"version": 0}},
+            "pcbnew": {"page_layout_descr_file": ""},
+            "sheets": [],
+            "text_variables": {},
+        }
+        template_dir = find_kicad_template_dir()
+        template_pro = template_dir / "kicad.kicad_pro" if template_dir else None
+        if template_pro and template_pro.exists():
+            try:
+                pro_data = json.loads(template_pro.read_text(encoding="utf-8"))
+                pro_data.setdefault("meta", {})["filename"] = f"{stem}.kicad_pro"
+            except (json.JSONDecodeError, OSError):
+                pro_data = _MINIMAL_PRO
+        else:
+            pro_data = _MINIMAL_PRO
+
+        pro_path.write_text(json.dumps(pro_data, indent=2), encoding="utf-8")
+
+        # --- .kicad_sch ---
+        FileSchematicOps().create_schematic(sch_path, title=title, revision=revision)
+
+        # --- .kicad_pcb ---
+        FileBoardOps().create_board(pcb_path, title=title, revision=revision)
+
+        result = {
+            "status": "success",
+            "project": {
+                "name": stem,
+                "directory": str(proj_dir),
+                "pro_file": str(pro_path),
+                "schematic_file": str(sch_path),
+                "board_file": str(pcb_path),
+            },
+        }
+        change_log.record("create_project", {"name": stem, "dir": project_dir})
+        return json.dumps(result, indent=2)

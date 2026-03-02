@@ -36,6 +36,206 @@ from kicad_mcp.utils.sexp_parser import (
 logger = get_logger("backend.file")
 
 
+# ---------------------------------------------------------------------------
+# Footprint library helpers used by place_component
+# ---------------------------------------------------------------------------
+
+def _load_kicad_mod(lib_id: str) -> str | None:
+    """Find and return the raw text of the .kicad_mod file for *lib_id*.
+
+    *lib_id* is expected in ``Library:FootprintName`` format.  Returns
+    ``None`` when the file cannot be located.
+    """
+    if ":" not in lib_id:
+        return None
+    lib_name, fp_name = lib_id.split(":", 1)
+    from kicad_mcp.utils.kicad_paths import find_footprint_libraries
+    for lib_dir in find_footprint_libraries():
+        if lib_dir.stem == lib_name or lib_dir.stem.replace(".pretty", "") == lib_name:
+            fp_file = lib_dir / f"{fp_name}.kicad_mod"
+            if fp_file.exists():
+                return fp_file.read_text(encoding="utf-8")
+    return None
+
+
+def _add_uuids_to_fp_elements(inner: str) -> str:
+    """Inject ``(uuid "…")`` into every sub-element of a footprint body that
+    does not already carry one.
+
+    KiCad 9 expects UUIDs on: ``pad``, ``property``, ``fp_line``,
+    ``fp_rect``, ``fp_poly``, ``fp_text``, ``fp_arc``, ``fp_circle``.
+    """
+    import uuid as _uuid
+
+    TAGS = frozenset(
+        ("pad", "property", "fp_line", "fp_rect", "fp_poly", "fp_text", "fp_arc", "fp_circle")
+    )
+
+    result: list[str] = []
+    i = 0
+    n = len(inner)
+
+    while i < n:
+        if inner[i] != "(":
+            result.append(inner[i])
+            i += 1
+            continue
+
+        # Read the tag name
+        j = i + 1
+        while j < n and inner[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        tag = inner[i + 1 : j]
+
+        if tag not in TAGS:
+            result.append(inner[i])
+            i += 1
+            continue
+
+        # Walk to the matching closing paren
+        end = _walk_balanced_parens(inner, i)
+        if end is None:
+            result.append(inner[i])
+            i += 1
+            continue
+
+        block = inner[i : end + 1]
+
+        if "(uuid " not in block:
+            new_uuid = str(_uuid.uuid4())
+            # Insert the uuid clause before the final closing paren, preserving indent
+            stripped = block.rstrip()
+            # Determine trailing indentation of the closing paren line
+            last_nl = stripped.rfind("\n")
+            indent = stripped[last_nl + 1 : -1] if last_nl != -1 else "\t\t"
+            block = stripped[:-1] + f"\n{indent}\t(uuid \"{new_uuid}\")\n{indent})"
+
+        result.append(block)
+        i = end + 1
+
+    return "".join(result)
+
+
+def _embed_kicad_mod_as_pcb_footprint(
+    kicad_mod: str,
+    lib_id: str,
+    reference: str,
+    x: float,
+    y: float,
+    layer: str,
+    rotation: float,
+    fp_uuid: str,
+) -> str:
+    """Convert raw ``.kicad_mod`` text into a PCB-embeddable footprint block.
+
+    The returned string includes full pad geometry so that ``assign_net``,
+    ``export_dsn``, and the autorouter all work correctly.
+    """
+    # Strip metadata lines that are not valid inside a kicad_pcb footprint
+    skip_prefixes = ("(version ", "(generator ", "(generator_version ")
+    filtered_lines = [
+        ln for ln in kicad_mod.splitlines(keepends=True)
+        if not any(ln.lstrip().startswith(p) for p in skip_prefixes)
+    ]
+    kicad_mod = "".join(filtered_lines)
+
+    # Extract the inner body (strip outer ``(footprint "Name"\n … \n)``)
+    first_nl = kicad_mod.find("\n")
+    if first_nl == -1:
+        return kicad_mod
+    inner = kicad_mod[first_nl + 1 :]
+    last_paren = inner.rfind(")")
+    if last_paren != -1:
+        inner = inner[:last_paren]
+
+    # Drop the redundant (layer "…") line that appears at the top of .kicad_mod
+    inner = re.sub(r"^[ \t]*\(layer \"[^\"]+\"\)\n", "", inner, count=1, flags=re.MULTILINE)
+
+    # Update the Reference property text to the actual designator
+    inner = re.sub(
+        r'(\(property\s+"Reference"\s+)"[^"]*"',
+        rf'\1"{reference}"',
+        inner,
+        count=1,
+    )
+
+    # Inject UUIDs into sub-elements
+    inner = _add_uuids_to_fp_elements(inner)
+
+    # Build the final block with PCB-level at/layer/uuid header
+    rot_clause = f" {rotation}" if rotation else ""
+    block = f'\t(footprint "{lib_id}"\n'
+    block += f'\t\t(layer "{layer}")\n'
+    block += f'\t\t(at {x} {y}{rot_clause})\n'
+    block += f'\t\t(uuid "{fp_uuid}")\n'
+
+    # Re-indent: .kicad_mod uses one tab level; inside PCB footprint we need two
+    for line in inner.splitlines():
+        if line.strip():
+            block += "\t" + line + "\n"
+        else:
+            block += "\n"
+
+    block += "\t)\n"
+    return block
+
+
+def _move_lib_symbol_before_child(content: str, parent_lib_id: str, child_lib_id: str) -> str:
+    """Ensure *parent_lib_id* block appears before *child_lib_id* inside lib_symbols.
+
+    Extracts the parent block, removes it from its current position, and
+    re-inserts it immediately before the child block.  Returns *content*
+    unchanged if either symbol cannot be located.
+    """
+    escaped_parent = re.escape(parent_lib_id)
+    escaped_child = re.escape(child_lib_id)
+
+    parent_m = re.search(rf'\(symbol\s+"{escaped_parent}"', content)
+    child_m = re.search(rf'\(symbol\s+"{escaped_child}"', content)
+    if parent_m is None or child_m is None:
+        return content
+
+    # Nothing to do — parent already before child
+    if parent_m.start() < child_m.start():
+        return content
+
+    # Extract the parent block
+    parent_block_end = _walk_balanced_parens(content, parent_m.start())
+    if parent_block_end is None:
+        return content
+
+    # Include any leading whitespace (the newline + indent before the block)
+    block_start = parent_m.start()
+    # Walk backwards to consume leading newline/spaces so we leave no blank line
+    ws_start = block_start
+    while ws_start > 0 and content[ws_start - 1] in (" ", "\t"):
+        ws_start -= 1
+    if ws_start > 0 and content[ws_start - 1] == "\n":
+        ws_start -= 1
+
+    parent_text = content[block_start : parent_block_end + 1]
+    # Consume any trailing newline that belongs to the block
+    tail_end = parent_block_end + 1
+    if tail_end < len(content) and content[tail_end] == "\n":
+        tail_end += 1
+
+    # Remove parent block from content
+    content = content[:ws_start + 1] + content[tail_end:]
+
+    # Re-find child (offsets shifted after removal)
+    child_m2 = re.search(rf'\(symbol\s+"{escaped_child}"', content)
+    if child_m2 is None:
+        return content
+
+    insert_pos = child_m2.start()
+    # Insert parent block (with indent) immediately before child
+    indent = "\t\t"
+    insertion = indent + parent_text + "\n"
+    content = content[:insert_pos] + insertion + content[insert_pos:]
+
+    return content
+
+
 class FileBoardOps(BoardOps):
     """Read-only board operations via direct file parsing."""
 
@@ -122,57 +322,70 @@ class FileBoardOps(BoardOps):
         if not net_name:
             return content, 0
 
-        # Find top-level net definitions only (one per line), not pad-level net clauses.
+        # Only scan the preamble (before the first footprint block) to avoid
+        # matching pad-level (net N "name") clauses nested inside footprints.
+        first_fp = content.find("(footprint ")
+        preamble = content[:first_fp] if first_fp != -1 else content
+
         net_pattern = re.compile(r'(?m)^[ \t]*\(net\s+(\d+)\s+"([^"]*?)"\)\s*$')
         max_id = 0
-        for m in net_pattern.finditer(content):
+        for m in net_pattern.finditer(preamble):
             net_id = int(m.group(1))
             if net_id > max_id:
                 max_id = net_id
             if m.group(2) == net_name:
                 return content, net_id
 
-        # Net not found — add a new entry
+        # Net not found — insert a new top-level entry just before the first footprint
         new_id = max_id + 1
         net_entry = f'  (net {new_id} "{net_name}")\n'
-        # Insert after the last existing net entry, or before the first footprint
         last_net = None
-        for m in net_pattern.finditer(content):
+        for m in net_pattern.finditer(preamble):
             last_net = m
         if last_net:
             insert_pos = last_net.end()
-            content = content[:insert_pos] + "\n" + net_entry + content[insert_pos:]
+            content = content[:insert_pos] + net_entry + content[insert_pos:]
+        elif first_fp != -1:
+            content = content[:first_fp] + net_entry + content[first_fp:]
         else:
-            # Insert before the first footprint or before final paren
-            fp_idx = content.find("(footprint ")
-            if fp_idx != -1:
-                content = content[:fp_idx] + net_entry + "\n" + content[fp_idx:]
-            else:
-                last_paren = content.rfind(")")
-                if last_paren >= 0:
-                    content = content[:last_paren] + net_entry + content[last_paren:]
+            last_paren = content.rfind(")")
+            if last_paren >= 0:
+                content = content[:last_paren] + net_entry + content[last_paren:]
         return content, new_id
 
     def place_component(
         self, path: Path, reference: str, footprint: str,
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
-        import uuid
-        fp_uuid = str(uuid.uuid4())
+        import uuid as _uuid
+        fp_uuid = str(_uuid.uuid4())
 
-        rot_clause = f" {rotation}" if rotation else ""
-        fp_sexp = (
-            f'  (footprint "{footprint}" (layer "{layer}")\n'
-            f'    (at {x} {y}{rot_clause})\n'
-            f'    (property "Reference" "{reference}" (at 0 0 0)\n'
-            f'      (effects (font (size 1 1) (thickness 0.15)))\n'
-            f'    )\n'
-            f'    (property "Value" "" (at 0 0 0)\n'
-            f'      (effects (font (size 1 1) (thickness 0.15)))\n'
-            f'    )\n'
-            f'    (uuid "{fp_uuid}")\n'
-            f'  )\n'
-        )
+        kicad_mod = _load_kicad_mod(footprint)
+        if kicad_mod:
+            fp_sexp = _embed_kicad_mod_as_pcb_footprint(
+                kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+            )
+        else:
+            logger.warning(
+                "Footprint '%s' not found in libraries, placing stub without pad geometry",
+                footprint,
+            )
+            rot_clause = f" {rotation}" if rotation else ""
+            fp_sexp = (
+                f'\t(footprint "{footprint}"\n'
+                f'\t\t(layer "{layer}")\n'
+                f'\t\t(at {x} {y}{rot_clause})\n'
+                f'\t\t(uuid "{fp_uuid}")\n'
+                f'\t\t(property "Reference" "{reference}" (at 0 0 0)\n'
+                f'\t\t\t(layer "F.SilkS")\n'
+                f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
+                f'\t\t)\n'
+                f'\t\t(property "Value" "" (at 0 0 0)\n'
+                f'\t\t\t(layer "F.Fab")\n'
+                f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
+                f'\t\t)\n'
+                f'\t)\n'
+            )
 
         content = path.read_text(encoding="utf-8")
         last_paren = content.rfind(")")
@@ -337,6 +550,76 @@ class FileBoardOps(BoardOps):
             "pad": pad,
             "net": net,
         }
+
+
+    def create_board(
+        self, path: Path, title: str = "", revision: str = "",
+    ) -> dict[str, Any]:
+        """Create a blank .kicad_pcb file at the given path."""
+        title_block = ""
+        if title or revision:
+            tb_lines = []
+            if title:
+                tb_lines.append(f'    (title "{title}")')
+            if revision:
+                tb_lines.append(f'    (rev "{revision}")')
+            title_block = (
+                "  (title_block\n"
+                + "\n".join(tb_lines)
+                + "\n  )\n"
+            )
+
+        content = (
+            "(kicad_pcb\n"
+            "  (version 20241229)\n"
+            "  (generator \"kicad_mcp\")\n"
+            "  (generator_version \"9.0\")\n"
+            "  (general\n"
+            "    (thickness 1.6)\n"
+            "    (legacy_teardrops no)\n"
+            "  )\n"
+            "  (paper \"A4\")\n"
+            + title_block
+            + "  (layers\n"
+            "    (0 \"F.Cu\" signal)\n"
+            "    (31 \"B.Cu\" signal)\n"
+            "    (32 \"B.Adhes\" user \"B.Adhesive\")\n"
+            "    (33 \"F.Adhes\" user \"F.Adhesive\")\n"
+            "    (34 \"B.Paste\" user)\n"
+            "    (35 \"F.Paste\" user)\n"
+            "    (36 \"B.SilkS\" user \"B.Silkscreen\")\n"
+            "    (37 \"F.SilkS\" user \"F.Silkscreen\")\n"
+            "    (38 \"B.Mask\" user)\n"
+            "    (39 \"F.Mask\" user)\n"
+            "    (40 \"Dwgs.User\" user \"User.Drawings\")\n"
+            "    (41 \"Cmts.User\" user \"User.Comments\")\n"
+            "    (42 \"Eco1.User\" user \"User.Eco1\")\n"
+            "    (43 \"Eco2.User\" user \"User.Eco2\")\n"
+            "    (44 \"Edge.Cuts\" user)\n"
+            "    (45 \"Margin\" user)\n"
+            "    (46 \"B.CrtYd\" user \"B.Courtyard\")\n"
+            "    (47 \"F.CrtYd\" user \"F.Courtyard\")\n"
+            "    (48 \"B.Fab\" user)\n"
+            "    (49 \"F.Fab\" user)\n"
+            "  )\n"
+            "  (setup\n"
+            "    (pad_to_mask_clearance 0)\n"
+            "    (allow_soldermask_bridges_in_footprints no)\n"
+            "    (pcbplotparams\n"
+            "      (layerselection 0x00010fc_ffffffff)\n"
+            "      (outputformat 1)\n"
+            "      (mirror no)\n"
+            "      (drillshape 1)\n"
+            "      (scaleselection 1)\n"
+            "      (outputdirectory \"\")\n"
+            "    )\n"
+            "  )\n"
+            "  (net 0 \"\")\n"
+            ")\n"
+        )
+
+        path.write_text(content, encoding="utf-8")
+        return {"path": str(path), "title": title, "revision": revision}
 
 
 class FileSchematicOps(SchematicOps):
@@ -602,7 +885,19 @@ class FileSchematicOps(SchematicOps):
 
         # Check if symbol is already cached
         escaped_lib_id = re.escape(lib_id)
-        if re.search(rf'\(symbol\s+"{escaped_lib_id}"', lib_sym_section):
+        child_in_section = re.search(rf'\(symbol\s+"{escaped_lib_id}"', lib_sym_section)
+        if child_in_section:
+            # Child is already present; still ensure its parent is cached if needed.
+            child_block_start = lib_sym_start + child_in_section.start()
+            child_block_end = _walk_balanced_parens(content, child_block_start)
+            if child_block_end is not None:
+                child_block = content[child_block_start:child_block_end + 1]
+                parent_match = re.search(r'\(extends\s+"([^"]+)"', child_block)
+                if parent_match:
+                    parent_lib_id = f"{lib_name}:{parent_match.group(1)}"
+                    content = self._ensure_lib_symbol_cached(
+                        content, parent_lib_id, schematic_path,
+                    )
             return content
 
         # Find the library file — check system libs first, then project sym-lib-table
@@ -633,6 +928,47 @@ class FileSchematicOps(SchematicOps):
         if block is None:
             logger.warning("Symbol '%s' not found in library %s", sym_name, lib_path)
             return content
+
+        # If the symbol extends a parent, resolve inheritance by inlining the
+        # parent's sub-symbols (geometry) into the child block and stripping
+        # the `extends` field.  KiCad 9's kicad-cli does not support `extends`
+        # in lib_symbols and will fail to load the schematic if it is present.
+        parent_match = re.search(r'\(extends\s+"([^"]+)"', block)
+        if parent_match:
+            parent_sym_name = parent_match.group(1)
+            parent_lib_id = f"{lib_name}:{parent_sym_name}"
+            content = self._ensure_lib_symbol_cached(content, parent_lib_id, schematic_path)
+            # Recalculate section bounds since parent insertion changed content
+            lib_sym_start = content.find("(lib_symbols")
+            lib_sym_end = _walk_balanced_parens(content, lib_sym_start)
+            if lib_sym_end is None:
+                logger.warning("Unbalanced lib_symbols section after parent injection")
+                return content
+
+            # Gather the parent's sub-symbols (graphics/pins) from the library
+            # and rename them to use the child's name, then inline into child.
+            parent_block_in_lib = extract_sexp_block(lib_content, "symbol", parent_sym_name)
+            sub_sym_blocks: list[str] = []
+            if parent_block_in_lib is not None:
+                escaped_parent = re.escape(parent_sym_name)
+                for m in re.finditer(
+                    rf'\(symbol\s+"{escaped_parent}_\d+_\d+"', parent_block_in_lib
+                ):
+                    end = _walk_balanced_parens(parent_block_in_lib, m.start())
+                    if end is not None:
+                        sub_block = parent_block_in_lib[m.start():end + 1]
+                        # Rename sub-symbol: "ParentName_N_M" → "ChildName_N_M"
+                        sub_block = sub_block.replace(
+                            f'"{parent_sym_name}_', f'"{sym_name}_', 1
+                        )
+                        sub_sym_blocks.append(sub_block)
+
+            # Strip the extends field from the child block
+            block = re.sub(r'\s*\(extends\s+"[^"]+"\)', '', block)
+            if sub_sym_blocks:
+                # Insert inlined sub-symbols before the child block's closing paren
+                insertion = "\n" + "\n".join(sub_sym_blocks)
+                block = block[:-1] + insertion + "\n)"
 
         # Rename: replace the top-level symbol name and all sub-symbol references
         # Top-level: (symbol "R" -> (symbol "Device:R"
@@ -668,8 +1004,12 @@ class FileSchematicOps(SchematicOps):
         if lib_sym_end != -1:
             lib_sym_end = _walk_balanced_parens(content, lib_sym_end)
             if lib_sym_end is not None:
-                # Insert after the lib_symbols block, plus its closing paren
-                return lib_sym_end + 1
+                # Advance past the closing ) and the newline that follows it,
+                # so that inserted elements start on their own line.
+                pos = lib_sym_end + 1
+                if pos < len(content) and content[pos] == '\n':
+                    pos += 1
+                return pos
 
         # Fallback: insert before the last closing parenthesis
         last_paren = content.rfind(")")
@@ -727,6 +1067,93 @@ class FileSchematicOps(SchematicOps):
             "uuid": sch_uuid,
             "title": title,
             "revision": revision,
+        }
+
+    def annotate(self, path: Path) -> dict[str, Any]:
+        """Assign sequential reference designators to symbols that have '?' in their reference.
+
+        Processes symbols in document order.  Only modifies references outside the
+        lib_symbols block (i.e. actual placed instances, not library definitions).
+        """
+        import re
+
+        content = path.read_text(encoding="utf-8")
+
+        # Locate the lib_symbols block so we can skip it
+        lib_sym_start = -1
+        lib_sym_end = -1
+        m = re.search(r'\(lib_symbols\b', content)
+        if m:
+            lib_sym_start = m.start()
+            depth = 0
+            for i in range(lib_sym_start, len(content)):
+                if content[i] == '(':
+                    depth += 1
+                elif content[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        lib_sym_end = i + 1
+                        break
+
+        def in_lib_symbols(pos: int) -> bool:
+            return lib_sym_start <= pos < lib_sym_end
+
+        # Find all (reference "X?") occurrences outside lib_symbols, in document order.
+        # These appear inside (instances ...) blocks.
+        inst_ref_pat = re.compile(r'\(reference\s+"([A-Za-z#][^?"]*\?)"\)')
+        # Also find (property "Reference" "X?") outside lib_symbols.
+        prop_ref_pat = re.compile(r'(\(property\s+"Reference"\s+)"([A-Za-z#][^?"]*\?)"')
+
+        # Group counters by prefix
+        counters: dict[str, int] = {}
+
+        # Collect instance-reference matches (these drive numbering)
+        inst_matches = [
+            m for m in inst_ref_pat.finditer(content)
+            if not in_lib_symbols(m.start())
+        ]
+        if not inst_matches:
+            return {"annotated_count": 0, "message": "No unannotated symbols found"}
+
+        # Assign numbers in document order; build a list of replacements (start, end, new_text)
+        replacements: list[tuple[int, int, str]] = []
+        # Maps the full old ref string → assigned new ref (for updating property lines)
+        old_to_new: dict[str, str] = {}
+
+        for m in inst_matches:
+            old_ref = m.group(1)
+            prefix = old_ref.rstrip("?")
+            if prefix not in counters:
+                counters[prefix] = 1
+            new_ref = f"{prefix}{counters[prefix]}"
+            counters[prefix] += 1
+            # Replace just the quoted ref value inside the (reference "...") expression
+            replacements.append((m.start(1), m.end(1), new_ref))
+            old_to_new.setdefault(old_ref, new_ref)
+
+        # Apply instance-reference replacements in reverse order
+        for start, end, new_ref in reversed(replacements):
+            content = content[:start] + new_ref + content[end:]
+
+        # Now update each (property "Reference" "X?") outside lib_symbols.
+        # We can't correlate them 1-to-1 with instances at this point (already replaced),
+        # so re-scan the original positions shifted by our edits by working on the new content.
+        prop_replacements: list[tuple[int, int, str]] = []
+        for m in prop_ref_pat.finditer(content):
+            if in_lib_symbols(m.start()):
+                continue
+            old_ref = m.group(2)
+            if old_ref in old_to_new:
+                # Replace the value part only
+                prop_replacements.append((m.start(2), m.end(2), old_to_new[old_ref]))
+
+        for start, end, new_ref in reversed(prop_replacements):
+            content = content[:start] + new_ref + content[end:]
+
+        path.write_text(content, encoding="utf-8")
+        return {
+            "annotated_count": len(replacements),
+            "message": f"Annotated {len(replacements)} reference(s)",
         }
 
     def add_component(

@@ -1,4 +1,4 @@
-"""PCB board tools - 8 tools."""
+"""PCB board tools - 10 tools."""
 
 from __future__ import annotations
 
@@ -256,3 +256,49 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         rules = ops.get_design_rules(p)
         change_log.record("get_design_rules", {"path": path})
         return json.dumps({"status": "success", "rules": rules}, indent=2)
+
+    @mcp.tool()
+    def refill_zones(path: str) -> str:
+        """Refill all copper pour zones on a PCB board.
+
+        Recalculates copper fill for all zones after component placement or
+        routing changes. Requires KiCad to be running (IPC backend).
+
+        Args:
+            path: Path to the .kicad_pcb file.
+
+        Returns:
+            JSON with refill status.
+        """
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+        ops = backend.get_zone_refill_ops()
+        if ops is None:
+            return json.dumps({
+                "status": "unavailable",
+                "reason": "refill_zones requires KiCad running with IPC",
+            })
+        result = ops.refill_zones(board_path)
+        change_log.record("refill_zones", {"path": path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def get_stackup(path: str) -> str:
+        """Return the layer stackup for a PCB board.
+
+        Retrieves copper, dielectric, and finish layer information.
+        Requires KiCad to be running (IPC backend).
+
+        Args:
+            path: Path to the .kicad_pcb file.
+
+        Returns:
+            JSON with layer stackup details.
+        """
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+        ops = backend.get_board_stackup_ops()
+        if ops is None:
+            return json.dumps({
+                "status": "unavailable",
+                "reason": "get_stackup requires KiCad running with IPC",
+            })
+        return json.dumps(ops.get_stackup(board_path), indent=2)

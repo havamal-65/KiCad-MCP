@@ -176,6 +176,34 @@ class CompositeBackend:
             )
         return ops
 
+    def get_zone_refill_ops(self) -> BoardOps | None:
+        """Get board ops from the backend supporting ZONE_REFILL, or None."""
+        backend = self._capability_map.get(BackendCapability.ZONE_REFILL)
+        if backend is None:
+            return None
+        return backend.get_board_ops()
+
+    def get_board_stackup_ops(self) -> BoardOps | None:
+        """Get board ops from the backend supporting BOARD_STACKUP, or None."""
+        backend = self._capability_map.get(BackendCapability.BOARD_STACKUP)
+        if backend is None:
+            return None
+        return backend.get_board_ops()
+
+    def get_text_variables(self, project_path: Any) -> dict[str, Any]:
+        """Get project text variables (requires REAL_TIME_SYNC / IPC backend)."""
+        backend = self._capability_map.get(BackendCapability.REAL_TIME_SYNC)
+        if not backend:
+            return {"status": "unavailable", "reason": "Requires KiCad running (IPC)"}
+        return backend.get_text_variables(project_path)
+
+    def set_text_variables(self, project_path: Any, variables: dict[str, str]) -> dict[str, Any]:
+        """Set project text variables (requires REAL_TIME_SYNC / IPC backend)."""
+        backend = self._capability_map.get(BackendCapability.REAL_TIME_SYNC)
+        if not backend:
+            return {"status": "unavailable", "reason": "Requires KiCad running (IPC)"}
+        return backend.set_text_variables(project_path, variables)
+
     def get_active_project(self) -> dict[str, Any]:
         """Query the currently open KiCad project (requires REAL_TIME_SYNC)."""
         backend = self._get_backend_for(BackendCapability.REAL_TIME_SYNC)

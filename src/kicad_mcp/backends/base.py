@@ -25,6 +25,8 @@ class BackendCapability(Enum):
     LIBRARY_MANAGE = auto()
     NETLIST_GENERATE = auto()
     REAL_TIME_SYNC = auto()
+    ZONE_REFILL = auto()
+    BOARD_STACKUP = auto()
 
 
 class BoardOps(ABC):

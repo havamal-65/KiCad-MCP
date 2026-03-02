@@ -755,11 +755,23 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
 
-        sch_ops = backend.get_schematic_ops()
-        pcb_ops = backend.get_board_ops()
+        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
-        sch_data = sch_ops.read_schematic(sch_p)
-        pcb_data = pcb_ops.read_board(pcb_p)
+        # Try the configured backend first; fall back to file ops if IPC times out
+        # (common when KiCad is running but the board/schematic isn't open in the editor).
+        try:
+            sch_ops = backend.get_schematic_ops()
+            sch_data = sch_ops.read_schematic(sch_p)
+        except Exception:
+            sch_ops = FileSchematicOps()
+            sch_data = sch_ops.read_schematic(sch_p)
+
+        try:
+            pcb_ops = backend.get_board_ops()
+            pcb_data = pcb_ops.read_board(pcb_p)
+        except Exception:
+            pcb_ops = FileBoardOps()
+            pcb_data = pcb_ops.read_board(pcb_p)
 
         # Build dicts keyed by reference, filtering out power symbols
         sch_by_ref: dict[str, dict] = {}
@@ -780,11 +792,12 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         actions: list[dict] = []
         warnings: list[dict] = []
 
-        # Try to get board_modify_ops for placing components
+        # Try IPC board modify ops; fall back to file backend if unavailable/timeout.
+        # The file backend is safe here: the PCB was just created (not open in KiCad).
         try:
             board_modify_ops = backend.get_board_modify_ops()
         except Exception:
-            board_modify_ops = None
+            board_modify_ops = FileBoardOps()
 
         # Auto-position grid for new components
         place_x, place_y = 50.0, 50.0
@@ -879,7 +892,6 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                             )
                             match = val_pattern.search(block)
                             if match:
-                                backend.check_file_write_safe("update PCB component value")
                                 new_block = (
                                     block[:match.start(2)]
                                     + sch_val

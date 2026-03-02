@@ -67,6 +67,37 @@ def find_kicad_cli() -> Path | None:
     return None
 
 
+def find_kicad_template_dir() -> Path | None:
+    """Find KiCad's built-in template directory.
+
+    Returns:
+        Path to the template directory if found, None otherwise.
+    """
+    platform = get_platform()
+
+    if platform == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        for version in ["9.0", "8.0", "7.0"]:
+            candidate = Path(program_files) / "KiCad" / version / "share" / "kicad" / "template"
+            if candidate.exists():
+                return candidate
+
+    elif platform == "macos":
+        candidate = Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/template")
+        if candidate.exists():
+            return candidate
+
+    else:  # linux
+        for p in [
+            Path("/usr/share/kicad/template"),
+            Path("/usr/local/share/kicad/template"),
+        ]:
+            if p.exists():
+                return p
+
+    return None
+
+
 def find_kicad_python_paths() -> list[Path]:
     """Find KiCad's Python module paths for SWIG bindings (pcbnew).
 
@@ -79,7 +110,7 @@ def find_kicad_python_paths() -> list[Path]:
     if platform == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         for version in ["9.0", "8.0", "7.0"]:
-            p = Path(program_files) / "KiCad" / version / "lib" / "python3" / "dist-packages"
+            p = Path(program_files) / "KiCad" / version / "bin" / "Lib" / "site-packages"
             if p.exists():
                 paths.append(p)
 
@@ -118,7 +149,127 @@ def add_kicad_to_sys_path() -> bool:
             sys.path.insert(0, p_str)
             logger.debug("Added to sys.path: %s", p_str)
             added = True
+        # On Windows, register bin/ so _pcbnew.pyd can load its dependent KiCad DLLs
+        if sys.platform == "win32":
+            kicad_bin = p.parent.parent  # site-packages -> Lib -> bin
+            try:
+                os.add_dll_directory(str(kicad_bin))
+                logger.debug("Registered DLL directory: %s", kicad_bin)
+            except (AttributeError, OSError):
+                pass  # Python < 3.8 or invalid path
     return added
+
+
+def find_kicad_executable() -> Path | None:
+    """Find the KiCad GUI application executable.
+
+    Uses the same search strategy as find_kicad_cli(), looking for the
+    main KiCad application binary alongside kicad-cli.
+
+    Returns:
+        Path to the KiCad executable if found, None otherwise.
+    """
+    platform = get_platform()
+
+    if platform == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for base in [program_files, program_files_x86]:
+            for version in ["9.0", "8.0", "7.0"]:
+                candidate = Path(base) / "KiCad" / version / "bin" / "kicad.exe"
+                if candidate.exists():
+                    return candidate
+
+    elif platform == "macos":
+        candidate = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad")
+        if candidate.exists():
+            return candidate
+
+    else:  # linux
+        for name in ["/usr/bin/kicad", "/usr/local/bin/kicad"]:
+            candidate = Path(name)
+            if candidate.exists():
+                return candidate
+        in_path = shutil.which("kicad")
+        if in_path:
+            return Path(in_path)
+
+    return None
+
+
+def is_kicad_running() -> bool:
+    """Check whether the KiCad GUI application is currently running.
+
+    Returns:
+        True if a KiCad GUI process is found, False otherwise.
+    """
+    import subprocess
+
+    platform = get_platform()
+    try:
+        if platform == "windows":
+            flags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq kicad.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=flags,
+            )
+            return "kicad.exe" in result.stdout.lower()
+        else:
+            result = subprocess.run(
+                ["pgrep", "-x", "kicad"],
+                capture_output=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+    except Exception as e:
+        logger.debug("KiCad process check failed: %s", e)
+        return False
+
+
+def launch_kicad(project_path: Path | None = None) -> bool:
+    """Launch the KiCad GUI application.
+
+    Args:
+        project_path: Optional .kicad_pro file to open on launch.
+
+    Returns:
+        True if the launch command succeeded, False otherwise.
+    """
+    import subprocess
+
+    platform = get_platform()
+    try:
+        if platform == "macos":
+            args = ["open", "-a", "KiCad"]
+            if project_path is not None:
+                args.append(str(project_path))
+            subprocess.Popen(args)
+            return True
+
+        exe = find_kicad_executable()
+        if exe is None:
+            logger.warning("KiCad executable not found — cannot launch")
+            return False
+
+        args = [str(exe)]
+        if project_path is not None:
+            args.append(str(project_path))
+
+        if platform == "windows":
+            subprocess.Popen(
+                args,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            )
+        else:
+            subprocess.Popen(args)
+
+        return True
+    except Exception as e:
+        logger.warning("Failed to launch KiCad: %s", e)
+        return False
 
 
 def detect_kicad_version() -> str | None:

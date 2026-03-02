@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -41,6 +42,8 @@ def _get_pcbnew():
     Returns:
         The pcbnew module, or None if not available.
     """
+    from kicad_mcp.utils.platform_helper import add_kicad_to_sys_path
+    add_kicad_to_sys_path()
     try:
         import pcbnew
         return pcbnew
@@ -90,18 +93,30 @@ def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
         kicad_bin = kicad_python.parent
         env["PYTHONHOME"] = str(kicad_bin)
         env["PYTHONPATH"] = ";".join([
-            str(kicad_bin.parent / "lib" / "python3" / "dist-packages"),
             str(kicad_bin / "Lib" / "site-packages"),
             str(kicad_bin / "Lib"),
         ])
+        # Add kicad_bin to PATH so Windows can resolve DLLs when _pcbnew.pyd loads
+        env["PATH"] = str(kicad_bin) + ";" + env.get("PATH", "")
+        site_pkgs = str(kicad_bin / "Lib" / "site-packages")
+        preamble = (
+            f"import ctypes; ctypes.windll.kernel32.SetErrorMode(3)\n"
+            f"import os, sys; "
+            f"os.add_dll_directory({str(kicad_bin)!r}); "
+            f"sys.path.insert(0, {site_pkgs!r})\n"
+        )
+        script = preamble + script
 
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         result = subprocess.run(
             [str(kicad_python), "-S", "-u", "-c", script],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
             env=env,
+            creationflags=creationflags,
         )
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode != 0 and not output.strip():

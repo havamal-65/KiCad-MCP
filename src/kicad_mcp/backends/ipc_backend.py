@@ -32,28 +32,51 @@ def _get_kicad():
     return _kicad
 
 
+def _reset_kicad() -> None:
+    """Discard the cached KiCad connection so the next call reconnects."""
+    global _kicad
+    _kicad = None
+
+
+def _is_token_error(exc: Exception) -> bool:
+    return "token" in str(exc).lower()
+
+
 class IPCBoardOps(BoardOps):
     """Board operations via KiCad 9+ IPC API."""
 
+    def __init__(self) -> None:
+        from kicad_mcp.backends.file_backend import FileBoardOps
+        self._file_ops = FileBoardOps()
+
     def read_board(self, path: Path) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
-        info = self.get_board_info(path)
-        components = self.get_components(path)
-        nets = self.get_nets(path)
-        tracks = self.get_tracks(path)
-        return {
-            "info": info,
-            "components": components,
-            "nets": nets,
-            "tracks": tracks,
-        }
+        try:
+            kicad = _get_kicad()
+            kicad.get_board()  # probe — raises if no board open / IPC unavailable
+            info = self._get_board_info_ipc()
+            components = self._get_components_ipc()
+            nets = self._get_nets_ipc()
+            tracks = self._get_tracks_ipc()
+            return {"info": info, "components": components, "nets": nets, "tracks": tracks}
+        except Exception as e:
+            logger.debug("IPC read_board failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.read_board(path)
 
     def get_board_info(self, path: Path) -> dict[str, Any]:
+        try:
+            return self._get_board_info_ipc()
+        except Exception as e:
+            logger.debug("IPC get_board_info failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.get_board_info(path)
+
+    def _get_board_info_ipc(self) -> dict[str, Any]:
         kicad = _get_kicad()
         board = kicad.get_board()
         return {
-            "file_path": str(path),
             "title": board.get_title() if hasattr(board, "get_title") else "",
             "num_components": len(board.get_footprints()) if hasattr(board, "get_footprints") else 0,
             "num_nets": len(board.get_nets()) if hasattr(board, "get_nets") else 0,
@@ -61,10 +84,18 @@ class IPCBoardOps(BoardOps):
         }
 
     def get_components(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            return self._get_components_ipc()
+        except Exception as e:
+            logger.debug("IPC get_components failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.get_components(path)
+
+    def _get_components_ipc(self) -> list[dict[str, Any]]:
         kicad = _get_kicad()
         board = kicad.get_board()
         components = []
-
         if hasattr(board, "get_footprints"):
             for fp in board.get_footprints():
                 comp: dict[str, Any] = {
@@ -76,28 +107,42 @@ class IPCBoardOps(BoardOps):
                 if hasattr(fp, "layer"):
                     comp["layer"] = fp.layer
                 components.append(comp)
-
         return components
 
     def get_nets(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            return self._get_nets_ipc()
+        except Exception as e:
+            logger.debug("IPC get_nets failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.get_nets(path)
+
+    def _get_nets_ipc(self) -> list[dict[str, Any]]:
         kicad = _get_kicad()
         board = kicad.get_board()
         nets = []
-
         if hasattr(board, "get_nets"):
             for net in board.get_nets():
                 nets.append({
                     "name": net.name if hasattr(net, "name") else str(net),
                     "number": net.number if hasattr(net, "number") else 0,
                 })
-
         return nets
 
     def get_tracks(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            return self._get_tracks_ipc()
+        except Exception as e:
+            logger.debug("IPC get_tracks failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.get_tracks(path)
+
+    def _get_tracks_ipc(self) -> list[dict[str, Any]]:
         kicad = _get_kicad()
         board = kicad.get_board()
         tracks = []
-
         if hasattr(board, "get_tracks"):
             for track in board.get_tracks():
                 track_data: dict[str, Any] = {}
@@ -110,176 +155,352 @@ class IPCBoardOps(BoardOps):
                 if hasattr(track, "layer"):
                     track_data["layer"] = track.layer
                 tracks.append(track_data)
-
         return tracks
+
+    # -- IPC infrastructure (board) --------------------------------------
+
+    def _get_board_doc(self):
+        """Get the DocumentSpecifier for the open PCB."""
+        from kipy.proto.common.types import DocumentType
+        kicad = _get_kicad()
+        docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+        if not docs:
+            raise RuntimeError("No board is open in KiCad")
+        return docs[0]
+
+    def _get_client(self):
+        """Get the KiCadClient for sending raw commands."""
+        return _get_kicad()._client
+
+    def _parse_and_create(self, sexp: str) -> dict[str, Any]:
+        """Send an S-expression string to KiCad to create board items."""
+        from kipy.proto.common.commands.editor_commands_pb2 import (
+            CreateItemsResponse, ParseAndCreateItemsFromString,
+        )
+        doc = self._get_board_doc()
+        command = ParseAndCreateItemsFromString()
+        command.document.CopyFrom(doc)
+        command.contents = sexp
+        response = self._get_client().send(command, CreateItemsResponse)
+        return {"status": "ok", "created_count": len(response.created_items)}
 
     def place_component(
         self, path: Path, reference: str, footprint: str,
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
 
-        if hasattr(board, "place_footprint"):
-            board.place_footprint(
-                footprint=footprint,
-                reference=reference,
-                position=(x, y),
-                layer=layer,
-                rotation=rotation,
+            if hasattr(board, "place_footprint"):
+                board.place_footprint(
+                    footprint=footprint,
+                    reference=reference,
+                    position=(x, y),
+                    layer=layer,
+                    rotation=rotation,
+                )
+                return {
+                    "reference": reference,
+                    "footprint": footprint,
+                    "position": {"x": x, "y": y},
+                }
+
+            # Fallback: load .kicad_mod and inject via ParseAndCreateItemsFromString
+            from kicad_mcp.backends.file_backend import (
+                _embed_kicad_mod_as_pcb_footprint,
+                _load_kicad_mod,
             )
+            import uuid as _uuid_mod
+            mod_text = _load_kicad_mod(footprint)
+            if mod_text is None:
+                raise ValueError(f"Footprint not found: {footprint}")
+            fp_uuid = str(_uuid_mod.uuid4())
+            fp_block = _embed_kicad_mod_as_pcb_footprint(
+                mod_text, footprint, reference, x, y, layer, rotation, fp_uuid
+            )
+            self._parse_and_create(fp_block)
             return {
                 "reference": reference,
                 "footprint": footprint,
                 "position": {"x": x, "y": y},
+                "layer": layer,
+                "rotation": rotation,
             }
-
-        raise NotImplementedError("IPC board does not support place_footprint")
+        except Exception as e:
+            if _is_token_error(e):
+                _reset_kicad()
+            logger.warning("IPC place_component failed (%s), falling back to file backend", e)
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            return FileBoardOps().place_component(path, reference, footprint, x, y, layer, rotation)
 
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
     ) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
 
-        if hasattr(board, "get_footprints"):
-            for fp in board.get_footprints():
-                ref = fp.reference if hasattr(fp, "reference") else ""
-                if ref == reference:
-                    if hasattr(fp, "set_position"):
-                        fp.set_position(x, y)
-                    if rotation is not None and hasattr(fp, "set_rotation"):
-                        fp.set_rotation(rotation)
-                    return {
-                        "reference": reference,
-                        "position": {"x": x, "y": y},
-                    }
+            if hasattr(board, "get_footprints"):
+                for fp in board.get_footprints():
+                    ref = fp.reference if hasattr(fp, "reference") else ""
+                    if ref == reference:
+                        if hasattr(fp, "set_position"):
+                            fp.set_position(x, y)
+                        if rotation is not None and hasattr(fp, "set_rotation"):
+                            fp.set_rotation(rotation)
+                        return {
+                            "reference": reference,
+                            "position": {"x": x, "y": y},
+                        }
+        except Exception as e:
+            if _is_token_error(e):
+                _reset_kicad()
+            logger.warning("IPC move_component failed (%s), falling back to file backend", e)
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            return FileBoardOps().move_component(path, reference, x, y, rotation)
 
         raise ValueError(f"Component {reference} not found")
+
+    def assign_net(
+        self, path: Path, reference: str, pad: str, net: str,
+    ) -> dict[str, Any]:
+        """Assign a net to a component pad (file-backend implementation with IPC not needed)."""
+        try:
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            return FileBoardOps().assign_net(path, reference, pad, net)
+        except Exception as e:
+            logger.warning("assign_net failed: %s", e)
+            raise
 
     def add_track(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float, width: float,
         layer: str = "F.Cu", net: str = "",
     ) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
 
-        if hasattr(board, "add_track"):
-            board.add_track(
-                start=(start_x, start_y),
-                end=(end_x, end_y),
-                width=width,
-                layer=layer,
-                net=net,
+            if hasattr(board, "add_track"):
+                board.add_track(
+                    start=(start_x, start_y),
+                    end=(end_x, end_y),
+                    width=width,
+                    layer=layer,
+                    net=net,
+                )
+                return {
+                    "start": {"x": start_x, "y": start_y},
+                    "end": {"x": end_x, "y": end_y},
+                    "width": width,
+                    "layer": layer,
+                }
+
+            # Fallback: inject segment via ParseAndCreateItemsFromString
+            seg_uuid = str(_uuid.uuid4())
+            sexp = (
+                f'(segment (start {start_x} {start_y}) (end {end_x} {end_y}) '
+                f'(width {width}) (layer "{layer}") (net 0) '
+                f'(uuid "{seg_uuid}"))'
             )
+            self._parse_and_create(sexp)
             return {
                 "start": {"x": start_x, "y": start_y},
                 "end": {"x": end_x, "y": end_y},
                 "width": width,
                 "layer": layer,
             }
-
-        raise NotImplementedError("IPC board does not support add_track")
+        except Exception as e:
+            if _is_token_error(e):
+                _reset_kicad()
+            logger.warning("IPC add_track failed (%s), falling back to file backend", e)
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            return FileBoardOps().add_track(path, start_x, start_y, end_x, end_y, width, layer, net)
 
     def add_via(
         self, path: Path, x: float, y: float,
         size: float = 0.8, drill: float = 0.4,
         net: str = "", via_type: str = "through",
     ) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
 
-        if hasattr(board, "add_via"):
-            board.add_via(
-                position=(x, y),
-                size=size,
-                drill=drill,
-                net=net,
+            if hasattr(board, "add_via"):
+                board.add_via(
+                    position=(x, y),
+                    size=size,
+                    drill=drill,
+                    net=net,
+                )
+                return {
+                    "position": {"x": x, "y": y},
+                    "size": size,
+                    "drill": drill,
+                }
+
+            # Fallback: inject via via ParseAndCreateItemsFromString
+            via_uuid = str(_uuid.uuid4())
+            sexp = (
+                f'(via (at {x} {y}) (size {size}) (drill {drill}) '
+                f'(layers "F.Cu" "B.Cu") (net 0) (uuid "{via_uuid}"))'
             )
+            self._parse_and_create(sexp)
             return {
                 "position": {"x": x, "y": y},
                 "size": size,
                 "drill": drill,
             }
-
-        raise NotImplementedError("IPC board does not support add_via")
+        except Exception as e:
+            if _is_token_error(e):
+                _reset_kicad()
+            logger.warning("IPC add_via failed (%s), falling back to file backend", e)
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            return FileBoardOps().add_via(path, x, y, size, drill, net, via_type)
 
     def get_design_rules(self, path: Path) -> dict[str, Any]:
-        kicad = _get_kicad()
-        board = kicad.get_board()
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
+            if hasattr(board, "get_design_settings"):
+                ds = board.get_design_settings()
+                return {
+                    "min_track_width": getattr(ds, "min_track_width", None),
+                    "min_via_diameter": getattr(ds, "min_via_diameter", None),
+                    "min_via_drill": getattr(ds, "min_via_drill", None),
+                    "min_clearance": getattr(ds, "min_clearance", None),
+                }
+            return {}
+        except Exception as e:
+            logger.debug("IPC get_design_rules failed (%s), returning empty dict", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return {}
 
-        if hasattr(board, "get_design_settings"):
-            ds = board.get_design_settings()
-            return {
-                "min_track_width": getattr(ds, "min_track_width", None),
-                "min_via_diameter": getattr(ds, "min_via_diameter", None),
-                "min_via_drill": getattr(ds, "min_via_drill", None),
-                "min_clearance": getattr(ds, "min_clearance", None),
-            }
+    def refill_zones(self, path: Path) -> dict[str, Any]:
+        """Refill all copper pour zones on the board."""
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
+            if hasattr(board, "refill_zones"):
+                board.refill_zones()
+                if hasattr(board, "save"):
+                    board.save()
+                return {"status": "success", "message": "All copper zones refilled"}
+            return {"status": "unavailable", "reason": "IPC board does not support refill_zones"}
+        except Exception as e:
+            logger.warning("IPC refill_zones failed: %s", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return {"status": "error", "message": f"Zone refill failed: {e}"}
 
-        return {}
+    def get_stackup(self, path: Path) -> dict[str, Any]:
+        """Return the board layer stackup."""
+        try:
+            kicad = _get_kicad()
+            board = kicad.get_board()
+            if not hasattr(board, "get_stackup"):
+                return {"status": "unavailable", "reason": "IPC board does not support get_stackup"}
+            stackup = board.get_stackup()
+            result: dict[str, Any] = {}
+            for attr in ("board_thickness", "castellation_pads", "edge_connector",
+                         "edge_plating", "finish", "impedance_controlled"):
+                val = getattr(stackup, attr, None)
+                if val is not None:
+                    result[attr] = val
+            layers: list[dict[str, Any]] = []
+            if hasattr(stackup, "layers"):
+                for layer in stackup.layers:
+                    layer_dict: dict[str, Any] = {}
+                    for field in ("name", "type", "material", "thickness",
+                                  "dielectric_constant", "loss_tangent", "color"):
+                        v = getattr(layer, field, None)
+                        if v is not None:
+                            layer_dict[field] = v
+                    layers.append(layer_dict)
+            result["layers"] = layers
+            return {"status": "success", "stackup": result}
+        except Exception as e:
+            logger.debug("IPC get_stackup failed (%s)", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return {"status": "unavailable", "reason": f"Stackup query failed: {e}"}
 
 
 class IPCLibraryOps(LibraryOps):
     """Library operations via KiCad 9+ IPC API."""
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
-        kicad = _get_kicad()
-        results = []
-
-        if hasattr(kicad, "get_symbol_libraries"):
-            for lib in kicad.get_symbol_libraries():
-                if hasattr(lib, "get_symbols"):
-                    for sym in lib.get_symbols():
-                        sym_name = sym.name if hasattr(sym, "name") else str(sym)
-                        if query.lower() in sym_name.lower():
-                            results.append({
-                                "name": sym_name,
-                                "library": lib.name if hasattr(lib, "name") else "",
-                                "lib_id": f"{lib.name}:{sym_name}" if hasattr(lib, "name") else sym_name,
-                            })
-
-        return results[:50]
+        try:
+            kicad = _get_kicad()
+            results = []
+            if hasattr(kicad, "get_symbol_libraries"):
+                for lib in kicad.get_symbol_libraries():
+                    if hasattr(lib, "get_symbols"):
+                        for sym in lib.get_symbols():
+                            sym_name = sym.name if hasattr(sym, "name") else str(sym)
+                            if query.lower() in sym_name.lower():
+                                results.append({
+                                    "name": sym_name,
+                                    "library": lib.name if hasattr(lib, "name") else "",
+                                    "lib_id": f"{lib.name}:{sym_name}" if hasattr(lib, "name") else sym_name,
+                                })
+            return results[:50]
+        except Exception as e:
+            logger.debug("IPC search_symbols failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            return FileLibraryOps().search_symbols(query)
 
     def search_footprints(self, query: str) -> list[dict[str, Any]]:
-        kicad = _get_kicad()
-        results = []
-
-        if hasattr(kicad, "get_footprint_libraries"):
-            for lib in kicad.get_footprint_libraries():
-                if hasattr(lib, "get_footprints"):
-                    for fp in lib.get_footprints():
-                        fp_name = fp.name if hasattr(fp, "name") else str(fp)
-                        if query.lower() in fp_name.lower():
-                            results.append({
-                                "name": fp_name,
-                                "library": lib.name if hasattr(lib, "name") else "",
-                                "lib_id": f"{lib.name}:{fp_name}" if hasattr(lib, "name") else fp_name,
-                            })
-
-        return results[:50]
+        try:
+            kicad = _get_kicad()
+            results = []
+            if hasattr(kicad, "get_footprint_libraries"):
+                for lib in kicad.get_footprint_libraries():
+                    if hasattr(lib, "get_footprints"):
+                        for fp in lib.get_footprints():
+                            fp_name = fp.name if hasattr(fp, "name") else str(fp)
+                            if query.lower() in fp_name.lower():
+                                results.append({
+                                    "name": fp_name,
+                                    "library": lib.name if hasattr(lib, "name") else "",
+                                    "lib_id": f"{lib.name}:{fp_name}" if hasattr(lib, "name") else fp_name,
+                                })
+            return results[:50]
+        except Exception as e:
+            logger.debug("IPC search_footprints failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            return FileLibraryOps().search_footprints(query)
 
     def list_libraries(self) -> list[dict[str, Any]]:
-        kicad = _get_kicad()
-        libs = []
-
-        if hasattr(kicad, "get_symbol_libraries"):
-            for lib in kicad.get_symbol_libraries():
-                libs.append({
-                    "name": lib.name if hasattr(lib, "name") else str(lib),
-                    "type": "symbol",
-                })
-
-        if hasattr(kicad, "get_footprint_libraries"):
-            for lib in kicad.get_footprint_libraries():
-                libs.append({
-                    "name": lib.name if hasattr(lib, "name") else str(lib),
-                    "type": "footprint",
-                })
-
-        return libs
+        try:
+            kicad = _get_kicad()
+            libs = []
+            if hasattr(kicad, "get_symbol_libraries"):
+                for lib in kicad.get_symbol_libraries():
+                    libs.append({
+                        "name": lib.name if hasattr(lib, "name") else str(lib),
+                        "type": "symbol",
+                    })
+            if hasattr(kicad, "get_footprint_libraries"):
+                for lib in kicad.get_footprint_libraries():
+                    libs.append({
+                        "name": lib.name if hasattr(lib, "name") else str(lib),
+                        "type": "footprint",
+                    })
+            return libs
+        except Exception as e:
+            logger.debug("IPC list_libraries failed (%s), falling back to file backend", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            return FileLibraryOps().list_libraries()
 
 
 class IPCSchematicOps(SchematicOps):
@@ -298,8 +519,17 @@ class IPCSchematicOps(SchematicOps):
     def _get_schematic_doc(self):
         """Get the DocumentSpecifier for the open schematic."""
         from kipy.proto.common.types import DocumentType
-        kicad = _get_kicad()
-        docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
+        try:
+            kicad = _get_kicad()
+            docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
+        except Exception as e:
+            if _is_token_error(e):
+                logger.debug("Token error on _get_schematic_doc, resetting connection")
+                _reset_kicad()
+                kicad = _get_kicad()
+                docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
+            else:
+                raise
         if not docs:
             raise RuntimeError("No schematic is open in KiCad")
         return docs[0]
@@ -307,6 +537,22 @@ class IPCSchematicOps(SchematicOps):
     def _get_client(self):
         """Get the KiCadClient for sending raw commands."""
         return _get_kicad()._client
+
+    def _try_save_to_disk(self) -> bool:
+        """Try to flush KiCad's schematic state to disk.
+
+        Returns True if successful.  Returns False on any failure (no schematic
+        open, gRPC timeout, token error, etc.) — the file on disk is then already
+        current from prior file-backend writes, so callers can proceed with file
+        reads directly.  Never re-raises.
+        """
+        try:
+            self._save_to_disk()
+            return True
+        except Exception as e:
+            if "No schematic is open" not in str(e):
+                logger.debug("IPC save-to-disk failed (%s); file already current", e)
+            return False
 
     def _save_to_disk(self):
         """Flush KiCad's in-memory schematic state to disk."""
@@ -362,31 +608,31 @@ class IPCSchematicOps(SchematicOps):
     # -- Read operations (delegate to file backend after flush) -----------
 
     def read_schematic(self, path: Path) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.read_schematic(path)
 
     def get_symbols(self, path: Path) -> list[dict[str, Any]]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.get_symbols(path)
 
     def get_symbol_pin_positions(self, path: Path, reference: str) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.get_symbol_pin_positions(path, reference)
 
     def get_sheet_hierarchy(self, path: Path) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.get_sheet_hierarchy(path)
 
     def get_pin_net(self, path: Path, reference: str, pin_number: str) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.get_pin_net(path, reference, pin_number)
 
     def get_net_connections(self, path: Path, net_name: str) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.get_net_connections(path, net_name)
 
     def validate_schematic(self, path: Path) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.validate_schematic(path)
 
     # -- Create operations (via ParseAndCreateItemsFromString) ------------
@@ -395,41 +641,71 @@ class IPCSchematicOps(SchematicOps):
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float,
     ) -> dict[str, Any]:
-        wire_uuid = str(_uuid.uuid4())
-        sexp = (
-            f'(wire (pts (xy {start_x} {start_y}) (xy {end_x} {end_y}))\n'
-            f'  (stroke (width 0) (type default))\n'
-            f'  (uuid "{wire_uuid}")\n'
-            f')'
-        )
-        self._parse_and_create(sexp)
-        return {
-            "start": {"x": start_x, "y": start_y},
-            "end": {"x": end_x, "y": end_y},
-            "uuid": wire_uuid,
-        }
+        try:
+            wire_uuid = str(_uuid.uuid4())
+            sexp = (
+                f'(wire (pts (xy {start_x} {start_y}) (xy {end_x} {end_y}))\n'
+                f'  (stroke (width 0) (type default))\n'
+                f'  (uuid "{wire_uuid}")\n'
+                f')'
+            )
+            self._parse_and_create(sexp)
+            return {
+                "start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y},
+                "uuid": wire_uuid,
+            }
+        except Exception as e:
+            logger.warning("IPC add_wire failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_wire(path, start_x, start_y, end_x, end_y)
 
     def add_label(
         self, path: Path, text: str, x: float, y: float,
         label_type: str = "net_label",
     ) -> dict[str, Any]:
-        label_uuid = str(_uuid.uuid4())
-        tag = label_type if label_type != "net_label" else "label"
-        sexp = (
-            f'({tag} "{text}" (at {x} {y} 0)\n'
-            f'  (effects (font (size 1.27 1.27)))\n'
-            f'  (uuid "{label_uuid}")\n'
-            f')'
-        )
-        self._parse_and_create(sexp)
-        return {
-            "text": text,
-            "position": {"x": x, "y": y},
-            "label_type": label_type,
-            "uuid": label_uuid,
-        }
+        try:
+            label_uuid = str(_uuid.uuid4())
+            tag = label_type if label_type != "net_label" else "label"
+            sexp = (
+                f'({tag} "{text}" (at {x} {y} 0)\n'
+                f'  (effects (font (size 1.27 1.27)))\n'
+                f'  (uuid "{label_uuid}")\n'
+                f')'
+            )
+            self._parse_and_create(sexp)
+            return {
+                "text": text,
+                "position": {"x": x, "y": y},
+                "label_type": label_type,
+                "uuid": label_uuid,
+            }
+        except Exception as e:
+            logger.warning("IPC add_label failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_label(path, text, x, y, label_type)
 
     def add_component(
+        self, path: Path, lib_id: str, reference: str, value: str,
+        x: float, y: float, rotation: float = 0.0,
+        mirror: str | None = None, footprint: str = "",
+        properties: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._add_component_via_ipc(
+                path, lib_id, reference, value, x, y, rotation, mirror, footprint, properties,
+            )
+        except Exception as e:
+            logger.warning("IPC add_component failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_component(
+                path, lib_id, reference, value, x, y, rotation, mirror, footprint, properties,
+            )
+
+    def _add_component_via_ipc(
         self, path: Path, lib_id: str, reference: str, value: str,
         x: float, y: float, rotation: float = 0.0,
         mirror: str | None = None, footprint: str = "",
@@ -523,15 +799,32 @@ class IPCSchematicOps(SchematicOps):
         return result
 
     def add_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
-        nc_uuid = str(_uuid.uuid4())
-        sexp = f'(no_connect (at {x} {y}) (uuid "{nc_uuid}"))'
-        self._parse_and_create(sexp)
-        return {
-            "position": {"x": x, "y": y},
-            "uuid": nc_uuid,
-        }
+        try:
+            nc_uuid = str(_uuid.uuid4())
+            sexp = f'(no_connect (at {x} {y}) (uuid "{nc_uuid}"))'
+            self._parse_and_create(sexp)
+            return {
+                "position": {"x": x, "y": y},
+                "uuid": nc_uuid,
+            }
+        except Exception as e:
+            logger.warning("IPC add_no_connect failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_no_connect(path, x, y)
 
     def add_power_symbol(
+        self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
+    ) -> dict[str, Any]:
+        try:
+            return self._add_power_symbol_via_ipc(path, name, x, y, rotation)
+        except Exception as e:
+            logger.warning("IPC add_power_symbol failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_power_symbol(path, name, x, y, rotation)
+
+    def _add_power_symbol_via_ipc(
         self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
     ) -> dict[str, Any]:
         symbol_uuid = str(_uuid.uuid4())
@@ -590,74 +883,107 @@ class IPCSchematicOps(SchematicOps):
         }
 
     def add_junction(self, path: Path, x: float, y: float) -> dict[str, Any]:
-        jn_uuid = str(_uuid.uuid4())
-        sexp = (
-            f'(junction (at {x} {y}) (diameter 0) (color 0 0 0 0)\n'
-            f'  (uuid "{jn_uuid}")\n'
-            f')'
-        )
-        self._parse_and_create(sexp)
-        return {
-            "position": {"x": x, "y": y},
-            "uuid": jn_uuid,
-        }
+        try:
+            jn_uuid = str(_uuid.uuid4())
+            sexp = (
+                f'(junction (at {x} {y}) (diameter 0) (color 0 0 0 0)\n'
+                f'  (uuid "{jn_uuid}")\n'
+                f')'
+            )
+            self._parse_and_create(sexp)
+            return {
+                "position": {"x": x, "y": y},
+                "uuid": jn_uuid,
+            }
+        except Exception as e:
+            logger.warning("IPC add_junction failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.add_junction(path, x, y)
 
     # -- Delete operations (SaveDocumentToString + find UUID + DeleteItems)
 
     def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
-        from kicad_mcp.utils.sexp_parser import find_symbol_block_by_reference
-        content = self._get_doc_as_string()
-        location = find_symbol_block_by_reference(content, reference)
-        if location is None:
-            raise ValueError(f"Symbol with reference '{reference}' not found in schematic")
-        start, end = location
-        uuid_str = self._find_uuid_in_sexp(content, start, end)
-        if uuid_str is None:
-            raise ValueError(f"Symbol '{reference}' has no UUID")
-        self._delete_by_uuid(uuid_str)
-        return {"reference": reference, "removed": True}
+        try:
+            from kicad_mcp.utils.sexp_parser import find_symbol_block_by_reference
+            content = self._get_doc_as_string()
+            location = find_symbol_block_by_reference(content, reference)
+            if location is None:
+                raise ValueError(f"Symbol with reference '{reference}' not found in schematic")
+            start, end = location
+            uuid_str = self._find_uuid_in_sexp(content, start, end)
+            if uuid_str is None:
+                raise ValueError(f"Symbol '{reference}' has no UUID")
+            self._delete_by_uuid(uuid_str)
+            return {"reference": reference, "removed": True}
+        except Exception as e:
+            logger.warning("IPC remove_component failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.remove_component(path, reference)
 
     def remove_wire(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float,
     ) -> dict[str, Any]:
-        from kicad_mcp.utils.sexp_parser import find_wire_block_by_endpoints
-        content = self._get_doc_as_string()
-        location = find_wire_block_by_endpoints(content, start_x, start_y, end_x, end_y)
-        if location is None:
-            raise ValueError(
-                f"Wire from ({start_x}, {start_y}) to ({end_x}, {end_y}) not found"
-            )
-        start, end = location
-        uuid_str = self._find_uuid_in_sexp(content, start, end)
-        if uuid_str is None:
-            raise ValueError("Wire has no UUID")
-        self._delete_by_uuid(uuid_str)
-        return {
-            "start": {"x": start_x, "y": start_y},
-            "end": {"x": end_x, "y": end_y},
-            "removed": True,
-        }
+        try:
+            from kicad_mcp.utils.sexp_parser import find_wire_block_by_endpoints
+            content = self._get_doc_as_string()
+            location = find_wire_block_by_endpoints(content, start_x, start_y, end_x, end_y)
+            if location is None:
+                raise ValueError(
+                    f"Wire from ({start_x}, {start_y}) to ({end_x}, {end_y}) not found"
+                )
+            start, end = location
+            uuid_str = self._find_uuid_in_sexp(content, start, end)
+            if uuid_str is None:
+                raise ValueError("Wire has no UUID")
+            self._delete_by_uuid(uuid_str)
+            return {
+                "start": {"x": start_x, "y": start_y},
+                "end": {"x": end_x, "y": end_y},
+                "removed": True,
+            }
+        except Exception as e:
+            logger.warning("IPC remove_wire failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.remove_wire(path, start_x, start_y, end_x, end_y)
 
     def remove_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
-        from kicad_mcp.utils.sexp_parser import find_no_connect_block_by_position
-        content = self._get_doc_as_string()
-        location = find_no_connect_block_by_position(content, x, y)
-        if location is None:
-            raise ValueError(f"No-connect at ({x}, {y}) not found")
-        start, end = location
-        uuid_str = self._find_uuid_in_sexp(content, start, end)
-        if uuid_str is None:
-            raise ValueError("No-connect has no UUID")
-        self._delete_by_uuid(uuid_str)
-        return {
-            "position": {"x": x, "y": y},
-            "removed": True,
-        }
+        try:
+            from kicad_mcp.utils.sexp_parser import find_no_connect_block_by_position
+            content = self._get_doc_as_string()
+            location = find_no_connect_block_by_position(content, x, y)
+            if location is None:
+                raise ValueError(f"No-connect at ({x}, {y}) not found")
+            start, end = location
+            uuid_str = self._find_uuid_in_sexp(content, start, end)
+            if uuid_str is None:
+                raise ValueError("No-connect has no UUID")
+            self._delete_by_uuid(uuid_str)
+            return {"position": {"x": x, "y": y}, "removed": True}
+        except Exception as e:
+            logger.warning("IPC remove_no_connect failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.remove_no_connect(path, x, y)
 
     # -- Modify operations (delete + re-create via S-expression) ----------
 
     def move_component(
+        self, path: Path, reference: str, x: float, y: float,
+        rotation: float | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._move_component_via_ipc(path, reference, x, y, rotation)
+        except Exception as e:
+            logger.warning("IPC move_component (schematic) failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.move_component(path, reference, x, y, rotation)
+
+    def _move_component_via_ipc(
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
     ) -> dict[str, Any]:
@@ -720,6 +1046,18 @@ class IPCSchematicOps(SchematicOps):
         }
 
     def update_component_property(
+        self, path: Path, reference: str,
+        property_name: str, property_value: str,
+    ) -> dict[str, Any]:
+        try:
+            return self._update_component_property_via_ipc(path, reference, property_name, property_value)
+        except Exception as e:
+            logger.warning("IPC update_component_property failed (%s), falling back to file ops", e)
+            if _is_token_error(e):
+                _reset_kicad()
+            return self._file_ops.update_component_property(path, reference, property_name, property_value)
+
+    def _update_component_property_via_ipc(
         self, path: Path, reference: str,
         property_name: str, property_value: str,
     ) -> dict[str, Any]:
@@ -787,7 +1125,7 @@ class IPCSchematicOps(SchematicOps):
         return self._file_ops.create_schematic(path, title, revision)
 
     def annotate(self, path: Path) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         result = self._file_ops.annotate(path)
         # Reload in KiCad after file-based annotation
         from kipy.proto.common.commands.editor_commands_pb2 import RevertDocument
@@ -802,7 +1140,7 @@ class IPCSchematicOps(SchematicOps):
         return result
 
     def generate_netlist(self, path: Path, output: Path) -> dict[str, Any]:
-        self._save_to_disk()
+        self._try_save_to_disk()
         return self._file_ops.generate_netlist(path, output)
 
 
@@ -822,6 +1160,8 @@ class IPCBackend(KiCadBackend):
             BackendCapability.SCHEMATIC_MODIFY,
             BackendCapability.LIBRARY_SEARCH,
             BackendCapability.REAL_TIME_SYNC,
+            BackendCapability.ZONE_REFILL,
+            BackendCapability.BOARD_STACKUP,
         }
 
     def is_available(self) -> bool:
@@ -837,7 +1177,11 @@ class IPCBackend(KiCadBackend):
         try:
             kicad = _get_kicad()
             if hasattr(kicad, "get_version"):
-                return kicad.get_version()
+                v = kicad.get_version()
+                # kipy returns a KiCadVersion protobuf; convert to a plain string
+                if hasattr(v, "full_version"):
+                    return str(v.full_version)
+                return str(v)
         except Exception:
             pass
         return None
@@ -903,6 +1247,38 @@ class IPCBackend(KiCadBackend):
             "project_path": project_path,
             "open_documents": open_documents,
         }
+
+    def get_text_variables(self, project_path: Path) -> dict[str, Any]:
+        """Get project text variables (${VAR} substitution table)."""
+        try:
+            from kipy.proto.common.types import DocumentType
+            kicad = _get_kicad()
+            docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
+            if not docs:
+                return {"status": "unavailable", "reason": "No project is open in KiCad"}
+            project = kicad.get_project(docs[0])
+            if hasattr(project, "get_text_variables"):
+                variables = dict(project.get_text_variables())
+                return {"status": "success", "variables": variables}
+            return {"status": "unavailable", "reason": "Project does not support text variables"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def set_text_variables(self, project_path: Path, variables: dict[str, str]) -> dict[str, Any]:
+        """Set project text variables."""
+        try:
+            from kipy.proto.common.types import DocumentType
+            kicad = _get_kicad()
+            docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
+            if not docs:
+                return {"status": "unavailable", "reason": "No project is open in KiCad"}
+            project = kicad.get_project(docs[0])
+            if hasattr(project, "set_text_variables"):
+                project.set_text_variables(variables)
+                return {"status": "success", "variables_set": len(variables)}
+            return {"status": "unavailable", "reason": "Project does not support text variables"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
     def get_board_ops(self) -> IPCBoardOps:
         return IPCBoardOps()

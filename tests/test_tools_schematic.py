@@ -697,6 +697,8 @@ class TestCompareSchematicPcb:
 
 # --- lib_symbols cache injection tests ---
 
+FIXTURES_SYM = Path(__file__).parent / "fixtures" / "symbols"
+
 MINIMAL_SCHEMATIC = (
     '(kicad_sch (version 20230121) (generator "test")\n'
     '  (uuid "00000000-0000-0000-0000-000000000000")\n'
@@ -711,66 +713,19 @@ MINIMAL_SCHEMATIC_NO_LIB_SYMBOLS = (
     ')\n'
 )
 
-MOCK_RESISTOR_LIB = (
-    '(kicad_symbol_lib\n'
-    '  (version 20231120)\n'
-    '  (generator "test")\n'
-    '  (symbol "R"\n'
-    '    (property "Reference" "R" (at 0 0 0))\n'
-    '    (property "Value" "R" (at 0 0 0))\n'
-    '    (symbol "R_0_1"\n'
-    '      (polyline (pts (xy 0 -1.016) (xy 0 1.016)))\n'
-    '    )\n'
-    '    (symbol "R_1_1"\n'
-    '      (pin passive line (at 0 1.27 270) (length 0.254)\n'
-    '        (name "~" (effects (font (size 1.27 1.27))))\n'
-    '        (number "1" (effects (font (size 1.27 1.27))))\n'
-    '      )\n'
-    '      (pin passive line (at 0 -1.27 90) (length 0.254)\n'
-    '        (name "~" (effects (font (size 1.27 1.27))))\n'
-    '        (number "2" (effects (font (size 1.27 1.27))))\n'
-    '      )\n'
-    '    )\n'
-    '  )\n'
-    ')\n'
-)
-
-MOCK_POWER_LIB = (
-    '(kicad_symbol_lib\n'
-    '  (version 20231120)\n'
-    '  (generator "test")\n'
-    '  (symbol "GND"\n'
-    '    (power)\n'
-    '    (property "Reference" "#PWR" (at 0 0 0))\n'
-    '    (property "Value" "GND" (at 0 0 0))\n'
-    '    (symbol "GND_0_1"\n'
-    '      (polyline (pts (xy 0 0) (xy 0 -1.27)))\n'
-    '    )\n'
-    '    (symbol "GND_1_1"\n'
-    '      (pin power_in line (at 0 0 270) (length 0)\n'
-    '        (name "GND" (effects (font (size 1.27 1.27))))\n'
-    '        (number "1" (effects (font (size 1.27 1.27))))\n'
-    '      )\n'
-    '    )\n'
-    '  )\n'
-    ')\n'
-)
-
 
 class TestLibSymbolsCache:
-    def _make_ops(self, tmp_path: Path, lib_content: str, lib_filename: str) -> "FileSchematicOps":
-        """Create a FileSchematicOps with a mock library file."""
+    def _make_ops(self, *lib_names: str) -> "FileSchematicOps":
+        """Create a FileSchematicOps pointed at the real symbol fixtures."""
         from kicad_mcp.backends.file_backend import FileSchematicOps
 
-        lib_file = tmp_path / lib_filename
-        lib_file.write_text(lib_content, encoding="utf-8")
         ops = FileSchematicOps()
-        ops._symbol_libs = [lib_file]
+        ops._symbol_libs = [FIXTURES_SYM / f"{name}.kicad_sym" for name in lib_names]
         return ops
 
     def test_lib_symbols_injected_on_add_component(self, tmp_path: Path):
         """Adding a component injects its symbol definition into lib_symbols."""
-        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+        ops = self._make_ops("Device")
 
         sch_file = tmp_path / "test.kicad_sch"
         sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
@@ -788,7 +743,7 @@ class TestLibSymbolsCache:
 
     def test_lib_symbols_not_duplicated(self, tmp_path: Path):
         """Adding the same component twice should not duplicate the cache entry."""
-        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+        ops = self._make_ops("Device")
 
         sch_file = tmp_path / "test.kicad_sch"
         sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
@@ -797,14 +752,13 @@ class TestLibSymbolsCache:
         ops.add_component(sch_file, "Device:R", "R2", "4.7k", 100.0, 80.0)
 
         content = sch_file.read_text(encoding="utf-8")
-        # Count occurrences of the top-level cached symbol
         import re
         matches = re.findall(r'\(symbol "Device:R"', content)
         assert len(matches) == 1, f"Expected 1 lib_symbols entry, found {len(matches)}"
 
     def test_lib_symbols_power_symbol(self, tmp_path: Path):
         """Adding a power symbol injects its definition with (power) tag."""
-        ops = self._make_ops(tmp_path, MOCK_POWER_LIB, "power.kicad_sym")
+        ops = self._make_ops("power")
 
         sch_file = tmp_path / "test.kicad_sch"
         sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
@@ -838,7 +792,7 @@ class TestLibSymbolsCache:
 
     def test_lib_symbols_section_created_if_missing(self, tmp_path: Path):
         """Schematic without lib_symbols section gets one created."""
-        ops = self._make_ops(tmp_path, MOCK_RESISTOR_LIB, "Device.kicad_sym")
+        ops = self._make_ops("Device")
 
         sch_file = tmp_path / "test.kicad_sch"
         sch_file.write_text(MINIMAL_SCHEMATIC_NO_LIB_SYMBOLS, encoding="utf-8")
@@ -849,6 +803,95 @@ class TestLibSymbolsCache:
         assert "(lib_symbols" in content
         assert '(symbol "Device:R"' in content
         assert '(symbol "R_0_1"' in content
+
+    def test_extended_symbol_injects_parent(self, tmp_path: Path):
+        """Adding AMS1117-3.3 (extends AP1117-15) also embeds the parent AP1117-15."""
+        ops = self._make_ops("Regulator_Linear")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        ops.add_component(sch_file, "Regulator_Linear:AMS1117-3.3", "U1", "AMS1117-3.3", 100.0, 50.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        # Parent must be present so KiCad can resolve the extends reference
+        assert '(symbol "Regulator_Linear:AP1117-15"' in content
+        # Child must also be present
+        assert '(symbol "Regulator_Linear:AMS1117-3.3"' in content
+        # Parent must appear before child in lib_symbols
+        parent_pos = content.index('(symbol "Regulator_Linear:AP1117-15"')
+        child_pos = content.index('(symbol "Regulator_Linear:AMS1117-3.3"')
+        assert parent_pos < child_pos, "Parent symbol must precede child in lib_symbols"
+
+    def test_extended_symbol_parent_not_duplicated(self, tmp_path: Path):
+        """Adding AMS1117-3.3 twice does not duplicate AP1117-15 in lib_symbols."""
+        ops = self._make_ops("Regulator_Linear")
+
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+
+        ops.add_component(sch_file, "Regulator_Linear:AMS1117-3.3", "U1", "AMS1117-3.3", 100.0, 50.0)
+        ops.add_component(sch_file, "Regulator_Linear:AMS1117-3.3", "U2", "AMS1117-3.3", 150.0, 50.0)
+
+        content = sch_file.read_text(encoding="utf-8")
+        import re as _re
+        parent_count = len(_re.findall(r'\(symbol "Regulator_Linear:AP1117-15"', content))
+        assert parent_count == 1, f"Expected 1 parent entry, found {parent_count}"
+
+    def test_extended_symbol_extends_uses_full_lib_id(self, tmp_path: Path):
+        """Extended symbols must have geometry inlined in lib_symbols (no extends) for kicad-cli."""
+        from kicad_mcp.backends.file_backend import _walk_balanced_parens
+        ops = self._make_ops("Regulator_Linear")
+        sch_file = tmp_path / "test.kicad_sch"
+        sch_file.write_text(MINIMAL_SCHEMATIC, encoding="utf-8")
+        ops.add_component(sch_file, "Regulator_Linear:AMS1117-3.3", "U1", "AMS1117-3.3", 100.0, 50.0)
+        content = sch_file.read_text(encoding="utf-8")
+
+        # Locate the lib_symbols section
+        lib_sym_start = content.find("(lib_symbols")
+        assert lib_sym_start != -1, "lib_symbols section missing"
+        lib_sym_end = _walk_balanced_parens(content, lib_sym_start)
+        assert lib_sym_end is not None, "lib_symbols not properly closed"
+        lib_sym_section = content[lib_sym_start:lib_sym_end + 1]
+
+        # extends must NOT appear in lib_symbols (kicad-cli 9 doesn't support it)
+        assert "(extends " not in lib_sym_section, \
+            "extends must not appear in lib_symbols — child geometry must be fully inlined"
+
+        # The child's inlined sub-symbols from the parent must be present
+        assert '(symbol "AMS1117-3.3_0_1"' in lib_sym_section or \
+               '(symbol "AMS1117-3.3_1_1"' in lib_sym_section, \
+            "Expected inlined parent sub-symbols (AMS1117-3.3_N_M) in lib_symbols"
+
+    def test_add_component_lib_symbols_closed_before_instance(self, tmp_path: Path):
+        """lib_symbols must fully close (with newline) before any symbol instance."""
+        from kicad_mcp.backends.file_backend import _walk_balanced_parens
+        ops = self._make_ops("Regulator_Linear")
+        path = tmp_path / "format_check.kicad_sch"
+        ops.create_schematic(path, title="Format Check")
+        ops.add_component(path, "Regulator_Linear:AMS1117-3.3", "U1", "AMS1117-3.3", 100.0, 75.0)
+        content = path.read_text(encoding="utf-8")
+
+        # Find where lib_symbols closes
+        lib_sym_start = content.find("(lib_symbols")
+        assert lib_sym_start != -1, "lib_symbols section missing"
+        lib_sym_end = _walk_balanced_parens(content, lib_sym_start)
+        assert lib_sym_end is not None, "lib_symbols section is not properly closed"
+
+        # Newline must immediately follow the closing )
+        assert lib_sym_end + 1 < len(content), "Content ends right at lib_symbols close"
+        assert content[lib_sym_end + 1] == '\n', (
+            f"Expected newline after lib_symbols closing ), "
+            f"got {content[lib_sym_end:lib_sym_end + 20]!r}"
+        )
+
+        # Symbol instance must appear AFTER lib_symbols closes
+        instance_pos = content.find("(symbol (lib_id")
+        assert instance_pos != -1, "No symbol instance placed"
+        assert instance_pos > lib_sym_end, (
+            f"Symbol instance at {instance_pos} is inside or before "
+            f"lib_symbols end at {lib_sym_end}"
+        )
 
 
 # --- Net connectivity tool tests ---

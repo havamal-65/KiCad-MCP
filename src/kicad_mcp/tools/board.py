@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
+from kicad_mcp.utils.response_limit import limit_response
 from kicad_mcp.utils.validation import (
     validate_kicad_path,
     validate_layer,
@@ -38,7 +39,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         ops = backend.get_board_ops()
         result = ops.read_board(p)
         change_log.record("read_board", {"path": path})
-        return json.dumps({"status": "success", **result}, indent=2)
+        return json.dumps({"status": "success", **limit_response(result)}, indent=2)
 
     @mcp.tool()
     def get_board_info(path: str) -> str:

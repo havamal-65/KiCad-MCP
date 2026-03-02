@@ -33,7 +33,7 @@ class TestServerCreation:
         mcp = create_server(config)
         tools = mcp._tool_manager._tools
         # Should have 70 tools total
-        # open_kicad(1) + board(10) + drc(3) + export(5) + routing(5) + library(6) + library_manage(9) + project(9) + schematic(22)
+        # open_kicad(1) + board(10) + drc(4) + export(5) + routing(5) + library(6) + library_manage(9) + project(9) + schematic(21)
         assert len(tools) == 70
 
     def test_server_auto_backend(self):

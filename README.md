@@ -25,6 +25,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - **File Backend**: Pure Python file parsing (no KiCad installation required)
 
 - **Smart Backend Selection**: Automatically detects and uses the best available backend
+- **Safe Response Sizes**: Large list results (symbols, wires, tracks, components) are automatically capped to prevent AI token-limit errors. Truncated fields include `<field>_total` and `<field>_truncated` metadata so you always know the full count.
 - **Change Tracking**: Built-in logging of all operations for debugging and auditing
 - **Backup Support**: Automatic file backups before modifications
 - **Flexible Configuration**: Environment variables, CLI args, or programmatic config
@@ -463,6 +464,26 @@ Auto-routing requires both Java and FreeRouting:
    - Provide `freerouting_jar` parameter to the tool
 
 The tool will auto-detect Java and FreeRouting if properly installed.
+
+### Large Schematic or Board Responses Truncated
+
+`read_schematic` and `read_board` automatically cap list fields (symbols, wires, components, tracks, etc.) to keep responses within AI token limits. When a list is truncated the response includes sibling metadata keys:
+
+```json
+{
+  "symbols": [ ... ],
+  "symbols_total": 342,
+  "symbols_truncated": true
+}
+```
+
+Use the dedicated per-list tools instead of `read_*` when you need specific data from a large design:
+
+| Instead of | Use |
+|---|---|
+| `read_schematic` symbols | `get_symbol_pin_positions` for a specific ref |
+| `read_schematic` wires | `get_net_connectivity` for net analysis |
+| `read_board` components | `get_board_info` for counts, `get_design_rules` for rules |
 
 ### Logging
 

@@ -1186,6 +1186,49 @@ class IPCBackend(KiCadBackend):
             pass
         return None
 
+    @staticmethod
+    def _doc_path(doc: Any) -> str:
+        """Extract a path-like field from a KiCad document object."""
+        for attr in ("path", "board_path", "file_path"):
+            value = getattr(doc, attr, None)
+            if value:
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _add_open_document(open_documents: list[dict[str, str]], doc_type: str, path: str) -> None:
+        entry = {"type": doc_type, "path": path}
+        if entry not in open_documents:
+            open_documents.append(entry)
+
+    @staticmethod
+    def _is_open_documents_unsupported(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "no handler available" in msg or "getopendocuments" in msg
+
+    def _fallback_project_from_board(self, kicad: Any) -> tuple[str | None, str | None, str | None]:
+        """Best-effort project discovery from the active board document.
+
+        Linux KiCad IPC builds may not expose GetOpenDocuments, but the active
+        board's document metadata still carries project information.
+        """
+        try:
+            board = kicad.get_board()
+        except Exception as e:
+            logger.debug("Board fallback unavailable for active project query: %s", e)
+            return None, None, None
+
+        doc = getattr(board, "document", None)
+        if doc is None:
+            return None, None, None
+
+        project = getattr(doc, "project", None)
+        project_name = getattr(project, "name", None) if project is not None else None
+        project_path_obj = getattr(project, "path", None) if project is not None else None
+        project_path = str(project_path_obj) if project_path_obj else None
+        board_path = self._doc_path(doc) or None
+        return project_name, project_path, board_path
+
     def get_active_project(self) -> dict[str, Any]:
         """Query the currently open KiCad project via IPC API.
 
@@ -1197,6 +1240,15 @@ class IPCBackend(KiCadBackend):
         project_name = None
         project_path = None
         open_documents: list[dict[str, str]] = []
+        open_documents_supported = True
+
+        # Primary source: board document metadata (works even when
+        # GetOpenDocuments is not implemented on Linux IPC builds).
+        fb_name, fb_path, fb_board_path = self._fallback_project_from_board(kicad)
+        project_name = fb_name
+        project_path = fb_path
+        if fb_board_path:
+            self._add_open_document(open_documents, "pcb", fb_board_path)
 
         # Query open project documents
         try:
@@ -1209,38 +1261,31 @@ class IPCBackend(KiCadBackend):
                 project_path = getattr(project_info, "path", None)
                 if project_path:
                     project_path = str(project_path)
-                open_documents.append({
-                    "type": "project",
-                    "path": project_path or "",
-                })
+                self._add_open_document(open_documents, "project", project_path or self._doc_path(doc))
         except Exception as e:
             logger.debug("Could not query project documents: %s", e)
+            if self._is_open_documents_unsupported(e):
+                open_documents_supported = False
 
         # Query open schematic documents
-        try:
-            from kipy.proto.common.types import DocumentType
-            sch_docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
-            for doc in sch_docs:
-                doc_path = getattr(doc, "path", None) or getattr(doc, "board_path", None)
-                open_documents.append({
-                    "type": "schematic",
-                    "path": str(doc_path) if doc_path else "",
-                })
-        except Exception as e:
-            logger.debug("Could not query schematic documents: %s", e)
+        if open_documents_supported:
+            try:
+                from kipy.proto.common.types import DocumentType
+                sch_docs = kicad.get_open_documents(DocumentType.DOCTYPE_SCHEMATIC)
+                for doc in sch_docs:
+                    self._add_open_document(open_documents, "schematic", self._doc_path(doc))
+            except Exception as e:
+                logger.debug("Could not query schematic documents: %s", e)
 
         # Query open PCB documents
-        try:
-            from kipy.proto.common.types import DocumentType
-            pcb_docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
-            for doc in pcb_docs:
-                doc_path = getattr(doc, "path", None) or getattr(doc, "board_path", None)
-                open_documents.append({
-                    "type": "pcb",
-                    "path": str(doc_path) if doc_path else "",
-                })
-        except Exception as e:
-            logger.debug("Could not query PCB documents: %s", e)
+        if open_documents_supported:
+            try:
+                from kipy.proto.common.types import DocumentType
+                pcb_docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+                for doc in pcb_docs:
+                    self._add_open_document(open_documents, "pcb", self._doc_path(doc))
+            except Exception as e:
+                logger.debug("Could not query PCB documents: %s", e)
 
         return {
             "project_name": project_name,
@@ -1251,12 +1296,23 @@ class IPCBackend(KiCadBackend):
     def get_text_variables(self, project_path: Path) -> dict[str, Any]:
         """Get project text variables (${VAR} substitution table)."""
         try:
-            from kipy.proto.common.types import DocumentType
             kicad = _get_kicad()
-            docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
-            if not docs:
+            project = None
+            try:
+                from kipy.proto.common.types import DocumentType
+                docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
+                if docs:
+                    project = kicad.get_project(docs[0])
+            except Exception as e:
+                logger.debug("Could not query project document for text vars: %s", e)
+
+            if project is None:
+                board = kicad.get_board()
+                doc = getattr(board, "document", None)
+                project = getattr(doc, "project", None)
+
+            if project is None:
                 return {"status": "unavailable", "reason": "No project is open in KiCad"}
-            project = kicad.get_project(docs[0])
             if hasattr(project, "get_text_variables"):
                 variables = dict(project.get_text_variables())
                 return {"status": "success", "variables": variables}
@@ -1267,12 +1323,23 @@ class IPCBackend(KiCadBackend):
     def set_text_variables(self, project_path: Path, variables: dict[str, str]) -> dict[str, Any]:
         """Set project text variables."""
         try:
-            from kipy.proto.common.types import DocumentType
             kicad = _get_kicad()
-            docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
-            if not docs:
+            project = None
+            try:
+                from kipy.proto.common.types import DocumentType
+                docs = kicad.get_open_documents(DocumentType.DOCTYPE_PROJECT)
+                if docs:
+                    project = kicad.get_project(docs[0])
+            except Exception as e:
+                logger.debug("Could not query project document for text vars: %s", e)
+
+            if project is None:
+                board = kicad.get_board()
+                doc = getattr(board, "document", None)
+                project = getattr(doc, "project", None)
+
+            if project is None:
                 return {"status": "unavailable", "reason": "No project is open in KiCad"}
-            project = kicad.get_project(docs[0])
             if hasattr(project, "set_text_variables"):
                 project.set_text_variables(variables)
                 return {"status": "success", "variables_set": len(variables)}

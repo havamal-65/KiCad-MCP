@@ -159,8 +159,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         """Get the currently open KiCad project from a running KiCad instance.
 
         Queries KiCad via IPC to discover which project is currently open,
-        along with any open schematic and PCB editor documents. Requires
-        KiCad 9+ running with IPC enabled.
+        along with any open schematic and PCB editor documents. On Linux
+        builds where the IPC `GetOpenDocuments` handler is unavailable,
+        project info falls back to the active board document metadata.
+        Requires KiCad 9+ running with IPC enabled.
 
         Returns:
             JSON with project_name, project_path, and open_documents list.

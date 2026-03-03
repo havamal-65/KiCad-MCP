@@ -175,12 +175,13 @@ A `.mcp.json` is included at the repo root. Claude Code picks it up automaticall
 ### Claude Desktop — Windows
 
 Add to `%APPDATA%\Claude\claude_desktop_config.json`:
+Use an absolute PowerShell path to avoid `Executable not found in $PATH: "powershell"` startup errors.
 
 ```json
 {
   "mcpServers": {
     "kicad": {
-      "command": "powershell",
+      "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
       "args": [
         "-ExecutionPolicy", "Bypass",
         "-NonInteractive",

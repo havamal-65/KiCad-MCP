@@ -9,7 +9,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 ### Key Features
 
 - **70 MCP Tools** across 8 categories:
-  - 📋 **Project Management** (9 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC
+- 📋 **Project Management** (9 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable)
   - 📐 **Schematic Operations** (21 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
   - 🔌 **PCB Board Operations** (10 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules, refill copper zones, query layer stackup
   - 📚 **Library Search** (6 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol
@@ -238,7 +238,7 @@ python -m kicad_mcp
 - `get_project_metadata`: Read detailed metadata from a KiCad project file
 - `save_project`: Trigger save for an open KiCad project (requires IPC backend)
 - `get_backend_info`: Get information about available backends and their capabilities
-- `get_active_project`: Query the currently open KiCad project and documents (requires IPC backend)
+- `get_active_project`: Query the currently open KiCad project and documents (requires IPC backend; on Linux IPC builds without `GetOpenDocuments`, falls back to active board document metadata)
 - `get_text_variables`: Get all project-level text variables (`${VAR}` substitutions)
 - `set_text_variables`: Set one or more project-level text variables
 - `create_project`: Create a new KiCad project with blank `.kicad_pro`, `.kicad_sch`, and `.kicad_pcb` files
@@ -452,6 +452,14 @@ Run `python -m kicad_mcp --check` to see which backends are available. Install m
 - SWIG: activate the venv then `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH
 - File: Always available (pure Python)
+
+### Linux IPC Project Discovery
+
+Some Linux KiCad IPC builds (for example KiCad 9.0.7) do not implement the `GetOpenDocuments` handler. In that case:
+
+- `get_active_project` still returns project information using `kicad.get_board().document.project`
+- `get_text_variables` / `set_text_variables` also fall back to the active board document's project object
+- `open_documents` may include only the active PCB document when schematic/project document enumeration is not available
 
 ### Auto-Routing Not Working
 

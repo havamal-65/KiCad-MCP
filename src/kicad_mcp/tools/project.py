@@ -309,3 +309,121 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         }
         change_log.record("create_project", {"name": stem, "dir": project_dir})
         return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def get_pcb_workflow() -> str:
+        """Return the standard KiCad PCB design workflow as a reference.
+
+        Provides a structured sequence of tools and steps for producing a
+        complete, DRC-clean PCB from a finished schematic. Follow this sequence
+        to avoid common ordering mistakes (e.g. placing before assigning
+        footprints, or routing before setting design rules).
+
+        Returns:
+            JSON with an ordered list of workflow steps, tool names, and notes.
+        """
+        workflow = {
+            "description": (
+                "Standard KiCad PCB design workflow using KiCad MCP. "
+                "Follow steps in order; steps marked must_pass=true must "
+                "succeed before continuing."
+            ),
+            "steps": [
+                {
+                    "step": 1,
+                    "name": "create_project",
+                    "tool": "create_project",
+                    "description": "Create .kicad_pro, .kicad_sch, and .kicad_pcb files.",
+                },
+                {
+                    "step": 2,
+                    "name": "capture_schematic",
+                    "tools": ["add_component", "add_power_symbol", "add_wire",
+                              "add_label", "add_junction", "add_no_connect"],
+                    "description": "Place symbols, connect with wires, add power rails.",
+                },
+                {
+                    "step": 3,
+                    "name": "run_erc",
+                    "tool": "run_erc",
+                    "must_pass": True,
+                    "description": (
+                        "Fix all ERC errors before proceeding. "
+                        "Add PWR_FLAG symbols to fix power_pin_not_driven violations."
+                    ),
+                },
+                {
+                    "step": 4,
+                    "name": "assign_footprints",
+                    "tool": "update_component_property",
+                    "description": (
+                        "Set the Footprint property on every non-power component. "
+                        "Use get_footprint_bounds to check physical size before placing."
+                    ),
+                },
+                {
+                    "step": 5,
+                    "name": "sync_to_pcb",
+                    "tool": "sync_schematic_to_pcb",
+                    "description": "Place all footprints on the board and assign nets.",
+                },
+                {
+                    "step": 6,
+                    "name": "set_design_rules",
+                    "tool": "set_board_design_rules",
+                    "description": (
+                        "Apply IPC-2221 Class 2 rules (preset=class2) or "
+                        "JLCPCB rules (preset=fab_jlcpcb) so DRC enforces real constraints."
+                    ),
+                },
+                {
+                    "step": 7,
+                    "name": "add_board_outline",
+                    "note": "Add gr_rect on Edge.Cuts layer to define board boundary.",
+                    "description": (
+                        "Write a (gr_rect ...) with layer Edge.Cuts into the PCB file. "
+                        "Use a 3 mm margin from the component area. "
+                        "pcb_pipeline does this automatically."
+                    ),
+                },
+                {
+                    "step": 8,
+                    "name": "auto_place",
+                    "tool": "auto_place",
+                    "description": (
+                        "Geometry-driven bin-packing placement. "
+                        "Reads courtyard bounds for each footprint, "
+                        "sorts by component class, packs into rows with 0.5 mm clearance."
+                    ),
+                },
+                {
+                    "step": 9,
+                    "name": "autoroute",
+                    "tool": "autoroute",
+                    "description": "Run FreeRouting auto-router (clean_board=false for new boards).",
+                },
+                {
+                    "step": 10,
+                    "name": "run_drc",
+                    "tool": "run_drc",
+                    "must_pass": True,
+                    "description": "All DRC errors must be resolved before export.",
+                },
+                {
+                    "step": 11,
+                    "name": "export",
+                    "tools": ["export_gerbers", "export_drill", "export_bom",
+                              "export_pick_and_place"],
+                    "description": "Export manufacturing files.",
+                },
+            ],
+            "shortcut": {
+                "tool": "pcb_pipeline",
+                "description": (
+                    "Run steps 5–10 in a single call. "
+                    "Provide schematic_path, board_path, board_width_mm, board_height_mm."
+                ),
+            },
+        }
+        change_log.record("get_pcb_workflow", {})
+        return json.dumps({"status": "success", "workflow": workflow}, indent=2)

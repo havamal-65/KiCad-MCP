@@ -113,7 +113,7 @@ class TestCreateSchematic:
 
         content = sch_file.read_text(encoding="utf-8")
         assert "(kicad_sch" in content
-        assert '(version 20231120)' in content
+        assert '(version 20250114)' in content
         assert '(generator "kicad_mcp")' in content
         assert f'(uuid "{result["uuid"]}")' in content
         assert '(paper "A4")' in content

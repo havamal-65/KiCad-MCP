@@ -20,11 +20,14 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
     """Register schematic tools on the MCP server."""
 
     @mcp.tool()
-    def read_schematic(path: str) -> str:
+    def read_schematic(path: str, include: list[str] | None = None) -> str:
         """Read a KiCad schematic and return its structure.
 
         Args:
             path: Path to .kicad_sch file.
+            include: Optional list of sections to return. Omit for all sections.
+                     Valid values: symbols, wires, labels, no_connects, junctions, sheets.
+                     The "info" section is always returned regardless of this filter.
 
         Returns:
             JSON with schematic info, symbols, wires, and labels.
@@ -32,6 +35,12 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         p = validate_kicad_path(path, ".kicad_sch")
         ops = backend.get_schematic_ops()
         result = ops.read_schematic(p)
+
+        VALID = {"symbols", "wires", "labels", "no_connects", "junctions", "sheets"}
+        if include:
+            keep = set(include) & VALID
+            result = {k: v for k, v in result.items() if k == "info" or k in keep}
+
         change_log.record("read_schematic", {"path": path})
         return json.dumps({"status": "success", **limit_response(result)}, indent=2)
 
@@ -278,8 +287,12 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             })
 
     @mcp.tool()
-    def get_symbol_pin_positions(path: str, reference: str) -> str:
-        """Get absolute schematic coordinates for each pin of a placed symbol.
+    def get_symbol_pin_positions(
+        path: str,
+        reference: str = "",
+        references: list[str] | None = None,
+    ) -> str:
+        """Get absolute schematic coordinates for each pin of one or more placed symbols.
 
         This is essential for knowing where to connect wires. It reads the symbol's
         placement (position, rotation, mirror) and its library pin definitions,
@@ -287,15 +300,34 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         Args:
             path: Path to .kicad_sch file.
-            reference: Reference designator of the symbol (e.g. 'U1', 'R3').
+            reference: Reference designator of a single symbol (e.g. 'U1', 'R3').
+                       Used when querying one component at a time.
+            references: List of reference designators for batch queries
+                        (e.g. ['R1', 'R2', 'U1']). Preferred over repeated
+                        single calls when pin positions for multiple components
+                        are needed.
 
         Returns:
-            JSON with pin_positions mapping pin numbers to {x, y} coordinates.
+            Single mode: JSON with pin_positions mapping pin numbers to {x, y} coordinates.
+            Batch mode:  JSON with batch dict keyed by reference, each value containing
+                         the same pin_positions structure.
         """
         p = validate_kicad_path(path, ".kicad_sch")
-        validate_reference(reference)
-
         ops = backend.get_schematic_ops()
+
+        if references:
+            batch: dict = {}
+            for ref in references:
+                validate_reference(ref)
+                batch[ref] = ops.get_symbol_pin_positions(p, ref)
+            change_log.record(
+                "get_symbol_pin_positions",
+                {"path": path, "references": references},
+            )
+            return json.dumps({"status": "success", "batch": batch}, indent=2)
+
+        # Single-reference path (original behaviour)
+        validate_reference(reference)
         result = ops.get_symbol_pin_positions(p, reference)
         change_log.record(
             "get_symbol_pin_positions",
@@ -578,7 +610,9 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         sch_data = sch_ops.read_schematic(sch_p)
         pcb_data = pcb_ops.read_board(pcb_p)
 
-        # Build dicts keyed by reference, filtering out power symbols
+        # Build dicts keyed by reference, filtering out power symbols.
+        # Multi-unit components appear once per unit; merge so the footprint
+        # from whichever unit carries it is preserved.
         sch_by_ref: dict[str, dict] = {}
         for sym in sch_data.get("symbols", []):
             ref = sym.get("reference", "")
@@ -586,7 +620,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 continue
             if sym.get("is_power"):
                 continue
-            sch_by_ref[ref] = sym
+            if ref not in sch_by_ref:
+                sch_by_ref[ref] = sym
+            elif sym.get("footprint") and not sch_by_ref[ref].get("footprint"):
+                sch_by_ref[ref]["footprint"] = sym["footprint"]
 
         pcb_by_ref: dict[str, dict] = {}
         for comp in pcb_data.get("components", []):
@@ -670,7 +707,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             "compare_schematic_pcb",
             {"schematic_path": schematic_path, "board_path": board_path},
         )
-        return json.dumps({"status": "success", **result}, indent=2)
+        return json.dumps({"status": "success", **limit_response(result)}, indent=2)
 
     @mcp.tool()
     def get_pin_net(path: str, reference: str, pin_number: str) -> str:
@@ -732,7 +769,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             "get_net_connections",
             {"path": path, "net_name": net_name},
         )
-        return json.dumps({"status": "success", **result}, indent=2)
+        return json.dumps({"status": "success", **limit_response(result)}, indent=2)
 
     @mcp.tool()
     def sync_schematic_to_pcb(schematic_path: str, board_path: str) -> str:
@@ -774,7 +811,9 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             pcb_ops = FileBoardOps()
             pcb_data = pcb_ops.read_board(pcb_p)
 
-        # Build dicts keyed by reference, filtering out power symbols
+        # Build dicts keyed by reference, filtering out power symbols.
+        # Multi-unit components appear once per unit; merge so the footprint
+        # from whichever unit carries it is preserved.
         sch_by_ref: dict[str, dict] = {}
         for sym in sch_data.get("symbols", []):
             ref = sym.get("reference", "")
@@ -782,7 +821,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 continue
             if sym.get("is_power"):
                 continue
-            sch_by_ref[ref] = sym
+            if ref not in sch_by_ref:
+                sch_by_ref[ref] = sym
+            elif sym.get("footprint") and not sch_by_ref[ref].get("footprint"):
+                sch_by_ref[ref]["footprint"] = sym["footprint"]
 
         pcb_by_ref: dict[str, dict] = {}
         for comp in pcb_data.get("components", []):
@@ -1043,9 +1085,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         )
         return json.dumps({
             "status": "success",
-            "summary": summary,
-            "actions": actions,
-            "warnings": warnings,
+            **limit_response({"summary": summary, "actions": actions, "warnings": warnings}),
         }, indent=2)
 
     @mcp.tool()

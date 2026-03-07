@@ -127,3 +127,36 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         result = ops.suggest_footprints(lib_id)
         change_log.record("suggest_footprints", {"lib_id": lib_id})
         return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def get_footprint_bounds(lib_id: str) -> str:
+        """Get physical dimensions and courtyard bounds for a footprint.
+
+        Returns the courtyard rectangle (F.CrtYd) and pad geometry for any
+        footprint before placing it on the board. Use this to compute
+        non-overlapping placement positions.
+
+        Args:
+            lib_id: Footprint identifier in 'Library:Footprint' format
+                    (e.g. 'Resistor_SMD:R_0805_2012Metric').
+
+        Returns:
+            JSON with courtyard {xmin, ymin, xmax, ymax}, width_mm,
+            height_mm, and pads list.
+        """
+        from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
+
+        kicad_mod_text = _load_kicad_mod(lib_id)
+        if kicad_mod_text is None:
+            return json.dumps({
+                "status": "error",
+                "message": f"Footprint '{lib_id}' not found in system libraries.",
+            }, indent=2)
+
+        bounds = _parse_footprint_bounds(kicad_mod_text)
+        change_log.record("get_footprint_bounds", {"lib_id": lib_id})
+        return json.dumps({
+            "status": "success",
+            "lib_id": lib_id,
+            **bounds,
+        }, indent=2)

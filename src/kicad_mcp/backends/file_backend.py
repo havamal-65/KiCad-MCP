@@ -58,6 +58,92 @@ def _load_kicad_mod(lib_id: str) -> str | None:
     return None
 
 
+def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
+    """Parse courtyard rectangle and pad geometry from raw .kicad_mod text.
+
+    Returns a dict with:
+      courtyard: {xmin, ymin, xmax, ymax} (from F.CrtYd/B.CrtYd fp_rect), or None
+      width_mm: courtyard width in mm (0.0 if no courtyard found)
+      height_mm: courtyard height in mm (0.0 if no courtyard found)
+      pads: list of {number, x, y, width, height}
+    """
+    courtyard: dict[str, float] | None = None
+    pads: list[dict[str, Any]] = []
+
+    start_pat = re.compile(r'\(start\s+([-\d.]+)\s+([-\d.]+)\)')
+    end_pat = re.compile(r'\(end\s+([-\d.]+)\s+([-\d.]+)\)')
+    at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)')
+    size_pat = re.compile(r'\(size\s+([-\d.]+)\s+([-\d.]+)\)')
+
+    # Walk the text looking for (fp_rect ...) and (pad ...) top-level tokens.
+    # We use _walk_balanced_parens to get the full balanced block for each.
+    i = 0
+    n = len(kicad_mod_text)
+    while i < n:
+        if kicad_mod_text[i] != '(':
+            i += 1
+            continue
+
+        # Peek at the token name
+        j = i + 1
+        while j < n and kicad_mod_text[j] not in (' ', '\t', '\n', '(', ')'):
+            j += 1
+        token = kicad_mod_text[i + 1: j]
+
+        if token == 'fp_rect':
+            end_idx = _walk_balanced_parens(kicad_mod_text, i)
+            if end_idx is not None:
+                block = kicad_mod_text[i: end_idx + 1]
+                if '"F.CrtYd"' in block or '"B.CrtYd"' in block:
+                    sm = start_pat.search(block)
+                    em = end_pat.search(block)
+                    if sm and em and courtyard is None:
+                        x1, y1 = float(sm.group(1)), float(sm.group(2))
+                        x2, y2 = float(em.group(1)), float(em.group(2))
+                        courtyard = {
+                            "xmin": min(x1, x2),
+                            "ymin": min(y1, y2),
+                            "xmax": max(x1, x2),
+                            "ymax": max(y1, y2),
+                        }
+                i = end_idx + 1
+                continue
+
+        elif token == 'pad':
+            end_idx = _walk_balanced_parens(kicad_mod_text, i)
+            if end_idx is not None:
+                block = kicad_mod_text[i: end_idx + 1]
+                # Extract pad number from first token after 'pad'
+                pad_hdr = re.match(r'\(pad\s+"?([^"\s)]+)"?', block)
+                num = pad_hdr.group(1) if pad_hdr else "?"
+                at_m = at_pat.search(block)
+                sz_m = size_pat.search(block)
+                if at_m:
+                    pad_info: dict[str, Any] = {
+                        "number": num,
+                        "x": float(at_m.group(1)),
+                        "y": float(at_m.group(2)),
+                    }
+                    if sz_m:
+                        pad_info["width"] = float(sz_m.group(1))
+                        pad_info["height"] = float(sz_m.group(2))
+                    pads.append(pad_info)
+                i = end_idx + 1
+                continue
+
+        i += 1
+
+    width_mm = (courtyard["xmax"] - courtyard["xmin"]) if courtyard else 0.0
+    height_mm = (courtyard["ymax"] - courtyard["ymin"]) if courtyard else 0.0
+
+    return {
+        "courtyard": courtyard,
+        "width_mm": round(width_mm, 4),
+        "height_mm": round(height_mm, 4),
+        "pads": pads,
+    }
+
+
 def _add_uuids_to_fp_elements(inner: str) -> str:
     """Inject ``(uuid "…")`` into every sub-element of a footprint body that
     does not already carry one.
@@ -552,6 +638,119 @@ class FileBoardOps(BoardOps):
         }
 
 
+    # IPC-2221 Class 2 and JLCPCB 2-layer standard rule presets
+    _DESIGN_RULE_PRESETS: dict[str, dict[str, float]] = {
+        "class2": {
+            "min_clearance": 0.20,
+            "trace_min": 0.25,
+            "via_min_drill": 0.30,
+            "via_min_size": 0.60,
+            "via_min_annulus": 0.15,
+            "hole_clearance": 0.25,
+            "courtyard_offset": 0.25,
+        },
+        "fab_jlcpcb": {
+            "min_clearance": 0.10,
+            "trace_min": 0.127,
+            "via_min_drill": 0.20,
+            "via_min_size": 0.45,
+            "via_min_annulus": 0.125,
+            "hole_clearance": 0.25,
+            "courtyard_offset": 0.25,
+        },
+    }
+
+    def set_board_design_rules(
+        self, path: Path, preset: str = "class2",
+    ) -> dict[str, Any]:
+        """Write IPC design rules into the board's (setup ...) section.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            preset: One of "class2" (IPC-2221 Class 2) or "fab_jlcpcb".
+
+        Returns:
+            Dict with applied preset name and rule values.
+        """
+        rules = self._DESIGN_RULE_PRESETS.get(preset)
+        if rules is None:
+            raise ValueError(
+                f"Unknown preset '{preset}'. Valid presets: {list(self._DESIGN_RULE_PRESETS)}"
+            )
+
+        content = path.read_text(encoding="utf-8")
+
+        # Locate the (setup ...) block
+        setup_start = content.find("(setup")
+        if setup_start == -1:
+            raise ValueError("No (setup ...) section found in board file")
+
+        setup_end = _walk_balanced_parens(content, setup_start)
+        if setup_end is None:
+            raise ValueError("Malformed (setup ...) section — unbalanced parens")
+
+        setup_block = content[setup_start : setup_end + 1]
+
+        # For each rule key, either replace existing value or insert before closing paren
+        simple_rules = {k: v for k, v in rules.items() if k != "courtyard_offset"}
+        courtyard_offset = rules.get("courtyard_offset", 0.25)
+
+        for key, value in simple_rules.items():
+            existing = re.search(rf'\({re.escape(key)}\s+[-\d.]+\)', setup_block)
+            new_clause = f'({key} {value})'
+            if existing:
+                setup_block = setup_block[:existing.start()] + new_clause + setup_block[existing.end():]
+            else:
+                # Insert before the pcbplotparams block or before closing paren
+                pcbplot_pos = setup_block.find("(pcbplotparams")
+                if pcbplot_pos != -1:
+                    # Insert the newline + indent before pcbplotparams
+                    setup_block = (
+                        setup_block[:pcbplot_pos]
+                        + f'    {new_clause}\n    '
+                        + setup_block[pcbplot_pos:]
+                    )
+                else:
+                    last_paren = setup_block.rfind(")")
+                    setup_block = (
+                        setup_block[:last_paren]
+                        + f'    {new_clause}\n  '
+                        + setup_block[last_paren:]
+                    )
+
+        # Handle courtyard_offset — KiCad uses nested form or flat form
+        cyd_existing = re.search(r'\(courtyard_offset\s.*?\)', setup_block, re.DOTALL)
+        cyd_clause = f'(courtyard_offset {courtyard_offset})'
+        if cyd_existing:
+            setup_block = (
+                setup_block[:cyd_existing.start()]
+                + cyd_clause
+                + setup_block[cyd_existing.end():]
+            )
+        else:
+            pcbplot_pos = setup_block.find("(pcbplotparams")
+            if pcbplot_pos != -1:
+                setup_block = (
+                    setup_block[:pcbplot_pos]
+                    + f'    {cyd_clause}\n    '
+                    + setup_block[pcbplot_pos:]
+                )
+            else:
+                last_paren = setup_block.rfind(")")
+                setup_block = (
+                    setup_block[:last_paren]
+                    + f'    {cyd_clause}\n  '
+                    + setup_block[last_paren:]
+                )
+
+        content = content[:setup_start] + setup_block + content[setup_end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "preset": preset,
+            "rules_applied": rules,
+        }
+
     def create_board(
         self, path: Path, title: str = "", revision: str = "",
     ) -> dict[str, Any]:
@@ -1044,7 +1243,7 @@ class FileSchematicOps(SchematicOps):
 
         content = (
             f'(kicad_sch\n'
-            f'  (version 20231120)\n'
+            f'  (version 20250114)\n'
             f'  (generator "kicad_mcp")\n'
             f'  (generator_version "9.0")\n'
             f'  (uuid "{sch_uuid}")\n'
@@ -1186,7 +1385,7 @@ class FileSchematicOps(SchematicOps):
         if footprint:
             prop_lines += (
                 f'    (property "Footprint" "{footprint}" (at {x} {y + 4} 0)\n'
-                f'      (effects (font (size 1.27 1.27)) hide)\n'
+                f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
                 f'    )\n'
             )
 
@@ -1195,7 +1394,7 @@ class FileSchematicOps(SchematicOps):
             for prop_name, prop_val in properties.items():
                 prop_lines += (
                     f'    (property "{prop_name}" "{prop_val}" (at {x} {y + offset} 0)\n'
-                    f'      (effects (font (size 1.27 1.27)) hide)\n'
+                    f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
                     f'    )\n'
                 )
                 offset += 2
@@ -1206,7 +1405,7 @@ class FileSchematicOps(SchematicOps):
 
         sym_sexp = (
             f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit 1)\n'
-            f'    (in_bom yes) (on_board yes) (dnp no)\n'
+            f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'{prop_lines}'
             f'    (instances\n'
@@ -1324,10 +1523,10 @@ class FileSchematicOps(SchematicOps):
 
         sym_sexp = (
             f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation}) (unit 1)\n'
-            f'    (in_bom yes) (on_board yes) (dnp no)\n'
+            f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'    (property "Reference" "{pwr_ref}" (at {x} {y - 2} 0)\n'
-            f'      (effects (font (size 1.27 1.27)) hide)\n'
+            f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
             f'    )\n'
             f'    (property "Value" "{name}" (at {x} {y + 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)))\n'
@@ -2434,7 +2633,7 @@ class FileLibraryManageOps(LibraryManageOps):
             if not sym_file.exists():
                 sym_file.write_text(
                     f'(kicad_symbol_lib\n'
-                    f'  (version 20231120)\n'
+                    f'  (version 20241209)\n'
                     f'  (generator "kicad_mcp")\n'
                     f'  (generator_version "9.0")\n'
                     f')\n',

@@ -10,6 +10,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog
+from kicad_mcp.utils.response_limit import limit_response
 from kicad_mcp.utils.validation import validate_kicad_path
 
 logger = get_logger("tools.drc")
@@ -39,7 +40,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             drc_ops = backend.get_drc_ops()
             result = drc_ops.run_drc(p, out)
             change_log.record("run_drc", {"path": path, "output": output})
-            return json.dumps({"status": "success", **result}, indent=2)
+            return json.dumps({"status": "success", **limit_response(result)}, indent=2)
         except Exception as e:
             return json.dumps({
                 "status": "error",
@@ -71,7 +72,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             drc_ops = backend.get_drc_ops()
             result = drc_ops.run_erc(p, out)
             change_log.record("run_erc", {"path": path, "output": output})
-            return json.dumps({"status": "success", **result}, indent=2)
+            return json.dumps({"status": "success", **limit_response(result)}, indent=2)
         except NotImplementedError:
             # Fall back to file-based validation
             try:
@@ -80,7 +81,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 result["backend"] = "file"
                 result["note"] = "File-based ERC lite. For full ERC, install kicad-cli."
                 change_log.record("run_erc", {"path": path, "output": output, "backend": "file"})
-                return json.dumps({"status": "success", **result}, indent=2)
+                return json.dumps({"status": "success", **limit_response(result)}, indent=2)
             except Exception as fallback_err:
                 return json.dumps({
                     "status": "error",

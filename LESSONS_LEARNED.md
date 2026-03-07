@@ -207,6 +207,24 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: The sync flow now queries schematic connectivity (`get_symbol_pin_positions` + `get_pin_net`) and calls `assign_net` for each resolved `(reference, pin/pad, net)` mapping. The tool reports `net_assigned` actions and includes `nets_assigned` in the summary.
 
+### 28. `_parse_footprint_bounds` Must Use Balanced-Paren Walking, Not Regex (FIXED)
+
+**Problem**: An early implementation of `_parse_footprint_bounds` used a regex like `\(fp_rect .*?\)` to extract courtyard rectangles from `.kicad_mod` files. The `.*?` lazy quantifier stops at the **first** `)` in the file, which is always inside a nested expression — it never captures the full `(fp_rect ...)` block. The same issue affected `(pad ...)` extraction.
+
+**Impact**: `get_footprint_bounds` returned empty or incorrect courtyard data, causing `auto_place` to fall back to 5 × 5 mm stubs for every component and produce overlapping placements.
+
+**Fix Applied**: Replaced the regex with `_walk_balanced_parens(text, "(fp_rect")` — a character-by-character scanner that tracks open/close paren depth. This correctly finds nested S-expression blocks of arbitrary depth. The same helper is used for pad extraction.
+
+**Rule**: Never use `.*?\)` to extract S-expression blocks. KiCad `.kicad_mod` and `.kicad_pcb` files contain deeply nested S-expressions; a regex that stops at the first `)` will always return a truncated fragment.
+
+### 29. `pcb_pipeline` Needs `_impl_*` Helpers, Not `@mcp.tool()` Wrappers (FIXED)
+
+**Problem**: `pcb_pipeline` originally called the `@mcp.tool()`-decorated `autoroute` function directly inside `register_tools()`. After decoration by fastmcp, `autoroute` becomes a `FunctionTool` object (not callable as a plain Python function), so `pcb_pipeline` crashed with `TypeError: 'FunctionTool' object is not callable`.
+
+**Fix Applied**: `pcb_pipeline` imports `_impl_export_dsn`, `_impl_import_ses`, and `_impl_run_freerouter` directly from `routing.py` and instantiates `KiCadMCPConfig()` locally. No `@mcp.tool()` decorated function is called from within another tool.
+
+**Rule**: Inside `register_tools()`, any function decorated with `@mcp.tool()` is no longer callable as a plain Python function. Always extract shared logic into module-level `_impl_*` helpers (see Lesson 24).
+
 ---
 
 ## Enhancement Requirements (Prioritized)
@@ -247,7 +265,10 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 24 | End-to-end MCP protocol test suite | **DONE** | 63/64 tools pass (1 skip: run_freerouter requires pcbnew for DSN export) |
 | 25 | `autoroute` FunctionTool bug | **DONE** | Extracted `_impl_*` helpers; autoroute now works end-to-end |
 | 26 | `run_freerouter` subprocess stdin | **DONE** | Added `stdin=DEVNULL`; prevents MCP pipe blocking |
-| 17 | `auto_place_components` | Planned | Suggest initial component placement based on connectivity |
+| 17 | `auto_place` + `get_footprint_bounds` | **DONE** | Geometry-driven bin-packing using courtyard extents; eliminates overlap violations |
+| 28 | `set_board_design_rules` | **DONE** | Writes IPC-2221 Class 2 / JLCPCB rules into (setup ...) so DRC catches real violations |
+| 29 | `pcb_pipeline` | **DONE** | Full schematic-to-routed-PCB in one call (sync → rules → outline → place → route → DRC) |
+| 30 | `get_pcb_workflow` | **DONE** | Returns structured 11-step workflow JSON so AI assistants follow the correct tool sequence |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |
 | 20 | Undo/redo support | Planned | Track changes and allow rollback beyond file backups |

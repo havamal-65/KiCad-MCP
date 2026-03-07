@@ -9,6 +9,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
+from kicad_mcp.utils.response_limit import limit_response
 
 logger = get_logger("tools.library_manage")
 
@@ -94,12 +95,13 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         ops = backend.get_library_manage_ops()
         result = ops.search_library_sources(query, source_name or None)
         change_log.record("search_library_sources", {"query": query, "source_name": source_name})
+        capped = limit_response(result)
         return json.dumps({
             "status": "success",
             "query": query,
             "symbol_count": len(result["symbols"]),
             "footprint_count": len(result["footprints"]),
-            **result,
+            **capped,
         }, indent=2)
 
     @mcp.tool()

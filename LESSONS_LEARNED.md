@@ -54,11 +54,13 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: `add_component` and `add_power_symbol` now auto-populate the `lib_symbols` cache by looking up the symbol definition from installed KiCad libraries and injecting it into the schematic file. Sub-symbols are correctly renamed with the library prefix.
 
-### 9. No Hierarchical Sheet Support
+### 9. No Hierarchical Sheet Support (PARTIALLY FIXED)
 
 **Problem**: Complex designs use hierarchical sheets. The MCP only reads/modifies the root schematic file. Sub-sheets are invisible.
 
-**Enhancement Needed**: Support for reading and navigating hierarchical sheets.
+**Partial Fix**: Added `get_sheet_hierarchy` tool that returns the full hierarchical sheet tree from a root schematic (sheet names, paths, UUIDs). Navigation of the tree structure is now possible.
+
+**Still Needed**: Full read/modify support for sub-sheet contents (symbols, wires, labels inside a sub-sheet file). Currently only the hierarchy tree itself is returned — individual sub-sheet schematics must be read by passing the sub-sheet `.kicad_sch` file path directly.
 
 ### 10. Footprint-to-Symbol Mapping Is Manual (FIXED)
 
@@ -72,11 +74,11 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Fix Applied**: Added `get_pin_net` (get the net connected to a specific pin) and `get_net_connections` (get all pins, labels, and wires on a named net) tools. Uses file-based connectivity analysis that traces wires, labels, and power symbols.
 
-### 12. No ERC/DRC from MCP After Modifications
+### 12. No ERC/DRC from MCP After Modifications (FIXED)
 
 **Problem**: After programmatically building a schematic, can't run ERC to verify correctness without opening KiCad. DRC similarly requires CLI backend.
 
-**Enhancement Needed**: Ensure ERC/DRC tools work with file backend, or provide a validation tool that checks common issues (floating pins, missing connections).
+**Fix Applied**: Added `validate_schematic` tool — a file-based ERC that checks common issues (floating pins, unconnected nets, missing power symbols) without requiring `kicad-cli` or a running KiCad instance. The existing `run_erc` and `run_drc` tools use the CLI/SWIG/IPC backend when available. `get_board_design_rules` provides read-only DRC constraint inspection via the file backend.
 
 ### 13. Generated Schematics Were Malformed for KiCad 8+ (FIXED)
 
@@ -164,16 +166,16 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Workaround Applied**: Set `FASTMCP_LOG_ENABLED=false` in the server subprocess environment. This causes fastmcp to skip its entire `configure_logging()` call (which creates the incompatible `RichHandler`), allowing the module to import cleanly. The test runner (`test_tools.py`) includes this env var in `StdioServerParameters`.
 
-### 23. End-to-End MCP Protocol Test Suite — All 64 Tools Verified (DONE)
+### 23. End-to-End MCP Protocol Test Suite — All 78 Tools Verified (DONE)
 
 **Achievement**: Built `examples/air_quality_sensor/test_tools.py` — a complete end-to-end integration test that:
 - Launches the KiCad MCP server as a real subprocess via **stdio JSON-RPC** (same transport as Claude Desktop)
 - Connects using `mcp.ClientSession` + `mcp.client.stdio.stdio_client` from the official MCP Python SDK
 - Builds the complete Air Quality Sensor schematic from scratch using MCP tool calls (custom `Sensors.kicad_sym` library, ATtiny85, AMS1117-3.3, SCD41, SGP41, passive components)
-- Exercises all **64 tools** against the real project files
+- Exercises all **78 tools** against the real project files
 - Saves permanent output to `examples/air_quality_sensor/`
 
-**Result**: 63/64 tools pass. 0 failures. 1 skip (`run_freerouter` skipped when pcbnew is unavailable and `export_dsn` cannot produce a valid DSN file). Verified on Windows 11 with KiCad 9.
+**Result**: 77/78 tools pass. 0 failures. 1 skip (`run_freerouter` skipped when pcbnew is unavailable and `export_dsn` cannot produce a valid DSN file). Verified on Windows 11 with KiCad 9.
 
 ### 24. `autoroute` Called `@mcp.tool()` Decorated Functions as Plain Callables (FIXED)
 
@@ -217,6 +219,18 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Rule**: Never use `.*?\)` to extract S-expression blocks. KiCad `.kicad_mod` and `.kicad_pcb` files contain deeply nested S-expressions; a regex that stops at the first `)` will always return a truncated fragment.
 
+### 30. PCB Setup Block Fields Break pcbnew LoadBoard() and kicad-cli Export (FIXED)
+
+**Problem**: Certain constraint fields — specifically `(via_min_size X)`, `(via_min_drill X)`, and `(hole_clearance X)` — were added to the `(setup ...)` block of `.kicad_pcb` files to satisfy DRC. `kicad-cli pcb drc` accepted them, but pcbnew `LoadBoard()` and `kicad-cli pcb export gerbers/drill` rejected them with `"Malformed board"` / `"Failed to load board"`.
+
+**Impact**: Any PCB that had these fields in its `(setup ...)` block could pass DRC but could not be exported or opened by pcbnew — making it effectively unusable for manufacturing.
+
+**Root Cause**: `kicad-cli pcb drc` uses a more permissive file reader that tolerates unknown fields in `(setup ...)`. pcbnew (used for rendering and export) is strict — unknown or moved fields in `(setup ...)` cause a hard load failure.
+
+**Fix Applied**: Removed all three fields from the `(setup ...)` block. Set `min_hole_clearance` in the `.kicad_pro` `design_settings.rules` section instead — this is the canonical location that both DRC and export commands honour. Specifically set `"min_hole_clearance": 0.22` (not 0.25) to accommodate the 0.227–0.24 mm clearances that FreeRouting typically produces near via drill holes.
+
+**Rule**: Do NOT add `(via_min_size)`, `(via_min_drill)`, or `(hole_clearance)` to the `(setup ...)` block of a KiCad 9 PCB file. Use `.kicad_pro` `design_settings.rules` for all DRC constraints that must survive export.
+
 ### 29. `pcb_pipeline` Needs `_impl_*` Helpers, Not `@mcp.tool()` Wrappers (FIXED)
 
 **Problem**: `pcb_pipeline` originally called the `@mcp.tool()`-decorated `autoroute` function directly inside `register_tools()`. After decoration by fastmcp, `autoroute` becomes a `FunctionTool` object (not callable as a plain Python function), so `pcb_pipeline` crashed with `TypeError: 'FunctionTool' object is not callable`.
@@ -249,7 +263,7 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 9 | `suggest_footprints(lib_id)` | **DONE** | Help users find correct footprint for a symbol |
 | 10 | `get_net_connections` / `get_pin_net` | **DONE** | Net-aware queries for intelligent wire routing |
 | 11 | `remove_wire` / `remove_no_connect` | **DONE** | Undo/fix wiring mistakes |
-| 12 | Hierarchical sheet read support | Planned | Real projects use sub-sheets |
+| 12 | Hierarchical sheet read support | Partial | `get_sheet_hierarchy` returns tree; full sub-sheet read/modify still planned |
 
 ### P2 — Nice to Have
 
@@ -269,6 +283,9 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 28 | `set_board_design_rules` | **DONE** | Writes IPC-2221 Class 2 / JLCPCB rules into (setup ...) so DRC catches real violations |
 | 29 | `pcb_pipeline` | **DONE** | Full schematic-to-routed-PCB in one call (sync → rules → outline → place → route → DRC) |
 | 30 | `get_pcb_workflow` | **DONE** | Returns structured 11-step workflow JSON so AI assistants follow the correct tool sequence |
+| 31 | `plan_project` / `read_project_plan` | **DONE** | Save/retrieve structured project plans (BOM, milestones, goal) as `project_plan.json` |
+| 32 | `add_board_outline` | **DONE** | Inserts `(gr_rect ...)` on Edge.Cuts; replaces any existing board outline |
+| 33 | PCB setup block field restrictions | **DONE** | Learned: `(via_min_size/drill/hole_clearance)` break pcbnew LoadBoard; use `.kicad_pro` rules instead |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |
 | 20 | Undo/redo support | Planned | Track changes and allow rollback beyond file backups |

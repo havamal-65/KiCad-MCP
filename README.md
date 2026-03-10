@@ -8,10 +8,10 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **75 MCP Tools** across 8 categories:
-- 📋 **Project Management** (11 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference
+- **78 MCP Tools** across 8 categories:
+- 📋 **Project Management** (13 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference, plan capture and retrieval
   - 📐 **Schematic Operations** (21 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
-  - 🔌 **PCB Board Operations** (13 tools): Read boards, place/move components, add tracks/vias, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement, full schematic-to-routed-PCB pipeline
+  - 🔌 **PCB Board Operations** (14 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement, full schematic-to-routed-PCB pipeline
   - 📚 **Library Search** (7 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol, query footprint courtyard dimensions
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
   - ✅ **Design Rule Checks** (4 tools): Run DRC and ERC validations, file-based schematic validation, query board design rules
@@ -231,7 +231,7 @@ python -m kicad_mcp
 
 ## Available Tools
 
-### Project Management (11 tools)
+### Project Management (13 tools)
 - `open_kicad`: Launch KiCad (IPC backend only)
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
@@ -243,6 +243,8 @@ python -m kicad_mcp
 - `set_text_variables`: Set one or more project-level text variables
 - `create_project`: Create a new KiCad project with blank `.kicad_pro`, `.kicad_sch`, and `.kicad_pcb` files
 - `get_pcb_workflow`: Return a structured 11-step PCB design workflow reference (JSON) showing the recommended tool sequence from project creation through DRC
+- `plan_project`: Record a structured project plan (name, goal, BOM, milestones) into a `project_plan.json` file in the project directory
+- `read_project_plan`: Read back the saved project plan for a given project directory
 
 ### Schematic Operations (21 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
@@ -267,18 +269,19 @@ python -m kicad_mcp
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (13 tools)
+### PCB Board Operations (14 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
 - `move_component`: Move an existing component to a new position
 - `add_track`: Add a copper track segment
 - `add_via`: Add a via (through-hole, blind, or buried)
+- `add_board_outline`: Add or replace the Edge.Cuts board outline with a rectangle at the specified origin and size
 - `assign_net`: Assign a net to a component pad
 - `get_design_rules`: Get the board's design rules (clearances, track widths, via sizes)
 - `refill_zones`: Refill all copper pour zones on a board
 - `get_stackup`: Get the layer stackup definition for a board
-- `set_board_design_rules`: Write manufacturing-enforceable design rules into the board's `(setup ...)` section. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
+- `set_board_design_rules`: Write manufacturing-enforceable design rules into the `.kicad_pro` `net_settings.classes` Default entry. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
 - `auto_place`: Geometry-driven bin-packing placement. Reads the courtyard extents for every footprint, sorts by component class (connectors → ICs → discretes → transistors → LEDs → others), and packs components into rows with a guaranteed courtyard-to-courtyard gap ≥ `clearance_mm`.
 - `pcb_pipeline`: Full schematic-to-routed-PCB pipeline in a single call: `sync_schematic_to_pcb` → `set_board_design_rules` → add Edge.Cuts outline → `auto_place` → `autoroute` → `run_drc`.
 
@@ -403,9 +406,10 @@ KiCad-MCP/
 │   └── __main__.py        # CLI entry point
 ├── tests/
 │   ├── integration/       # End-to-end tool tests (run_integration_tests.py)
-│   └── *.py               # Unit tests (191 tests)
+│   └── *.py               # Unit tests (208 tests)
 ├── examples/
-│   └── air_quality_sensor/  # Complete worked example
+│   ├── air_quality_sensor/  # Complete worked example (schematic build script)
+│   └── wearable_aqs/        # Wearable air quality sensor (full schematic + routed PCB)
 ├── pyproject.toml         # Project metadata
 └── README.md
 ```
@@ -441,11 +445,26 @@ python examples/air_quality_sensor/build_schematic.py
 
 The script also demonstrates how to inject a custom symbol library into the file backend's search path, making the SCD41 and SGP41 symbols (not in the standard KiCad library) available to all MCP tools.
 
+### Wearable Air Quality Sensor (complete routed PCB)
+
+`examples/wearable_aqs/` contains a complete KiCad project with schematic, routed PCB, and exported manufacturing files.
+
+**BOM**: ESP32-C3-WROOM-02 (WiFi/BLE MCU) · SCD41 (CO₂/temp/humidity) · SGP41 (VOC/NOx) · AMS1117-3.3 (LDO regulator) · USB-C connector · JST battery connector · decoupling capacitors
+
+**Board**: 60 × 50 mm, 2-layer, JLCPCB rules, 231 tracks, DRC 0 errors
+
+**What it demonstrates**:
+- Full `pcb_pipeline` workflow (schematic → auto-place → autoroute → DRC)
+- `set_board_design_rules` with `"fab_jlcpcb"` preset written to `.kicad_pro`
+- `auto_place` geometry-driven bin-packing with ESP32 courtyard parsed from `fp_line` segments
+- `autoroute` via FreeRouting — complete routing in under 10 seconds
+- `export_gerbers`, `export_drill`, `export_bom` — manufacturing-ready output in `manufacturing/`
+
 ## Troubleshooting
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 70 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 73 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

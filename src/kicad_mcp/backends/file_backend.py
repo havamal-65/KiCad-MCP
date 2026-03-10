@@ -62,20 +62,23 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
     """Parse courtyard rectangle and pad geometry from raw .kicad_mod text.
 
     Returns a dict with:
-      courtyard: {xmin, ymin, xmax, ymax} (from F.CrtYd/B.CrtYd fp_rect), or None
+      courtyard: {xmin, ymin, xmax, ymax} (from F.CrtYd/B.CrtYd fp_rect or fp_line), or None
       width_mm: courtyard width in mm (0.0 if no courtyard found)
       height_mm: courtyard height in mm (0.0 if no courtyard found)
       pads: list of {number, x, y, width, height}
     """
     courtyard: dict[str, float] | None = None
     pads: list[dict[str, Any]] = []
+    fp_line_xs: list[float] = []
+    fp_line_ys: list[float] = []
 
     start_pat = re.compile(r'\(start\s+([-\d.]+)\s+([-\d.]+)\)')
     end_pat = re.compile(r'\(end\s+([-\d.]+)\s+([-\d.]+)\)')
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)')
     size_pat = re.compile(r'\(size\s+([-\d.]+)\s+([-\d.]+)\)')
+    startend_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
 
-    # Walk the text looking for (fp_rect ...) and (pad ...) top-level tokens.
+    # Walk the text looking for (fp_rect ...), (fp_line ...) and (pad ...) top-level tokens.
     # We use _walk_balanced_parens to get the full balanced block for each.
     i = 0
     n = len(kicad_mod_text)
@@ -109,6 +112,17 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
                 i = end_idx + 1
                 continue
 
+        elif token == 'fp_line':
+            end_idx = _walk_balanced_parens(kicad_mod_text, i)
+            if end_idx is not None:
+                block = kicad_mod_text[i: end_idx + 1]
+                if '"F.CrtYd"' in block or '"B.CrtYd"' in block:
+                    for m in startend_pat.finditer(block):
+                        fp_line_xs.append(float(m.group(1)))
+                        fp_line_ys.append(float(m.group(2)))
+                i = end_idx + 1
+                continue
+
         elif token == 'pad':
             end_idx = _walk_balanced_parens(kicad_mod_text, i)
             if end_idx is not None:
@@ -132,6 +146,13 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
                 continue
 
         i += 1
+
+    # If fp_rect didn't provide a courtyard, fall back to fp_line segments
+    if courtyard is None and fp_line_xs:
+        courtyard = {
+            "xmin": min(fp_line_xs), "ymin": min(fp_line_ys),
+            "xmax": max(fp_line_xs), "ymax": max(fp_line_ys),
+        }
 
     width_mm = (courtyard["xmax"] - courtyard["xmin"]) if courtyard else 0.0
     height_mm = (courtyard["ymax"] - courtyard["ymin"]) if courtyard else 0.0
@@ -599,35 +620,44 @@ class FileBoardOps(BoardOps):
         start, end = location
         block = content[start:end + 1]
 
-        # Find the pad sub-block
+        # Find ALL pad sub-blocks matching this pad number (footprints like
+        # ESP32-C3-WROOM-02 define multiple physical holes for one logical pad,
+        # e.g. a thermal via array — all must receive the same net).
         escaped_pad = re.escape(pad)
         pad_pattern = re.compile(rf'\(pad\s+"{escaped_pad}"\s')
-        pad_match = pad_pattern.search(block)
-        if pad_match is None:
+        pad_matches = list(pad_pattern.finditer(block))
+        if not pad_matches:
             # Try unquoted pad number
             pad_pattern = re.compile(rf'\(pad\s+{escaped_pad}\s')
-            pad_match = pad_pattern.search(block)
-        if pad_match is None:
+            pad_matches = list(pad_pattern.finditer(block))
+        if not pad_matches:
             raise ValueError(f"Pad '{pad}' not found in footprint '{reference}'")
 
-        pad_start = pad_match.start()
-        pad_end_abs = _walk_balanced_parens(block, pad_start)
-        if pad_end_abs is None:
-            raise ValueError(f"Unbalanced pad block for pad '{pad}' in '{reference}'")
-
-        pad_block = block[pad_start:pad_end_abs + 1]
-
-        # Replace or insert (net ...) in the pad block
-        net_in_pad = re.search(r'\(net\s+\d+(?:\s+"[^"]*")?\)', pad_block)
         net_clause = f'(net {net_id} "{net}")'
 
-        if net_in_pad:
-            new_pad_block = pad_block[:net_in_pad.start()] + net_clause + pad_block[net_in_pad.end():]
-        else:
-            # Insert before the closing paren of the pad block
-            new_pad_block = pad_block[:-1] + f" {net_clause})"
+        # Process in reverse order so that earlier positions are unaffected by
+        # insertions/replacements in later parts of the block.
+        new_block = block
+        for pad_match in reversed(pad_matches):
+            pad_start = pad_match.start()
+            pad_end_abs = _walk_balanced_parens(new_block, pad_start)
+            if pad_end_abs is None:
+                continue
 
-        new_block = block[:pad_start] + new_pad_block + block[pad_end_abs + 1:]
+            pad_block = new_block[pad_start:pad_end_abs + 1]
+
+            # Replace or insert (net ...) in the pad block
+            net_in_pad = re.search(r'\(net\s+\d+(?:\s+"[^"]*")?\)', pad_block)
+
+            if net_in_pad:
+                new_pad_block = (
+                    pad_block[:net_in_pad.start()] + net_clause + pad_block[net_in_pad.end():]
+                )
+            else:
+                new_pad_block = pad_block[:-1] + f" {net_clause})"
+
+            new_block = new_block[:pad_start] + new_pad_block + new_block[pad_end_abs + 1:]
+
         content = content[:start] + new_block + content[end + 1:]
         path.write_text(content, encoding="utf-8")
 
@@ -635,6 +665,7 @@ class FileBoardOps(BoardOps):
             "reference": reference,
             "pad": pad,
             "net": net,
+            "pads_updated": len(pad_matches),
         }
 
 
@@ -663,93 +694,190 @@ class FileBoardOps(BoardOps):
     def set_board_design_rules(
         self, path: Path, preset: str = "class2",
     ) -> dict[str, Any]:
-        """Write IPC design rules into the board's (setup ...) section.
+        """Write design rules into the project's Default netclass.
+
+        KiCad 9 stores netclass constraints in the ``.kicad_pro`` JSON file
+        under ``net_settings.classes``, not in the ``.kicad_pcb`` file.  This
+        method updates the ``Default`` netclass entry in the sibling
+        ``.kicad_pro`` file so that DRC and the router use the preset limits.
+
+        The ``.kicad_pcb`` file is NOT modified.
 
         Args:
-            path: Path to .kicad_pcb file.
+            path: Path to .kicad_pcb file (the sibling .kicad_pro is derived
+                  from this path automatically).
             preset: One of "class2" (IPC-2221 Class 2) or "fab_jlcpcb".
 
         Returns:
             Dict with applied preset name and rule values.
         """
+        import json
+
         rules = self._DESIGN_RULE_PRESETS.get(preset)
         if rules is None:
             raise ValueError(
                 f"Unknown preset '{preset}'. Valid presets: {list(self._DESIGN_RULE_PRESETS)}"
             )
 
-        content = path.read_text(encoding="utf-8")
-
-        # Locate the (setup ...) block
-        setup_start = content.find("(setup")
-        if setup_start == -1:
-            raise ValueError("No (setup ...) section found in board file")
-
-        setup_end = _walk_balanced_parens(content, setup_start)
-        if setup_end is None:
-            raise ValueError("Malformed (setup ...) section — unbalanced parens")
-
-        setup_block = content[setup_start : setup_end + 1]
-
-        # For each rule key, either replace existing value or insert before closing paren
-        simple_rules = {k: v for k, v in rules.items() if k != "courtyard_offset"}
-        courtyard_offset = rules.get("courtyard_offset", 0.25)
-
-        for key, value in simple_rules.items():
-            existing = re.search(rf'\({re.escape(key)}\s+[-\d.]+\)', setup_block)
-            new_clause = f'({key} {value})'
-            if existing:
-                setup_block = setup_block[:existing.start()] + new_clause + setup_block[existing.end():]
-            else:
-                # Insert before the pcbplotparams block or before closing paren
-                pcbplot_pos = setup_block.find("(pcbplotparams")
-                if pcbplot_pos != -1:
-                    # Insert the newline + indent before pcbplotparams
-                    setup_block = (
-                        setup_block[:pcbplot_pos]
-                        + f'    {new_clause}\n    '
-                        + setup_block[pcbplot_pos:]
-                    )
-                else:
-                    last_paren = setup_block.rfind(")")
-                    setup_block = (
-                        setup_block[:last_paren]
-                        + f'    {new_clause}\n  '
-                        + setup_block[last_paren:]
-                    )
-
-        # Handle courtyard_offset — KiCad uses nested form or flat form
-        cyd_existing = re.search(r'\(courtyard_offset\s.*?\)', setup_block, re.DOTALL)
-        cyd_clause = f'(courtyard_offset {courtyard_offset})'
-        if cyd_existing:
-            setup_block = (
-                setup_block[:cyd_existing.start()]
-                + cyd_clause
-                + setup_block[cyd_existing.end():]
+        pro_path = path.with_suffix(".kicad_pro")
+        if not pro_path.exists():
+            raise FileNotFoundError(
+                f"No .kicad_pro file found alongside {path}. "
+                "Create the project first with create_project."
             )
-        else:
-            pcbplot_pos = setup_block.find("(pcbplotparams")
-            if pcbplot_pos != -1:
-                setup_block = (
-                    setup_block[:pcbplot_pos]
-                    + f'    {cyd_clause}\n    '
-                    + setup_block[pcbplot_pos:]
-                )
-            else:
-                last_paren = setup_block.rfind(")")
-                setup_block = (
-                    setup_block[:last_paren]
-                    + f'    {cyd_clause}\n  '
-                    + setup_block[last_paren:]
-                )
 
-        content = content[:setup_start] + setup_block + content[setup_end + 1:]
-        path.write_text(content, encoding="utf-8")
+        pro = json.loads(pro_path.read_text(encoding="utf-8"))
+
+        # Ensure the net_settings.classes list exists
+        net_settings = pro.setdefault("net_settings", {})
+        classes = net_settings.setdefault("classes", [])
+
+        # Find or create the Default netclass entry
+        default_cls = next((c for c in classes if c.get("name") == "Default"), None)
+        if default_cls is None:
+            default_cls = {
+                "bus_width": 12,
+                "diff_pair_gap": 0.25,
+                "diff_pair_via_gap": 0.25,
+                "diff_pair_width": 0.2,
+                "line_style": 0,
+                "microvia_diameter": 0.3,
+                "microvia_drill": 0.1,
+                "name": "Default",
+                "pcb_color": "rgba(0, 0, 0, 0.000)",
+                "priority": 2147483647,
+                "schematic_color": "rgba(0, 0, 0, 0.000)",
+                "wire_width": 6,
+            }
+            classes.append(default_cls)
+
+        # Apply preset values to Default netclass (controls router behaviour)
+        default_cls["clearance"]    = rules.get("min_clearance", 0.20)
+        default_cls["track_width"]  = rules.get("trace_min", 0.25)
+        default_cls["via_diameter"] = rules.get("via_min_size", 0.60)
+        default_cls["via_drill"]    = rules.get("via_min_drill", 0.30)
+
+        # Also update board DRC minimum rules so they match the netclass.
+        # Without this, DRC rejects the vias/tracks the router just created.
+        design_settings = pro.setdefault("board", {}).setdefault("design_settings", {})
+        drc_rules = design_settings.setdefault("rules", {})
+        drc_rules["min_clearance"]          = rules.get("min_clearance", 0.20)
+        drc_rules["min_track_width"]        = rules.get("trace_min", 0.25)
+        drc_rules["min_via_diameter"]       = rules.get("via_min_size", 0.60)
+        drc_rules["min_via_annular_width"]  = rules.get("via_min_annulus", 0.15)
+        drc_rules["min_through_hole_diameter"] = rules.get("via_min_drill", 0.30)
+        drc_rules["min_hole_clearance"]     = rules.get("hole_clearance", 0.25)
+
+        pro_path.write_text(
+            json.dumps(pro, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        # Also update the .kicad_pcb (setup ...) block — KiCad's DRC reads
+        # these constraints from the PCB file, not just the .kicad_pro.
+        pcb_content = path.read_text(encoding="utf-8")
+        pcb_content = self._upsert_pcb_setup_value(
+            pcb_content, "via_min_size", rules.get("via_min_size", 0.60)
+        )
+        pcb_content = self._upsert_pcb_setup_value(
+            pcb_content, "via_min_drill", rules.get("via_min_drill", 0.30)
+        )
+        pcb_content = self._upsert_pcb_setup_value(
+            pcb_content, "hole_clearance", rules.get("hole_clearance", 0.25)
+        )
+        path.write_text(pcb_content, encoding="utf-8")
 
         return {
             "preset": preset,
             "rules_applied": rules,
         }
+
+    @staticmethod
+    def _upsert_pcb_setup_value(content: str, key: str, value: float) -> str:
+        """Insert or replace a ``(key value)`` line inside the PCB ``(setup ...)`` block.
+
+        If the key already exists it is replaced; if not it is inserted before
+        the closing paren of the setup block.  If there is no setup block the
+        content is returned unchanged.
+        """
+        import re as _re
+        # Replace existing occurrence
+        pattern = _re.compile(rf'\({key}\s+[^\)]+\)')
+        if pattern.search(content):
+            return pattern.sub(f"({key} {value})", content)
+        # Find the setup block and insert before its closing paren
+        setup_start = content.find("(setup")
+        if setup_start == -1:
+            return content
+        setup_end = _walk_balanced_parens(content, setup_start)
+        if setup_end is None:
+            return content
+        # Insert before closing paren of setup block
+        return content[:setup_end] + f"\n\t({key} {value})" + content[setup_end:]
+
+    def add_board_outline(
+        self, path: Path, x: float, y: float, width: float, height: float,
+        line_width: float = 0.05,
+    ) -> dict[str, Any]:
+        """Add a rectangular Edge.Cuts board outline to the PCB file.
+
+        Inserts a ``gr_rect`` element on the Edge.Cuts layer.  Any existing
+        ``gr_rect`` on Edge.Cuts is replaced so the outline stays unique.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            x: Left edge X coordinate in mm.
+            y: Top edge Y coordinate in mm (KiCad Y increases downward).
+            width: Board width in mm.
+            height: Board height in mm.
+            line_width: Outline stroke width in mm (default 0.05).
+
+        Returns:
+            Dict with x, y, width, height, x2, y2.
+        """
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+
+        # Remove any pre-existing gr_rect on Edge.Cuts to avoid duplication
+        gr_start = content.find("(gr_rect")
+        while gr_start != -1:
+            block_end = _walk_balanced_parens(content, gr_start)
+            if block_end is not None:
+                block = content[gr_start:block_end + 1]
+                if '"Edge.Cuts"' in block:
+                    content = content[:gr_start] + content[block_end + 1:]
+                    gr_start = content.find("(gr_rect", gr_start)
+                    continue
+            gr_start = content.find("(gr_rect", gr_start + 1)
+
+        x2 = round(x + width, 6)
+        y2 = round(y + height, 6)
+        outline_uuid = str(_uuid.uuid4())
+        gr_rect = (
+            f'  (gr_rect\n'
+            f'    (start {x} {y})\n'
+            f'    (end {x2} {y2})\n'
+            f'    (stroke\n'
+            f'      (width {line_width})\n'
+            f'      (type solid)\n'
+            f'    )\n'
+            f'    (fill none)\n'
+            f'    (layer "Edge.Cuts")\n'
+            f'    (uuid "{outline_uuid}")\n'
+            f'  )\n'
+        )
+
+        # Insert just before the first footprint or before the final closing paren
+        first_fp = content.find("(footprint ")
+        if first_fp != -1:
+            content = content[:first_fp] + gr_rect + content[first_fp:]
+        else:
+            last_paren = content.rfind(")")
+            content = content[:last_paren] + gr_rect + content[last_paren:]
+
+        path.write_text(content, encoding="utf-8")
+        return {"x": x, "y": y, "width": width, "height": height, "x2": x2, "y2": y2}
 
     def create_board(
         self, path: Path, title: str = "", revision: str = "",

@@ -352,6 +352,48 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def add_board_outline(
+        path: str,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        line_width: float = 0.05,
+    ) -> str:
+        """Add a rectangular Edge.Cuts board outline to the PCB.
+
+        Inserts a gr_rect graphic on the Edge.Cuts layer, which defines the
+        physical board boundary required for fabrication and autorouting.
+        Any existing Edge.Cuts gr_rect is replaced.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            x: Left edge X coordinate in mm (e.g. 3.0 for a 3 mm margin).
+            y: Top edge Y coordinate in mm (KiCad Y increases downward).
+            width: Board width in mm.
+            height: Board height in mm.
+            line_width: Outline stroke width in mm (default 0.05).
+
+        Returns:
+            JSON with x, y, width, height, x2, y2 of the placed outline.
+        """
+        p = validate_kicad_path(path, ".kicad_pcb")
+        validate_positive(width, "width")
+        validate_positive(height, "height")
+        validate_positive(line_width, "line_width")
+
+        backup = create_backup(p)
+        from kicad_mcp.backends.file_backend import FileBoardOps
+        result = FileBoardOps().add_board_outline(p, x, y, width, height, line_width)
+        change_log.record(
+            "add_board_outline",
+            {"path": path, "x": x, "y": y, "width": width, "height": height},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
     def auto_place(
         path: str,
         board_x: float = 3.0,
@@ -507,27 +549,31 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         board_path: str,
         board_width_mm: float = 100.0,
         board_height_mm: float = 80.0,
-        design_rules_preset: str = "class2",
+        design_rules_preset: str = "",
     ) -> str:
-        """Run the complete schematic-to-routed-PCB pipeline in a single call.
+        """Run the schematic-to-routed-PCB pipeline in a single call.
 
-        Executes all PCB design steps in order, with validation between steps:
+        Executes PCB steps in order, with validation between steps:
           1. sync_schematic_to_pcb — place footprints and assign nets
-          2. set_board_design_rules — apply IPC-2221 Class 2 rules
+          2. set_board_design_rules — only if design_rules_preset is non-empty
           3. Add Edge.Cuts board outline (gr_rect)
           4. auto_place — geometry-driven component layout, 0.5 mm clearance
           5. autoroute — FreeRouting auto-router
           6. run_drc — design rule validation
 
-        Use this instead of calling each tool individually to avoid the
-        trial-and-error placement errors that arise from unknown footprint sizes.
+        Design rules should be set at project creation via create_project
+        (pass design_rules_preset there).  Leave design_rules_preset empty
+        here unless working with a project that was created without a preset
+        and you need to apply one now.
 
         Args:
             schematic_path: Path to .kicad_sch file.
             board_path: Path to .kicad_pcb file.
             board_width_mm: Target board width in mm (default 100).
             board_height_mm: Target board height in mm (default 80).
-            design_rules_preset: "class2" (IPC-2221, default) or "fab_jlcpcb".
+            design_rules_preset: Re-apply design rules if non-empty
+                ("class2" or "fab_jlcpcb"). Leave empty (default) if rules
+                were already applied at create_project.
 
         Returns:
             JSON with status, per-step results, drc_passed, and violations list.
@@ -612,16 +658,26 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         except Exception as exc:
             return _fail("sync_schematic_to_pcb", str(exc))
 
-        # ── Step 2: set_board_design_rules ───────────────────────────────────
-        try:
-            dr_result = FileBoardOps().set_board_design_rules(pcb_p, design_rules_preset)
+        # ── Step 2: set_board_design_rules (only if explicitly requested) ────
+        # Rules should already be set by create_project; only re-apply here
+        # if the caller explicitly passes a non-empty preset (e.g. migrating
+        # an older project that was created without a preset).
+        if design_rules_preset:
+            try:
+                dr_result = FileBoardOps().set_board_design_rules(pcb_p, design_rules_preset)
+                pipeline_steps.append({
+                    "step": "set_board_design_rules",
+                    "status": "success",
+                    **dr_result,
+                })
+            except Exception as exc:
+                return _fail("set_board_design_rules", str(exc))
+        else:
             pipeline_steps.append({
                 "step": "set_board_design_rules",
-                "status": "success",
-                **dr_result,
+                "status": "skipped",
+                "note": "Design rules already applied at create_project.",
             })
-        except Exception as exc:
-            return _fail("set_board_design_rules", str(exc))
 
         # ── Step 3: add Edge.Cuts board outline ──────────────────────────────
         try:

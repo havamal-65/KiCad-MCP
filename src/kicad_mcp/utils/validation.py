@@ -13,7 +13,8 @@ from kicad_mcp.models.errors import (
 
 # Reference designator pattern: one or more letters followed by one or more digits
 # Supports multi-unit like U3A, U3B
-REFERENCE_PATTERN = re.compile(r"^[A-Za-z]+\d+[A-Za-z]?$")
+# Also supports KiCad power/flag symbols prefixed with #, e.g. #PWR001, #FLG02
+REFERENCE_PATTERN = re.compile(r"^#?[A-Za-z]+\d+[A-Za-z]?$")
 
 # Net name: alphanumeric, underscores, hyphens, slashes, dots, plus signs
 # Allows hierarchical nets like /sheet1/VCC and differential pairs like USB_D+
@@ -42,7 +43,7 @@ def validate_reference(ref: str) -> str:
     if not ref or not REFERENCE_PATTERN.match(ref):
         raise InvalidReferenceError(
             f"Invalid reference designator: '{ref}'. "
-            "Expected format: letter(s) + number(s), e.g. R1, U3, C10"
+            "Expected format: letter(s) + number(s), e.g. R1, U3, C10, or #PWR001 for power symbols"
         )
     return ref
 

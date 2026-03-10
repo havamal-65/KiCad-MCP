@@ -405,10 +405,11 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         Completely removes the symbol instance block (e.g. the placed R1 resistor)
         from the schematic file. This does NOT remove associated wires or labels.
+        Power symbols such as #PWR001 or #FLG01 can also be removed.
 
         Args:
             path: Path to .kicad_sch file.
-            reference: Reference designator of the component to remove (e.g. 'R1', 'U3').
+            reference: Reference designator of the component to remove (e.g. 'R1', 'U3', '#PWR031').
 
         Returns:
             JSON confirming removal.

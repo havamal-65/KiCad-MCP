@@ -9,7 +9,8 @@
       ],
       "env": {
         "KICAD_MCP_BACKEND": "auto",
-        "KICAD_MCP_LOG_LEVEL": "INFO"
+        "KICAD_MCP_LOG_LEVEL": "INFO",
+        "PYTHONPATH": ""
       }
     }
   }

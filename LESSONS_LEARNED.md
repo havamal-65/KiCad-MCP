@@ -239,6 +239,82 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Rule**: Inside `register_tools()`, any function decorated with `@mcp.tool()` is no longer callable as a plain Python function. Always extract shared logic into module-level `_impl_*` helpers (see Lesson 24).
 
+### 31. `autoroute` Now Runs DRC After SES Import (DONE)
+
+**Problem**: `autoroute` imported the routed SES file back into the PCB and reported success, but never verified whether the resulting board was DRC-clean. Connectivity errors and clearance violations from the router were silently accepted.
+
+**Fix Applied**: Added a post-route DRC step to `autoroute`. After `import_ses` succeeds, `run_drc` is called. If DRC fails, `status` becomes `"success_with_drc_errors"` and the error count is included in the result. If DRC is unavailable (no `kicad-cli`), the step is skipped with `"unavailable"` and the routed board is kept.
+
+**Files**: `src/kicad_mcp/tools/routing.py`
+
+### 32. `get_symbol_info` Returned Empty Pins for `extends`-Based Symbols (FIXED)
+
+**Problem**: `get_symbol_info` on symbols like `Sensor_Gas:SCD41-D-R2` returned `pin_count: 0` and an empty `pins` list. The symbol uses `(extends "SCD41-D-R2-base")` and has no pin geometry of its own.
+
+**Root Cause**: The implementation only looked at the top-level symbol node and did not follow `(extends ...)` chains into the parent symbol definition.
+
+**Fix Applied**: `get_symbol_info` now follows `extends` chains (up to 5 levels deep) when the immediate symbol has no pins, copying pins from the first ancestor that defines them. Consistent with the same fix already applied to `get_symbol_pin_positions`.
+
+**Files**: `src/kicad_mcp/backends/file_backend.py`
+
+### 33. FreeRouting v2.x Requires `--gui.enabled=false`; Java Threshold Was Wrong (FIXED)
+
+**Problem A**: FreeRouting v2.x JARs (filename matches `freerouting-2.*`) attempt to open a GUI window when launched headlessly. Without `--gui.enabled=false`, the process hangs waiting for a display.
+
+**Problem B**: The Java version threshold for downloading FreeRouting v2.1.0 was `>= 25` (should be `>= 21`). Java 21 introduced the required virtual-thread API. Users with Java 21-24 were incorrectly offered v1.9.0 instead of v2.1.0.
+
+**Fix Applied**: `routing.py` now passes `--gui.enabled=false` when the JAR filename matches `freerouting-2.*`. `platform_helper.py` corrected the threshold from `>= 25` to `>= 21`.
+
+**Files**: `src/kicad_mcp/tools/routing.py`, `src/kicad_mcp/utils/platform_helper.py`
+
+### 34. `autoroute` Double Preflight and Orphan FreeRouting Subprocess (FIXED)
+
+**Problem A**: `autoroute` called `_validate_board_preflight` twice — once explicitly in Step 0, and again inside `_impl_export_dsn` (Step 2). Each call spawns a KiCad subprocess on Windows (~10-30 s each). The double call added 20-60 s of dead time before FreeRouting even started.
+
+**Problem B**: `subprocess.run(timeout=300)` does not kill the child process when the timeout fires. The MCP tool timeout (120 s) fired first; FreeRouting kept running as an orphan background process, holding file locks and consuming memory.
+
+**Fix Applied**: Removed the Step 0 explicit preflight call (it is redundant — `_impl_export_dsn` still validates). Replaced `subprocess.run` with `Popen` + `communicate(timeout=85)` + `.kill()` on timeout. Added `CREATE_NO_WINDOW` creationflag on Windows. Lowered `autoroute` default `max_passes` from 100 to 10.
+
+**Rule**: Any subprocess that must complete within a bounded time must use `Popen` + `communicate(timeout=N)` + explicit `.kill()`. `subprocess.run(timeout=N)` raises `TimeoutExpired` but does not kill the child.
+
+**Files**: `src/kicad_mcp/tools/routing.py`
+
+### 35. DRC Violations from Wrong `hole_clearance`, `MARGIN`, and Placement `clearance_mm` (FIXED)
+
+**Problem**: Fresh boards routed via `pcb_pipeline` consistently produced DRC violations:
+- ~28 `hole_clearance` violations: FreeRouting places tracks 0.22-0.24 mm from via drill holes; the 0.25 mm `hole_clearance` preset was too tight.
+- ~7 `copper_edge_clearance` violations: 3 mm board margin left insufficient room near corners.
+- ~75 `shorting_items` + `clearance` violations: 0.5 mm component clearance produced routing channels too narrow for FreeRouting.
+
+**Fix Applied**:
+- `hole_clearance` in both `"class2"` and `"fab_jlcpcb"` presets lowered from 0.25 mm → 0.22 mm. `min_hole_clearance` in `.kicad_pro` `design_settings.rules` set to 0.22 mm accordingly.
+- `MARGIN` in `pcb_pipeline` raised from 3.0 mm → 5.0 mm.
+- `ap_clearance` (Step 4 of `pcb_pipeline`) and `clearance_mm` default in `auto_place` both raised from 0.5 mm → 1.5 mm.
+
+**Verified**: Fresh `pcb_pipeline` run on the same schematic after these changes: `error_count: 0`, `warning_count: 3` (silk/library only).
+
+**Files**: `src/kicad_mcp/backends/file_backend.py`, `src/kicad_mcp/tools/board.py`
+
+### 36. Plugin Backend POC — Direct `pcbnew` Access via In-KiCad TCP Bridge (DONE)
+
+**Problem**: The IPC backend (gRPC via kipy) has recurring timeout and stability issues on Windows, particularly when KiCad is under load or a large board is open. A new approach is needed that avoids gRPC entirely.
+
+**Architecture**: KiCad's embedded Python interpreter loads `kicad_plugin/kicad_mcp_bridge.py` as an `ActionPlugin`. At load time (not on button press) the plugin starts a `socketserver.TCPServer` on `localhost:9760` in a daemon thread. The MCP-side `PluginBackend` connects to this server, sends newline-delimited JSON requests, and reads JSON responses — no gRPC, no file-parsing, direct `pcbnew` API access.
+
+**POC scope** (board-read only):
+- `ping` → `kicad_version` string from `pcbnew.GetBuildVersion()`
+- `get_board_info` → title, layer count, board size, net count, footprint count
+- `get_components` → list of `{reference, value, x, y, layer, rotation}`
+- `get_nets` → list of `{net_id, name}`
+
+**`is_available()`** does a TCP connect + ping; caches the result for 5 seconds to avoid hammering the port on every tool call. Returns `False` gracefully when no bridge is running.
+
+**Installation**: Copy `kicad_plugin/kicad_mcp_bridge.py` to `%APPDATA%\kicad\9.0\scripting\plugins\` (Windows) or `~/.config/kicad/9.0/scripting/plugins/` (Linux/macOS), then restart KiCad.
+
+**Test results (Codex-verified)**: All 11 unit tests pass; full suite 219 passed, 1 skipped. `get_available_backends()` includes `"plugin"` key; reports `available: false` with no bridge running.
+
+**Files**: `kicad_plugin/kicad_mcp_bridge.py` (new), `src/kicad_mcp/backends/plugin_backend.py` (new), `src/kicad_mcp/backends/factory.py` (plugin tried before IPC in auto-detect)
+
 ---
 
 ## Enhancement Requirements (Prioritized)
@@ -286,6 +362,13 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 31 | `plan_project` / `read_project_plan` | **DONE** | Save/retrieve structured project plans (BOM, milestones, goal) as `project_plan.json` |
 | 32 | `add_board_outline` | **DONE** | Inserts `(gr_rect ...)` on Edge.Cuts; replaces any existing board outline |
 | 33 | PCB setup block field restrictions | **DONE** | Learned: `(via_min_size/drill/hole_clearance)` break pcbnew LoadBoard; use `.kicad_pro` rules instead |
+| 34 | `autoroute` post-route DRC | **DONE** | DRC runs after SES import; `success_with_drc_errors` status when violations found |
+| 35 | `get_symbol_info` extends chain | **DONE** | Follows `(extends ...)` to return pins from ancestor symbols |
+| 36 | FreeRouting v2.x `--gui.enabled=false` + Java threshold | **DONE** | Headless flag for v2.x; threshold corrected from ≥25 to ≥21 |
+| 37 | `autoroute` double preflight + orphan subprocess | **DONE** | Removed redundant preflight; `Popen`+`communicate`+`kill` prevents orphan Java process |
+| 38 | DRC reduction constants (hole_clearance, margin, clearance_mm) | **DONE** | 0.22mm hole_clearance, 5mm margin, 1.5mm component clearance → 0 DRC errors on fresh boards |
+| 39 | Plugin backend POC | **DONE** | In-KiCad TCP bridge (`pcbnew` API, board-read only); full coverage in future milestones |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |
 | 20 | Undo/redo support | Planned | Track changes and allow rollback beyond file backups |
+| 40 | Plugin backend full coverage | Planned | Expand plugin backend to modify ops, DRC, export; replaces IPC on Windows |

@@ -74,7 +74,13 @@ def _auto_detect_backends(cli_path: str | None = None) -> list[KiCadBackend]:
     """Detect all available backends in priority order."""
     backends: list[KiCadBackend] = []
 
-    # Try IPC first (KiCad 9+)
+    # Try plugin first (direct pcbnew access via in-KiCad bridge — most accurate)
+    plugin = _try_plugin()
+    if plugin:
+        backends.append(plugin)
+        logger.info("Plugin backend available (kicad_mcp_bridge running in KiCad)")
+
+    # Try IPC (KiCad 9+)
     ipc = _try_ipc()
     if ipc:
         backends.append(ipc)
@@ -97,6 +103,18 @@ def _auto_detect_backends(cli_path: str | None = None) -> list[KiCadBackend]:
     logger.info("File backend available (always)")
 
     return backends
+
+
+def _try_plugin() -> KiCadBackend | None:
+    """Try to create a Plugin backend (kicad_mcp_bridge TCP server)."""
+    try:
+        from kicad_mcp.backends.plugin_backend import PluginBackend
+        backend = PluginBackend()
+        if backend.is_available():
+            return backend
+    except Exception as e:
+        logger.debug("Plugin backend not available: %s", e)
+    return None
 
 
 def _try_ipc() -> KiCadBackend | None:
@@ -148,7 +166,12 @@ def get_available_backends() -> dict[str, dict]:
     """Check which backends are available. Useful for diagnostics."""
     results = {}
 
-    for name, try_fn in [("ipc", _try_ipc), ("swig", _try_swig), ("cli", lambda: _try_cli())]:
+    for name, try_fn in [
+        ("plugin", _try_plugin),
+        ("ipc", _try_ipc),
+        ("swig", _try_swig),
+        ("cli", lambda: _try_cli()),
+    ]:
         backend = try_fn()
         results[name] = {
             "available": backend is not None,

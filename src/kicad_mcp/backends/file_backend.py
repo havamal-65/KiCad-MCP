@@ -677,7 +677,7 @@ class FileBoardOps(BoardOps):
             "via_min_drill": 0.30,
             "via_min_size": 0.60,
             "via_min_annulus": 0.15,
-            "hole_clearance": 0.25,
+            "hole_clearance": 0.22,
             "courtyard_offset": 0.25,
         },
         "fab_jlcpcb": {
@@ -686,7 +686,7 @@ class FileBoardOps(BoardOps):
             "via_min_drill": 0.20,
             "via_min_size": 0.45,
             "via_min_annulus": 0.125,
-            "hole_clearance": 0.25,
+            "hole_clearance": 0.22,
             "courtyard_offset": 0.25,
         },
     }
@@ -757,8 +757,8 @@ class FileBoardOps(BoardOps):
         default_cls["via_diameter"] = rules.get("via_min_size", 0.60)
         default_cls["via_drill"]    = rules.get("via_min_drill", 0.30)
 
-        # Also update board DRC minimum rules so they match the netclass.
-        # Without this, DRC rejects the vias/tracks the router just created.
+        # Also update board DRC minimum rules stored in the project file so
+        # KiCad picks up the same constraints when the project is opened.
         design_settings = pro.setdefault("board", {}).setdefault("design_settings", {})
         drc_rules = design_settings.setdefault("rules", {})
         drc_rules["min_clearance"]          = rules.get("min_clearance", 0.20)
@@ -766,26 +766,12 @@ class FileBoardOps(BoardOps):
         drc_rules["min_via_diameter"]       = rules.get("via_min_size", 0.60)
         drc_rules["min_via_annular_width"]  = rules.get("via_min_annulus", 0.15)
         drc_rules["min_through_hole_diameter"] = rules.get("via_min_drill", 0.30)
-        drc_rules["min_hole_clearance"]     = rules.get("hole_clearance", 0.25)
+        drc_rules["min_hole_clearance"]     = rules.get("hole_clearance", 0.22)
 
         pro_path.write_text(
             json.dumps(pro, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-
-        # Also update the .kicad_pcb (setup ...) block — KiCad's DRC reads
-        # these constraints from the PCB file, not just the .kicad_pro.
-        pcb_content = path.read_text(encoding="utf-8")
-        pcb_content = self._upsert_pcb_setup_value(
-            pcb_content, "via_min_size", rules.get("via_min_size", 0.60)
-        )
-        pcb_content = self._upsert_pcb_setup_value(
-            pcb_content, "via_min_drill", rules.get("via_min_drill", 0.30)
-        )
-        pcb_content = self._upsert_pcb_setup_value(
-            pcb_content, "hole_clearance", rules.get("hole_clearance", 0.25)
-        )
-        path.write_text(pcb_content, encoding="utf-8")
 
         return {
             "preset": preset,
@@ -2562,7 +2548,28 @@ class FileLibraryOps(LibraryOps):
                 for node in tree:
                     if (isinstance(node, list) and len(node) >= 2
                             and node[0] == "symbol" and node[1] == sym_name):
-                        return _parse_symbol_detail(node, lib_name)
+                        result = _parse_symbol_detail(node, lib_name)
+                        # If no pins found, the symbol may use (extends "Parent").
+                        # Walk the extends chain to inherit pins from the parent.
+                        if result.get("pin_count", 0) == 0:
+                            for child in node[1:]:
+                                if (isinstance(child, list) and len(child) >= 2
+                                        and child[0] == "extends"):
+                                    parent_name = child[1]
+                                    result["extends"] = parent_name
+                                    for parent_node in tree:
+                                        if (isinstance(parent_node, list)
+                                                and len(parent_node) >= 2
+                                                and parent_node[0] == "symbol"
+                                                and parent_node[1] == parent_name):
+                                            parent_detail = _parse_symbol_detail(
+                                                parent_node, lib_name,
+                                            )
+                                            result["pins"] = parent_detail.get("pins", [])
+                                            result["pin_count"] = len(result["pins"])
+                                            break
+                                    break
+                        return result
         return {"error": f"Symbol not found: {lib_id}"}
 
     def get_footprint_info(self, lib_id: str) -> dict[str, Any]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -97,6 +98,31 @@ class TestFileBoardOps:
     def test_get_design_rules(self, board_ops: FileBoardOps, sample_board_path: Path):
         rules = board_ops.get_design_rules(sample_board_path)
         assert isinstance(rules, dict)
+
+    def test_set_board_design_rules_keeps_invalid_rule_keys_out_of_pcb(
+        self,
+        board_ops: FileBoardOps,
+        tmp_path: Path,
+    ):
+        pcb_path = tmp_path / "rules_board.kicad_pcb"
+        pro_path = tmp_path / "rules_board.kicad_pro"
+
+        board_ops.create_board(pcb_path, title="Rules Board", revision="1.0")
+        pro_path.write_text("{}", encoding="utf-8")
+
+        result = board_ops.set_board_design_rules(pcb_path, "fab_jlcpcb")
+
+        assert result["preset"] == "fab_jlcpcb"
+
+        project_rules = json.loads(pro_path.read_text(encoding="utf-8"))["board"]["design_settings"]["rules"]
+        assert project_rules["min_via_diameter"] == pytest.approx(0.45)
+        assert project_rules["min_through_hole_diameter"] == pytest.approx(0.2)
+        assert project_rules["min_hole_clearance"] == pytest.approx(0.22)
+
+        pcb_text = pcb_path.read_text(encoding="utf-8")
+        assert "via_min_size" not in pcb_text
+        assert "via_min_drill" not in pcb_text
+        assert "hole_clearance" not in pcb_text
 
 
 class TestFileSchematicOps:

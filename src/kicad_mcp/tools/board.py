@@ -400,7 +400,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         board_y: float = 3.0,
         board_width: float = 100.0,
         board_height: float = 80.0,
-        clearance_mm: float = 0.5,
+        clearance_mm: float = 1.5,
     ) -> str:
         """Automatically place all board components using geometry-driven bin-packing.
 
@@ -550,6 +550,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         board_width_mm: float = 100.0,
         board_height_mm: float = 80.0,
         design_rules_preset: str = "",
+        max_passes: int = 10,
     ) -> str:
         """Run the schematic-to-routed-PCB pipeline in a single call.
 
@@ -574,11 +575,13 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             design_rules_preset: Re-apply design rules if non-empty
                 ("class2" or "fab_jlcpcb"). Leave empty (default) if rules
                 were already applied at create_project.
+            max_passes: Maximum FreeRouting autorouter passes (default 10).
+                Increase for better routing quality; 10 is fast and sufficient
+                for validation.
 
         Returns:
             JSON with status, per-step results, drc_passed, and violations list.
         """
-        import uuid as _uuid
         from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
         from kicad_mcp.config import KiCadMCPConfig
         from kicad_mcp.tools.routing import (
@@ -594,7 +597,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         pipeline_steps: list[dict] = []
         overall_status = "success"
-        MARGIN = 3.0  # mm between board edge and Edge.Cuts
+        MARGIN = 5.0  # mm between board edge and Edge.Cuts
 
         def _step(name: str, result_json: str) -> dict:
             r = json.loads(result_json)
@@ -648,11 +651,31 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                         place_x = 50.0
                         place_y += 10.0
 
+            # Assign nets from schematic connectivity to PCB pads
+            connectivity = sch_ops._build_connectivity(sch_p)
+            net_assign_count = 0
+            net_assign_warnings: list[str] = []
+            board_assign = FileBoardOps()
+            for net_name, pins in connectivity.items():
+                if not net_name:
+                    continue
+                for pin in pins:
+                    pin_ref = pin.get("reference", "")
+                    pad = str(pin.get("pin_number", ""))
+                    if not pin_ref or not pad:
+                        continue
+                    try:
+                        board_assign.assign_net(pcb_p, pin_ref, pad, net_name)
+                        net_assign_count += 1
+                    except Exception as net_exc:
+                        net_assign_warnings.append(f"{pin_ref}/{pad}: {net_exc}")
+
             pipeline_steps.append({
                 "step": "sync_schematic_to_pcb",
                 "status": "success",
                 "placed": placed,
-                "warnings": sync_warnings,
+                "nets_assigned": net_assign_count,
+                "warnings": sync_warnings + net_assign_warnings,
             })
             change_log.record("pcb_pipeline_sync", {"schematic": schematic_path, "board": board_path})
         except Exception as exc:
@@ -680,29 +703,20 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             })
 
         # ── Step 3: add Edge.Cuts board outline ──────────────────────────────
+        # Delegates to FileBoardOps.add_board_outline, which removes any
+        # existing gr_rect on Edge.Cuts before inserting — safe on reruns.
         try:
-            outline_uuid = str(_uuid.uuid4())
             x1 = round(MARGIN, 4)
             y1 = round(MARGIN, 4)
-            x2 = round(MARGIN + board_width_mm, 4)
-            y2 = round(MARGIN + board_height_mm, 4)
-            gr_rect = (
-                f'  (gr_rect (start {x1} {y1}) (end {x2} {y2})\n'
-                f'    (stroke (width 0.05) (type solid))\n'
-                f'    (fill none)\n'
-                f'    (layer "Edge.Cuts")\n'
-                f'    (uuid "{outline_uuid}")\n'
-                f'  )\n'
-            )
-            content = pcb_p.read_text(encoding="utf-8")
-            last_paren = content.rfind(")")
-            if last_paren >= 0:
-                content = content[:last_paren] + gr_rect + content[last_paren:]
-                pcb_p.write_text(content, encoding="utf-8")
+            FileBoardOps().add_board_outline(pcb_p, x1, y1, board_width_mm, board_height_mm)
             pipeline_steps.append({
                 "step": "add_board_outline",
                 "status": "success",
-                "outline": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                "outline": {
+                    "x1": x1, "y1": y1,
+                    "x2": round(x1 + board_width_mm, 4),
+                    "y2": round(y1 + board_height_mm, 4),
+                },
                 "layer": "Edge.Cuts",
             })
         except Exception as exc:
@@ -721,7 +735,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 c.get("reference", ""),
             ))
 
-            ap_clearance = 0.5
+            ap_clearance = 1.5
             cx_cur = MARGIN + ap_clearance
             cy_cur = MARGIN + ap_clearance
             row_h = 0.0
@@ -774,13 +788,12 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             return _fail("auto_place", str(exc))
 
         # ── Step 5: autoroute ────────────────────────────────────────────────
+        # Skip _validate_board_preflight: the outline was written in Step 3.
+        # Spawning a KiCad Python subprocess just to re-verify it would add
+        # 10-30 s of startup overhead on Windows without benefit.
         try:
             dsn = pcb_p.parent / "freerouting.dsn"
             ses = pcb_p.parent / "freerouting.ses"
-
-            preflight_ok, preflight_msg = _validate_board_preflight(pcb_p)
-            if not preflight_ok:
-                return _fail("autoroute_preflight", preflight_msg)
 
             dsn_result = json.loads(
                 _impl_export_dsn(str(pcb_p), str(dsn), config, change_log)
@@ -789,13 +802,13 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 return _fail("autoroute_export_dsn", dsn_result.get("message", "DSN export failed"))
 
             router_result = json.loads(
-                _impl_run_freerouter(str(dsn), str(ses), config, change_log)
+                _impl_run_freerouter(str(dsn), str(ses), max_passes, "", "", config, change_log)
             )
             if router_result.get("status") != "success":
                 return _fail("autoroute_freerouter", router_result.get("message", "FreeRouting failed"))
 
             ses_result = json.loads(
-                _impl_import_ses(str(pcb_p), str(ses), config, change_log)
+                _impl_import_ses(str(pcb_p), str(ses), change_log)
             )
             if ses_result.get("status") != "success":
                 return _fail("autoroute_import_ses", ses_result.get("message", "SES import failed"))

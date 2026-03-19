@@ -19,7 +19,8 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - 🔀 **Auto-Routing** (5 tools): PCB trace auto-routing via FreeRouting (optional, requires FreeRouting)
 
 - **Multiple Backend Support**:
-  - **IPC Backend**: Direct communication with running KiCad instance
+  - **Plugin Backend**: TCP bridge to KiCad's embedded Python — direct `pcbnew` API access, no gRPC (POC)
+  - **IPC Backend**: Direct communication with running KiCad instance via gRPC
   - **SWIG Backend**: Native Python bindings (requires `kicad-python`)
   - **CLI Backend**: Uses `kicad-cli` command-line tool
   - **File Backend**: Pure Python file parsing (no KiCad installation required)
@@ -166,7 +167,38 @@ mcp.run(transport="stdio")
 
 ## Client Integration
 
-The repo ships bootstrap scripts (`run.ps1` for Windows, `run.sh` for macOS/Linux) that automatically create a virtual environment and install all dependencies on first run — no manual setup needed.
+The repo ships bootstrap scripts (`run.ps1` for Windows, `run.sh` for macOS/Linux) that automatically create a virtual environment and install all dependencies on first run, and they clear inherited `PYTHONHOME` / `PYTHONPATH` overrides so MCP clients use the repo's venv instead of global Python packages.
+
+### Codex CLI
+
+Register the server once with `codex mcp add`:
+
+Windows:
+
+```powershell
+codex mcp add kicad `
+  --env KICAD_MCP_BACKEND=auto `
+  --env KICAD_MCP_LOG_LEVEL=INFO `
+  -- "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+  -ExecutionPolicy Bypass `
+  -NonInteractive `
+  -File "C:\path\to\KiCad-MCP\run.ps1"
+```
+
+macOS / Linux:
+
+```bash
+codex mcp add kicad \
+  --env KICAD_MCP_BACKEND=auto \
+  --env KICAD_MCP_LOG_LEVEL=INFO \
+  -- /path/to/KiCad-MCP/run.sh
+```
+
+Verify with:
+
+```bash
+codex mcp get kicad
+```
 
 ### Claude Code (recommended)
 
@@ -336,23 +368,25 @@ These tools provide automated PCB trace routing capabilities:
 
 When using `auto` backend selection, the server tries backends in this order:
 
-1. **IPC** - Fastest, requires running KiCad instance
-2. **SWIG** - Fast, requires kicad-python package
-3. **CLI** - Moderate, requires kicad-cli tool
-4. **File** - Slowest, pure Python parsing
+1. **Plugin** - Direct `pcbnew` API via in-KiCad TCP bridge (POC; board-read only)
+2. **IPC** - Full KiCad 9+ gRPC API, requires running KiCad instance
+3. **SWIG** - Fast, requires kicad-python package
+4. **CLI** - Moderate, requires kicad-cli tool
+5. **File** - Pure Python parsing, always available
 
 ### Backend Capabilities
 
-| Feature | IPC | SWIG | CLI | File |
-|---------|-----|------|-----|------|
-| Read Files | ✅ | ✅ | ✅ | ✅ |
-| Modify Files | ✅ | ✅ | ⚠️ | ⚠️ |
-| Export | ✅ | ✅ | ✅ | ❌ |
-| DRC/ERC | ✅ | ✅ | ✅ | ❌ |
-| Live KiCad | ✅ | ❌ | ❌ | ❌ |
-| No KiCad Required | ❌ | ❌ | ❌ | ✅ |
+| Feature | Plugin | IPC | SWIG | CLI | File |
+|---------|--------|-----|------|-----|------|
+| Read Files | ⚠️ | ✅ | ✅ | ✅ | ✅ |
+| Modify Files | ❌ | ✅ | ✅ | ⚠️ | ⚠️ |
+| Export | ❌ | ✅ | ✅ | ✅ | ❌ |
+| DRC/ERC | ❌ | ✅ | ✅ | ✅ | ❌ |
+| Live KiCad | ✅ | ✅ | ❌ | ❌ | ❌ |
+| No KiCad Required | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 ⚠️ = Limited support
+Plugin backend is a POC — board-read only (`get_board_info`, `get_components`, `get_nets`). Modify/export/DRC expand in future milestones.
 
 ## Development
 
@@ -404,9 +438,11 @@ KiCad-MCP/
 │   ├── config.py          # Configuration
 │   ├── server.py          # MCP server setup
 │   └── __main__.py        # CLI entry point
+├── kicad_plugin/
+│   └── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge for plugin backend
 ├── tests/
 │   ├── integration/       # End-to-end tool tests (run_integration_tests.py)
-│   └── *.py               # Unit tests (208 tests)
+│   └── *.py               # Unit tests (219 tests)
 ├── examples/
 │   ├── air_quality_sensor/  # Complete worked example (schematic build script)
 │   └── wearable_aqs/        # Wearable air quality sensor (full schematic + routed PCB)
@@ -468,10 +504,30 @@ The script also demonstrates how to inject a custom symbol library into the file
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 
+### Plugin Backend Setup (optional)
+
+The plugin backend gives the MCP direct access to `pcbnew`'s in-memory board data while KiCad is open, with no gRPC overhead. It is a POC covering board-read operations only.
+
+**Install** (copy to KiCad's plugin directory, then restart KiCad):
+
+Windows:
+```powershell
+Copy-Item D:\GitHub\KiCad-MCP\kicad_plugin\kicad_mcp_bridge.py `
+  "$env:APPDATA\kicad\9.0\scripting\plugins\"
+```
+
+macOS / Linux:
+```bash
+cp kicad_plugin/kicad_mcp_bridge.py ~/.config/kicad/9.0/scripting/plugins/
+```
+
+After restarting KiCad and the MCP server, `get_backend_info()` should report `"plugin"` as the active backend when a board is open. Port is configurable via `KICAD_MCP_PLUGIN_PORT` (default `9760`).
+
 ### Backend Not Available
 
 Run `python -m kicad_mcp --check` to see which backends are available. Install missing dependencies:
 
+- Plugin: Copy `kicad_plugin/kicad_mcp_bridge.py` to KiCad's scripting/plugins directory and restart KiCad
 - IPC: Requires KiCad to be running
 - SWIG: activate the venv then `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH

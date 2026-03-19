@@ -472,11 +472,12 @@ def download_freerouting(target_dir: Path | None = None) -> Path | None:
     java = find_java()
     java_version = detect_java_major_version(java) if java else None
 
-    if java_version and java_version >= 25:
+    if java_version and java_version >= 21:
+        # v2.1.0 requires Java 21+
         jar_name = "freerouting-2.1.0.jar"
         url = "https://github.com/freerouting/freerouting/releases/download/v2.1.0/freerouting-2.1.0.jar"
     else:
-        # v1.9.0 is the last version compatible with Java 17
+        # v1.9.0 is the last version compatible with Java 17-20
         jar_name = "freerouting-1.9.0.jar"
         url = "https://github.com/freerouting/freerouting/releases/download/v1.9.0/freerouting-1.9.0.jar"
 

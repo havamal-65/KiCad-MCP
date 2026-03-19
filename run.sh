@@ -17,6 +17,11 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_DIR/.venv"
 VENV_PYTHON="$VENV_DIR/bin/python"
 
+# Ignore global Python overrides so the venv's pinned dependencies win.
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+export FASTMCP_LOG_ENABLED="${FASTMCP_LOG_ENABLED:-false}"
+
 ensure_venv() {
     if [ ! -x "$VENV_PYTHON" ]; then
         echo "[kicad-mcp] Creating virtual environment at $VENV_DIR ..." >&2

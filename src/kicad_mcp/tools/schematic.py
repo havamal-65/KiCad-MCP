@@ -605,11 +605,13 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
 
-        sch_ops = backend.get_schematic_ops()
-        pcb_ops = backend.get_board_ops()
+        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
-        sch_data = sch_ops.read_schematic(sch_p)
-        pcb_data = pcb_ops.read_board(pcb_p)
+        # Always use file-backend reads: compare_schematic_pcb is read-only and
+        # IPC read_board on a large routed board can hang (serializing hundreds
+        # of tracks through the gRPC layer adds seconds and risks timeouts).
+        sch_data = FileSchematicOps().read_schematic(sch_p)
+        pcb_data = FileBoardOps().read_board(pcb_p)
 
         # Build dicts keyed by reference, filtering out power symbols.
         # Multi-unit components appear once per unit; merge so the footprint
@@ -900,13 +902,14 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     "message": f"{ref} exists in PCB but not in schematic.",
                 })
 
-        # Check mismatches for components in both
-        for ref in sorted(set(sch_by_ref) & set(pcb_by_ref)):
+        # Check mismatches for pre-existing components, and update values for all
+        # (including newly placed, which start with the footprint name as Value).
+        for ref in sorted(set(sch_by_ref) & (set(pcb_by_ref) | placed_refs)):
             sch_sym = sch_by_ref[ref]
-            pcb_comp = pcb_by_ref[ref]
+            pcb_comp = pcb_by_ref.get(ref)
 
             sch_fp = sch_sym.get("footprint", "")
-            pcb_fp = pcb_comp.get("footprint", "")
+            pcb_fp = pcb_comp.get("footprint", "") if pcb_comp else ""
             if sch_fp and pcb_fp and sch_fp != pcb_fp:
                 warnings.append({
                     "type": "footprint_mismatch",
@@ -917,8 +920,8 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 })
 
             sch_val = sch_sym.get("value", "")
-            pcb_val = pcb_comp.get("value", "")
-            if sch_val and pcb_val and sch_val != pcb_val:
+            pcb_val = pcb_comp.get("value", "") if pcb_comp else ""
+            if sch_val and sch_val != pcb_val:
                 # Update PCB value
                 if board_modify_ops is not None:
                     try:
@@ -976,95 +979,136 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                         "message": f"{ref} value mismatch (board modify not available).",
                     })
 
-        # Propagate schematic pin nets to PCB pads when connectivity queries are available.
+        # Propagate schematic pin nets to PCB pads.
+        # Use _build_connectivity to resolve all nets in one pass when available
+        # (avoids re-parsing the schematic file O(N×M) times via per-pin get_pin_net).
         if board_modify_ops is not None:
-            net_assignments: list[dict[str, str]] = []
-            net_queries_supported = True
-
-            for ref in sorted(sch_by_ref):
-                # Only assign nets to components known to exist in PCB (pre-existing or newly placed).
-                if ref not in pcb_by_ref and ref not in placed_refs:
-                    continue
-
+            if hasattr(sch_ops, "_build_connectivity"):
                 try:
-                    pin_info = sch_ops.get_symbol_pin_positions(sch_p, ref)
-                except NotImplementedError:
-                    net_queries_supported = False
-                    break
-                except Exception:
-                    continue
+                    connectivity = sch_ops._build_connectivity(sch_p)
+                except Exception as conn_exc:
+                    connectivity = {}
+                    warnings.append({
+                        "type": "net_sync_failed",
+                        "message": f"Could not build schematic connectivity: {conn_exc}",
+                    })
+                seen_keys: set[tuple[str, str, str]] = set()
+                net_sync_aborted = False
+                for net_name, pins in connectivity.items():
+                    if net_sync_aborted:
+                        break
+                    if not net_name or net_name.strip().lower() == "none":
+                        continue
+                    for pin in pins:
+                        ref = pin.get("reference", "")
+                        pad = str(pin.get("pin_number", ""))
+                        if not ref or not pad or ref not in sch_by_ref:
+                            continue
+                        key = (ref, pad, net_name)
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        try:
+                            board_modify_ops.assign_net(pcb_p, ref, pad, net_name)
+                            actions.append({
+                                "type": "net_assigned",
+                                "reference": ref,
+                                "pad": pad,
+                                "net": net_name,
+                            })
+                        except NotImplementedError:
+                            warnings.append({
+                                "type": "net_sync_not_supported",
+                                "message": "Board backend does not support assigning nets to pads.",
+                            })
+                            net_sync_aborted = True
+                            break
+                        except Exception as exc:
+                            warnings.append({
+                                "type": "net_assign_failed",
+                                "reference": ref,
+                                "pad": pad,
+                                "net": net_name,
+                                "message": str(exc),
+                            })
+            else:
+                # IPC backend: fall back to per-pin queries
+                net_assignments: list[dict[str, str]] = []
+                net_queries_supported = True
 
-                if not isinstance(pin_info, dict):
-                    continue
-                pin_positions = pin_info.get("pin_positions", {})
-                if not isinstance(pin_positions, dict):
-                    continue
-
-                for pin_number in sorted(pin_positions, key=lambda p: str(p)):
-                    pin_number_str = str(pin_number)
+                for ref in sorted(sch_by_ref):
+                    if ref not in pcb_by_ref and ref not in placed_refs:
+                        continue
                     try:
-                        pin_net = sch_ops.get_pin_net(sch_p, ref, pin_number_str)
+                        pin_info = sch_ops.get_symbol_pin_positions(sch_p, ref)
                     except NotImplementedError:
                         net_queries_supported = False
                         break
                     except Exception:
                         continue
-
-                    if not isinstance(pin_net, dict):
+                    if not isinstance(pin_info, dict):
                         continue
-                    net_name = pin_net.get("net_name", "")
-                    if not isinstance(net_name, str) or not net_name:
+                    pin_positions = pin_info.get("pin_positions", {})
+                    if not isinstance(pin_positions, dict):
                         continue
-                    if net_name.strip().lower() == "none":
-                        continue
-
-                    net_assignments.append({
-                        "reference": ref,
-                        "pad": pin_number_str,
-                        "net": net_name,
-                    })
+                    for pin_number in sorted(pin_positions, key=lambda p: str(p)):
+                        pin_number_str = str(pin_number)
+                        try:
+                            pin_net = sch_ops.get_pin_net(sch_p, ref, pin_number_str)
+                        except NotImplementedError:
+                            net_queries_supported = False
+                            break
+                        except Exception:
+                            continue
+                        if not isinstance(pin_net, dict):
+                            continue
+                        net_name = pin_net.get("net_name", "")
+                        if not isinstance(net_name, str) or not net_name:
+                            continue
+                        if net_name.strip().lower() == "none":
+                            continue
+                        net_assignments.append({
+                            "reference": ref,
+                            "pad": pin_number_str,
+                            "net": net_name,
+                        })
+                    if not net_queries_supported:
+                        break
 
                 if not net_queries_supported:
-                    break
-
-            if not net_queries_supported:
-                warnings.append({
-                    "type": "net_sync_not_supported",
-                    "message": "Schematic backend does not support pin/net connectivity queries.",
-                })
-            else:
-                seen_assignments: set[tuple[str, str, str]] = set()
-                for assignment in net_assignments:
-                    key = (assignment["reference"], assignment["pad"], assignment["net"])
-                    if key in seen_assignments:
-                        continue
-                    seen_assignments.add(key)
-
-                    try:
-                        board_modify_ops.assign_net(
-                            pcb_p,
-                            assignment["reference"],
-                            assignment["pad"],
-                            assignment["net"],
-                        )
-                        actions.append({
-                            "type": "net_assigned",
-                            **assignment,
-                        })
-                    except NotImplementedError:
-                        warnings.append({
-                            "type": "net_sync_not_supported",
-                            "message": "Board backend does not support assigning nets to pads.",
-                        })
-                        break
-                    except Exception as exc:
-                        warnings.append({
-                            "type": "net_assign_failed",
-                            "reference": assignment["reference"],
-                            "pad": assignment["pad"],
-                            "net": assignment["net"],
-                            "message": str(exc),
-                        })
+                    warnings.append({
+                        "type": "net_sync_not_supported",
+                        "message": "Schematic backend does not support pin/net connectivity queries.",
+                    })
+                else:
+                    seen_assignments: set[tuple[str, str, str]] = set()
+                    for assignment in net_assignments:
+                        key = (assignment["reference"], assignment["pad"], assignment["net"])
+                        if key in seen_assignments:
+                            continue
+                        seen_assignments.add(key)
+                        try:
+                            board_modify_ops.assign_net(
+                                pcb_p,
+                                assignment["reference"],
+                                assignment["pad"],
+                                assignment["net"],
+                            )
+                            actions.append({"type": "net_assigned", **assignment})
+                        except NotImplementedError:
+                            warnings.append({
+                                "type": "net_sync_not_supported",
+                                "message": "Board backend does not support assigning nets to pads.",
+                            })
+                            break
+                        except Exception as exc:
+                            warnings.append({
+                                "type": "net_assign_failed",
+                                "reference": assignment["reference"],
+                                "pad": assignment["pad"],
+                                "net": assignment["net"],
+                                "message": str(exc),
+                            })
         else:
             if any(ref in pcb_by_ref or ref in placed_refs for ref in sch_by_ref):
                 warnings.append({

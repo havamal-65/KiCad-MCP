@@ -654,9 +654,16 @@ def _impl_run_freerouter(
                        "or set KICAD_MCP_FREEROUTING_JAR environment variable.",
         })
 
+    # v2.x requires --gui.enabled=false for headless/batch mode;
+    # v1.x runs headlessly when -de/-do are provided without this flag.
+    jar_is_v2 = re.search(r"freerouting-2\.", jar.name) is not None
     cmd = [
         str(java),
         "-jar", str(jar),
+    ]
+    if jar_is_v2:
+        cmd.append("--gui.enabled=false")
+    cmd += [
         "-de", str(dsn),
         "-do", str(ses),
         "-mp", str(max_passes),
@@ -664,26 +671,37 @@ def _impl_run_freerouter(
 
     logger.info("Running FreeRouting: %s", " ".join(cmd))
 
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
         )
-    except subprocess.TimeoutExpired:
-        return json.dumps({
-            "status": "error",
-            "message": "FreeRouting timed out after 300 seconds",
-        })
     except OSError as e:
         return json.dumps({
             "status": "error",
             "message": f"Failed to run FreeRouting: {e}",
         })
 
-    combined_output = (result.stdout or "") + (result.stderr or "")
+    try:
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=85)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return json.dumps({
+            "status": "error",
+            "message": (
+                f"FreeRouting timed out after 85 seconds (max_passes={max_passes}). "
+                "Try a lower max_passes value."
+            ),
+        })
+
+    combined_output = (
+        stdout_bytes.decode(errors="replace") + stderr_bytes.decode(errors="replace")
+    )
 
     # Parse routing stats from output
     routing_time = None
@@ -930,7 +948,7 @@ def register_tools(
         path: str,
         freerouting_jar: str = "",
         java_path: str = "",
-        max_passes: int = 100,
+        max_passes: int = 10,
         clean_board: bool = True,
     ) -> str:
         """Run the full auto-routing pipeline on a PCB board.
@@ -938,11 +956,15 @@ def register_tools(
         Complete workflow: clean board -> export DSN -> run FreeRouting -> import SES.
         Creates a backup of the board before any modifications.
 
+        Board outline and loadability are validated inside export_dsn — no separate
+        preflight step is needed here.
+
         Args:
             path: Path to .kicad_pcb file.
             freerouting_jar: Path to freerouting JAR. Auto-detected if empty.
             java_path: Path to java executable. Auto-detected if empty.
-            max_passes: Maximum routing passes (default 100).
+            max_passes: Maximum routing passes (default 10). Increase for more
+                complete routing at the cost of longer runtime.
             clean_board: Remove keepouts and bad tracks first (default true).
 
         Returns:
@@ -952,23 +974,6 @@ def register_tools(
         dsn = p.parent / "freerouting.dsn"
         ses = p.parent / "freerouting.ses"
         report: dict = {"status": "success", "steps": []}
-
-        # Step 0: Preflight board validation
-        preflight_ok, preflight_message = _validate_board_preflight(p)
-        if not preflight_ok:
-            report["status"] = "error"
-            report["steps"].append({
-                "step": "preflight",
-                "status": "error",
-                "message": preflight_message,
-            })
-            report["message"] = f"Preflight failed: {preflight_message}"
-            return json.dumps(report, indent=2)
-        report["steps"].append({
-            "step": "preflight",
-            "status": "success",
-            "message": "Board preflight checks passed",
-        })
 
         # Step 1: Clean board (optional)
         if clean_board:
@@ -1015,6 +1020,33 @@ def register_tools(
             report["message"] = (
                 f"Auto-routing complete: {result.get('new_tracks', 0)} tracks routed"
             )
+
+        # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking)
+        if result["status"] == "success":
+            try:
+                drc_ops = backend.get_drc_ops()
+                drc_result = drc_ops.run_drc(p, None)
+                drc_passed = drc_result.get("passed", False)
+                error_count = drc_result.get("error_count", 0)
+                report["steps"].append({
+                    "step": "post_route_drc",
+                    "status": "success",
+                    "passed": drc_passed,
+                    "error_count": error_count,
+                    "warning_count": drc_result.get("warning_count", 0),
+                })
+                if not drc_passed:
+                    report["status"] = "success_with_drc_errors"
+                    report["message"] = (
+                        f"Routed {result.get('new_tracks', 0)} tracks but DRC found "
+                        f"{error_count} error(s) — inspect board before fabrication."
+                    )
+            except Exception as drc_exc:
+                report["steps"].append({
+                    "step": "post_route_drc",
+                    "status": "unavailable",
+                    "message": f"Post-route DRC skipped: {drc_exc}",
+                })
 
         # Clean up temp files
         dsn.unlink(missing_ok=True)

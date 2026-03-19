@@ -602,65 +602,78 @@ class TestCompareSchematicPcb:
     def test_compare_detects_missing_from_pcb(self, mcp_sch: FastMCP,
                                                sample_schematic_path: Path,
                                                sample_board_path: Path):
-        """Mock schematic has R1, U1. Mock PCB has R1, R2, U1.
-        So schematic is missing R2 perspective: nothing missing from PCB
-        since the mock schematic only returns R1 and U1."""
+        """compare_schematic_pcb reads files directly (file backend).
+        sample_schematic has R1 (10k), R2 (4.7k), U1 (ATtiny85).
+        sample_board has R1 (10k), R2 (4.7k), U1 (ATtiny85).
+        All three match; no missing components."""
         result_json = mcp_sch._tool_manager._tools["compare_schematic_pcb"].fn(
             schematic_path=str(sample_schematic_path),
             board_path=str(sample_board_path),
         )
         result = json.loads(result_json)
         summary = result["summary"]
-        # Mock schematic has R1, U1 (2 components)
-        # Mock PCB has R1, R2, U1 (3 components)
-        assert summary["schematic_components"] == 2
+        # Both files have R1, R2, U1 — all match
+        assert summary["schematic_components"] == 3
         assert summary["pcb_components"] == 3
-        # R2 is in PCB but not in schematic
-        assert summary["missing_from_schematic"] == 1
-        assert result["missing_from_schematic"][0]["reference"] == "R2"
+        assert summary["missing_from_pcb"] == 0
+        assert summary["missing_from_schematic"] == 0
 
     def test_compare_logic_directly(self):
-        """Test the comparison logic with controlled data by calling the tool
-        with a custom mock that has mismatches."""
+        """Test the comparison logic using real temp KiCad files.
+        compare_schematic_pcb now uses FileSchematicOps/FileBoardOps directly
+        to avoid IPC hangs on large routed boards, so tests must provide real
+        parseable file content."""
+        import tempfile
+        from kicad_mcp.utils.change_log import ChangeLog
+        from kicad_mcp.tools.schematic import register_tools
         from unittest.mock import MagicMock
 
-        # Build a minimal MCP + backend with controlled data
         mcp = FastMCP("test")
         mock_backend = MagicMock(spec=CompositeBackend)
-
-        sch_ops = MagicMock()
-        sch_ops.read_schematic.return_value = {
-            "symbols": [
-                {"reference": "R1", "value": "10k", "lib_id": "Device:R", "footprint": "R_0805"},
-                {"reference": "R2", "value": "4.7k", "lib_id": "Device:R", "footprint": "R_0603"},
-                {"reference": "C1", "value": "100nF", "lib_id": "Device:C"},
-                {"reference": "#PWR01", "value": "GND", "lib_id": "power:GND", "is_power": True},
-            ],
-        }
-        pcb_ops = MagicMock()
-        pcb_ops.read_board.return_value = {
-            "components": [
-                {"reference": "R1", "value": "10k", "footprint": "R_0805"},
-                {"reference": "R2", "value": "4.7k", "footprint": "R_0805"},  # footprint mismatch
-                {"reference": "U1", "value": "ATmega", "footprint": "TQFP-44"},  # not in schematic
-            ],
-        }
-        mock_backend.get_schematic_ops.return_value = sch_ops
-        mock_backend.get_board_ops.return_value = pcb_ops
-
-        from kicad_mcp.utils.change_log import ChangeLog
         change_log = ChangeLog(Path("/dev/null"))
-
-        from kicad_mcp.tools.schematic import register_tools
         register_tools(mcp, mock_backend, change_log)
 
-        # Need valid file paths for validation — create temp files
-        import tempfile, os
+        # Schematic: R1 (R_0805, 10k), R2 (R_0603, 4.7k), C1 (no fp, 100nF),
+        #            #PWR01 (power:GND, excluded from comparison)
+        sch_content = (
+            "(kicad_sch\n"
+            '  (symbol (lib_id "Device:R") (at 100 100 0)'
+            '    (property "Reference" "R1")'
+            '    (property "Value" "10k")'
+            '    (property "Footprint" "R_0805"))\n'
+            '  (symbol (lib_id "Device:R") (at 100 120 0)'
+            '    (property "Reference" "R2")'
+            '    (property "Value" "4.7k")'
+            '    (property "Footprint" "R_0603"))\n'
+            '  (symbol (lib_id "Device:C") (at 100 140 0)'
+            '    (property "Reference" "C1")'
+            '    (property "Value" "100nF"))\n'
+            '  (symbol (lib_id "power:GND") (at 50 50 0)'
+            '    (property "Reference" "#PWR01")'
+            '    (property "Value" "GND"))\n'
+            ")\n"
+        )
+        # PCB: R1 (R_0805, 10k matches), R2 (R_0805 — fp mismatch with R_0603),
+        #      U1 (extra, not in schematic)
+        pcb_content = (
+            "(kicad_pcb\n"
+            '  (footprint "R_0805" (layer "F.Cu") (at 10 10)'
+            '    (property "Reference" "R1")'
+            '    (property "Value" "10k"))\n'
+            '  (footprint "R_0805" (layer "F.Cu") (at 20 10)'
+            '    (property "Reference" "R2")'
+            '    (property "Value" "4.7k"))\n'
+            '  (footprint "TQFP-44" (layer "F.Cu") (at 30 10)'
+            '    (property "Reference" "U1")'
+            '    (property "Value" "ATmega"))\n'
+            ")\n"
+        )
+
         with tempfile.TemporaryDirectory() as td:
             sch = Path(td) / "test.kicad_sch"
             pcb = Path(td) / "test.kicad_pcb"
-            sch.write_text("(kicad_sch)")
-            pcb.write_text("(kicad_pcb)")
+            sch.write_text(sch_content)
+            pcb.write_text(pcb_content)
 
             result_json = mcp._tool_manager._tools["compare_schematic_pcb"].fn(
                 schematic_path=str(sch),
@@ -691,7 +704,7 @@ class TestCompareSchematicPcb:
         assert fp_mm["schematic_footprint"] == "R_0603"
         assert fp_mm["pcb_footprint"] == "R_0805"
 
-        # R1 matches perfectly, R2 has mismatch => 1 matched
+        # R1 matches perfectly, R2 has fp mismatch => 1 matched
         assert summary["matched"] == 1
 
 

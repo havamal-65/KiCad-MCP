@@ -19,7 +19,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - 🔀 **Auto-Routing** (5 tools): PCB trace auto-routing via FreeRouting (optional, requires FreeRouting)
 
 - **Multiple Backend Support**:
-  - **Plugin Backend**: TCP bridge to KiCad's embedded Python — direct `pcbnew` API access, no gRPC (POC)
+  - **Plugin Backend** *(primary on Windows)*: TCP bridge to KiCad's embedded Python — full board read+write via `pcbnew` API, DRC and export via `kicad-cli`, schematics via file backend
   - **IPC Backend**: Direct communication with running KiCad instance via gRPC
   - **SWIG Backend**: Native Python bindings (requires `kicad-python`)
   - **CLI Backend**: Uses `kicad-cli` command-line tool
@@ -79,22 +79,33 @@ pip install kicad-mcp[dev]
 
 ## Quick Start
 
-### Check Available Backends
+### Plugin Entry Point (recommended on Windows with KiCad 9)
+
+The plugin entry point routes board operations through the in-KiCad TCP bridge (`kicad_mcp_bridge`) and is the primary supported path for live PCB work.
+
+**Prerequisites**: Install the bridge plugin and restart KiCad (see [Plugin Backend Setup](#plugin-backend-setup) below).
 
 ```bash
-python -m kicad_mcp --check
+python -m kicad_mcp_plugin
 ```
 
-This will show:
-- Platform information
-- Python version
-- KiCad CLI availability and version
-- Status of each backend
+### Legacy Entry Point (file/CLI/IPC composite)
+
+```bash
+python -m kicad_mcp --check   # show available backends
+python -m kicad_mcp            # run with auto backend detection
+```
 
 ### Run the Server
 
 #### Stdio Transport (for Claude Desktop, Cursor, etc.)
 
+Plugin entry point:
+```bash
+python -m kicad_mcp_plugin
+```
+
+Legacy composite entry point:
 ```bash
 python -m kicad_mcp
 ```
@@ -102,7 +113,7 @@ python -m kicad_mcp
 #### SSE Transport (for web clients)
 
 ```bash
-python -m kicad_mcp --transport sse --sse-host 127.0.0.1 --sse-port 8765
+python -m kicad_mcp_plugin --transport sse --sse-host 127.0.0.1 --sse-port 8765
 ```
 
 ## Configuration
@@ -167,7 +178,12 @@ mcp.run(transport="stdio")
 
 ## Client Integration
 
-The repo ships bootstrap scripts (`run.ps1` for Windows, `run.sh` for macOS/Linux) that automatically create a virtual environment and install all dependencies on first run, and they clear inherited `PYTHONHOME` / `PYTHONPATH` overrides so MCP clients use the repo's venv instead of global Python packages.
+The repo ships two sets of bootstrap scripts:
+
+- **`run.ps1` / `run.sh`** — legacy composite entry point (`kicad_mcp`)
+- **`run_plugin.ps1` / `run_plugin.sh`** — plugin entry point (`kicad_mcp_plugin`, recommended on Windows with KiCad 9)
+
+Both automatically create a virtual environment and install all dependencies on first run, and they clear inherited `PYTHONHOME` / `PYTHONPATH` overrides so MCP clients use the repo's venv instead of global Python packages.
 
 ### Codex CLI
 
@@ -202,7 +218,7 @@ codex mcp get kicad
 
 ### Claude Code (recommended)
 
-A `.mcp.json` is included at the repo root. Claude Code picks it up automatically when you open the folder, so no manual config is required.
+A `.mcp.json` is included at the repo root. Claude Code picks it up automatically when you open the folder, so no manual config is required. It uses the plugin entry point (`kicad_mcp_plugin`) by default, which requires KiCad to be open with the bridge installed.
 
 ### Claude Desktop — Windows
 
@@ -364,11 +380,22 @@ These tools provide automated PCB trace routing capabilities:
 
 ## Backend Details
 
-### Backend Priority
+### Plugin Entry Point Backend Routing
 
-When using `auto` backend selection, the server tries backends in this order:
+`kicad_mcp_plugin` (the recommended entry point on Windows) uses `PluginDirectBackend` with fixed routing — no auto-detection fallbacks:
 
-1. **Plugin** - Direct `pcbnew` API via in-KiCad TCP bridge (POC; board-read only)
+| Operation | Backend |
+|-----------|---------|
+| Board read/write (place, move, track, via, zones, outline, DSN/SES) | Plugin bridge (TCP → `pcbnew`) |
+| Schematic read/write | File backend |
+| DRC / export (Gerbers, drill, BOM, PDF) | kicad-cli |
+| Library search / management | File backend |
+
+### Legacy Composite Backend Priority
+
+When using `python -m kicad_mcp` with `--backend auto`, backends are tried in this priority order:
+
+1. **Plugin** - Direct `pcbnew` API via in-KiCad TCP bridge
 2. **IPC** - Full KiCad 9+ gRPC API, requires running KiCad instance
 3. **SWIG** - Fast, requires kicad-python package
 4. **CLI** - Moderate, requires kicad-cli tool
@@ -378,15 +405,17 @@ When using `auto` backend selection, the server tries backends in this order:
 
 | Feature | Plugin | IPC | SWIG | CLI | File |
 |---------|--------|-----|------|-----|------|
-| Read Files | ⚠️ | ✅ | ✅ | ✅ | ✅ |
-| Modify Files | ❌ | ✅ | ✅ | ⚠️ | ⚠️ |
-| Export | ❌ | ✅ | ✅ | ✅ | ❌ |
-| DRC/ERC | ❌ | ✅ | ✅ | ✅ | ❌ |
+| Board Read | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Board Modify | ✅ | ✅ | ✅ | ⚠️ | ⚠️ |
+| Export | ✅¹ | ✅ | ✅ | ✅ | ❌ |
+| DRC/ERC | ✅¹ | ✅ | ✅ | ✅ | ❌ |
+| Schematic | ✅² | ✅ | ❌ | ⚠️ | ✅ |
 | Live KiCad | ✅ | ✅ | ❌ | ❌ | ❌ |
 | No KiCad Required | ❌ | ❌ | ❌ | ❌ | ✅ |
 
-⚠️ = Limited support
-Plugin backend is a POC — board-read only (`get_board_info`, `get_components`, `get_nets`). Modify/export/DRC expand in future milestones.
+⚠️ = Limited support  
+¹ Plugin entry point routes export/DRC to kicad-cli  
+² Plugin entry point routes schematic ops to file backend
 
 ## Development
 
@@ -430,22 +459,29 @@ mypy src
 ```
 KiCad-MCP/
 ├── src/kicad_mcp/
-│   ├── backends/          # Backend implementations
-│   ├── models/            # Data models
+│   ├── backends/          # Backend implementations (composite, plugin, CLI, SWIG, file, IPC)
+│   ├── models/            # Data models and error types
 │   ├── resources/         # MCP resources
-│   ├── tools/             # MCP tools
-│   ├── utils/             # Utilities
+│   ├── tools/             # MCP tools (board, schematic, export, routing, library, DRC, project)
+│   ├── utils/             # Utilities (platform detection, sexp parser, validation)
 │   ├── config.py          # Configuration
-│   ├── server.py          # MCP server setup
-│   └── __main__.py        # CLI entry point
+│   ├── server.py          # MCP server setup (legacy composite entry point)
+│   └── __main__.py        # CLI entry point: python -m kicad_mcp
+├── src/kicad_mcp_plugin/
+│   ├── backends/
+│   │   └── plugin_direct.py  # PluginDirectBackend — explicit routing, no fallbacks
+│   ├── config.py          # Plugin entry point config (KICAD_PLUGIN_ env prefix)
+│   ├── server.py          # Plugin MCP server setup
+│   └── __main__.py        # CLI entry point: python -m kicad_mcp_plugin
 ├── kicad_plugin/
-│   └── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge for plugin backend
-├── tests/
-│   ├── integration/       # End-to-end tool tests (run_integration_tests.py)
-│   └── *.py               # Unit tests (219 tests)
+│   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
+│   └── install_bridge.ps1   # PowerShell installer (Windows, PowerShell 7+)
 ├── examples/
 │   ├── air_quality_sensor/  # Complete worked example (schematic build script)
-│   └── wearable_aqs/        # Wearable air quality sensor (full schematic + routed PCB)
+│   ├── wearable_aqs/        # Wearable AQS (full schematic + routed PCB, E2E verified)
+│   └── usb_c_power_breakout_20260406_try3/  # USB-C breakout (pcb_pipeline E2E, plugin backend)
+├── run_plugin.ps1         # Windows launcher for kicad_mcp_plugin (auto-creates venv)
+├── run_plugin.sh          # macOS/Linux launcher for kicad_mcp_plugin
 ├── pyproject.toml         # Project metadata
 └── README.md
 ```
@@ -496,6 +532,19 @@ The script also demonstrates how to inject a custom symbol library into the file
 - `autoroute` via FreeRouting — complete routing in under 10 seconds
 - `export_gerbers`, `export_drill`, `export_bom` — manufacturing-ready output in `manufacturing/`
 
+### USB-C Power Breakout (plugin backend E2E)
+
+`examples/usb_c_power_breakout_20260406_try3/` contains a complete board created end-to-end via the plugin entry point, with the `kicad_mcp_bridge` providing live `pcbnew` access throughout.
+
+**BOM**: USB-C connector · AMS1117-3.3 LDO · decoupling capacitors · protection diode · status LED
+
+**Board**: ~40 × 25 mm, 2-layer, 6 footprints, 6 nets, copper routed, DRC clean
+
+**What it demonstrates**:
+- `pcb_pipeline` end-to-end via the plugin backend (`pcbnew` TCP bridge for all board ops)
+- `drc_passed: true` on a fully plugin-driven board
+- BOM export via `export_bom`
+
 ## Troubleshooting
 
 ### Does KiCad-MCP require FreeRouting?
@@ -504,30 +553,49 @@ The script also demonstrates how to inject a custom symbol library into the file
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 
-### Plugin Backend Setup (optional)
+### Plugin Backend Setup
 
-The plugin backend gives the MCP direct access to `pcbnew`'s in-memory board data while KiCad is open, with no gRPC overhead. It is a POC covering board-read operations only.
+The plugin backend gives the MCP direct live access to `pcbnew`'s in-memory board data while KiCad is open, with no gRPC overhead. It is the primary recommended path on Windows with KiCad 9.
 
-**Install** (copy to KiCad's plugin directory, then restart KiCad):
+**Install (Windows, PowerShell 7+):**
 
-Windows:
 ```powershell
-Copy-Item D:\GitHub\KiCad-MCP\kicad_plugin\kicad_mcp_bridge.py `
-  "$env:APPDATA\kicad\9.0\scripting\plugins\"
+pwsh -ExecutionPolicy Bypass -File kicad_plugin\install_bridge.ps1
 ```
 
-macOS / Linux:
-```bash
-cp kicad_plugin/kicad_mcp_bridge.py ~/.config/kicad/9.0/scripting/plugins/
+The script:
+1. Removes any stale bridge copies from `scripting\plugins\` (which cause a `sys.modules` conflict)
+2. Installs `kicad_mcp_bridge.py` as `__init__.py` in `[MyDocuments]\KiCad\9.0\3rdparty\plugins\kicad_mcp_bridge\`
+3. Patches `pcbnew.json` so KiCad auto-loads the bridge on every pcbnew startup
+
+**After installing:**
+1. Close all KiCad / pcbnew windows
+2. Open pcbnew and load your board
+3. Verify the bridge is running: `Test-NetConnection -ComputerName localhost -Port 9760`
+4. Start the MCP server with `python -m kicad_mcp_plugin`
+
+**Reinstalling the bridge** (after source updates):
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File kicad_plugin\install_bridge.ps1
 ```
 
-After restarting KiCad and the MCP server, `get_backend_info()` should report `"plugin"` as the active backend when a board is open. Port is configurable via `KICAD_MCP_PLUGIN_PORT` (default `9760`).
+Then close and reopen pcbnew to reload the updated bridge. Check `bridge_startup.log` in the plugin directory for startup diagnostics.
+
+**Port configuration:** `KICAD_MCP_PLUGIN_PORT` env var (default `9760`).
+
+**macOS / Linux:** The bridge and plugin entry point are currently Windows-only. Use `python -m kicad_mcp` with the CLI or file backend on other platforms.
+
+### Known Limitations (Plugin Backend)
+
+- **Board switching**: After calling `open_kicad` with a new board path, the bridge stays connected to the previously open board. You must manually open the new board in pcbnew before bridge operations will reflect the new board.
+- **Bridge reinstall required after source updates**: The installed bridge (`3rdparty\plugins\kicad_mcp_bridge\__init__.py`) is a snapshot. Re-run `install_bridge.ps1` and restart pcbnew after any bridge source changes.
 
 ### Backend Not Available
 
 Run `python -m kicad_mcp --check` to see which backends are available. Install missing dependencies:
 
-- Plugin: Copy `kicad_plugin/kicad_mcp_bridge.py` to KiCad's scripting/plugins directory and restart KiCad
+- Plugin: Run `install_bridge.ps1`, restart pcbnew, then use `python -m kicad_mcp_plugin`
 - IPC: Requires KiCad to be running
 - SWIG: activate the venv then `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH

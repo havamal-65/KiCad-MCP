@@ -295,25 +295,89 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 
 **Files**: `src/kicad_mcp/backends/file_backend.py`, `src/kicad_mcp/tools/board.py`
 
-### 36. Plugin Backend POC — Direct `pcbnew` Access via In-KiCad TCP Bridge (DONE)
+### 36. Plugin Backend — Full Board Read+Write via In-KiCad TCP Bridge (DONE)
 
 **Problem**: The IPC backend (gRPC via kipy) has recurring timeout and stability issues on Windows, particularly when KiCad is under load or a large board is open. A new approach is needed that avoids gRPC entirely.
 
 **Architecture**: KiCad's embedded Python interpreter loads `kicad_plugin/kicad_mcp_bridge.py` as an `ActionPlugin`. At load time (not on button press) the plugin starts a `socketserver.TCPServer` on `localhost:9760` in a daemon thread. The MCP-side `PluginBackend` connects to this server, sends newline-delimited JSON requests, and reads JSON responses — no gRPC, no file-parsing, direct `pcbnew` API access.
 
-**POC scope** (board-read only):
-- `ping` → `kicad_version` string from `pcbnew.GetBuildVersion()`
-- `get_board_info` → title, layer count, board size, net count, footprint count
-- `get_components` → list of `{reference, value, x, y, layer, rotation}`
-- `get_nets` → list of `{net_id, name}`
+**Supported bridge operations:**
+- Read: `ping`, `get_board_info`, `get_components`, `get_nets`, `get_tracks`, `get_design_rules`, `get_stackup`, `get_active_project`
+- Write: `place_component`, `move_component`, `add_track`, `add_via`, `assign_net`, `refill_zones`, `save_board`, `reload_board`, `add_board_outline`, `auto_place`, `export_dsn`, `import_ses`
 
-**`is_available()`** does a TCP connect + ping; caches the result for 5 seconds to avoid hammering the port on every tool call. Returns `False` gracefully when no bridge is running.
+**Thread safety**: All write operations use `_run_on_main_thread(fn)` which schedules the callable via `wx.CallAfter` onto KiCad's GUI thread and blocks until completion (30 s timeout). Read operations that call non-thread-safe pcbnew APIs are also wrapped in `_run_on_main_thread`. Falls back to direct execution when `wx` is not importable (unit test environments).
 
-**Installation**: Copy `kicad_plugin/kicad_mcp_bridge.py` to `%APPDATA%\kicad\9.0\scripting\plugins\` (Windows) or `~/.config/kicad/9.0/scripting/plugins/` (Linux/macOS), then restart KiCad.
+**`is_available()`** does a TCP connect + ping; caches the result for 5 seconds to avoid hammering the port on every tool call.
 
-**Test results (Codex-verified)**: All 11 unit tests pass; full suite 219 passed, 1 skipped. `get_available_backends()` includes `"plugin"` key; reports `available: false` with no bridge running.
+**E2E verified**: `pcb_pipeline` on a USB-C power breakout (6 footprints, 6 nets) completed with `drc_passed: true` using the plugin backend exclusively for all board operations.
 
-**Files**: `kicad_plugin/kicad_mcp_bridge.py` (new), `src/kicad_mcp/backends/plugin_backend.py` (new), `src/kicad_mcp/backends/factory.py` (plugin tried before IPC in auto-detect)
+**Files**: `kicad_plugin/kicad_mcp_bridge.py`, `kicad_plugin/install_bridge.ps1` (new), `src/kicad_mcp/backends/plugin_backend.py`, `src/kicad_mcp_plugin/` (new plugin entry point package)
+
+### 37. Bridge Must Be Installed in `3rdparty\plugins`, Not `scripting\plugins` (CRITICAL)
+
+**Problem**: KiCad loads `scripting\plugins` in the project-manager Python context **before** the PCB editor opens. In that context `import pcbnew` fails (pcbnew is only available inside the PCB editor). The failed import caches `kicad_mcp_bridge` in `sys.modules` with no TCP server started. When the PCB editor later tries to load the bridge from `3rdparty\plugins`, Python returns the cached broken object — the server never starts and port 9760 never opens.
+
+**Impact**: Bridge appears to load (no error in KiCad UI) but is completely non-functional. `PluginBackend.is_available()` always returns `False`. Diagnosis requires checking `bridge_startup.log`.
+
+**Fix**: The bridge must **only** live in `[MyDocuments]\KiCad\9.0\3rdparty\plugins\kicad_mcp_bridge\__init__.py`. Any copy in `scripting\plugins\` must be deleted, including `__pycache__`. The `install_bridge.ps1` script handles this automatically.
+
+**Rule**: KiCad 9 on Windows — always install ActionPlugins in `3rdparty\plugins\<name>\__init__.py`. Never use `scripting\plugins` for plugins that need `pcbnew`.
+
+**Files**: `kicad_plugin/install_bridge.ps1`
+
+### 38. wx Bare-Name Bug in Bridge `_handle_save_board` (FIXED)
+
+**Problem**: The installed bridge's `_handle_save_board` contained:
+```python
+def _do():
+    import pcbnew
+    board = _get_open_board(path)
+    board.Save(board.GetFileName())
+    wx.CallAfter(pcbnew.Refresh)   # ← NameError: 'wx' not in _do() scope
+    return {"success": True, "path": board.GetFileName()}
+return _run_on_main_thread(_do)
+```
+
+`wx` was only imported locally inside `_run_on_main_thread`. `_do()` is a separate closure and has no access to that local `wx`. When `_do()` ran on the main thread via `wx.CallAfter`, Python raised `NameError: name 'wx' is not defined`. The bridge returned this as `{"status": "error", "message": "name 'wx' is not defined"}`, causing `PluginDirectBackend.save_board()` to raise `RuntimeError("Plugin bridge error: name 'wx' is not defined")`, which aborted `export_gerbers` and `run_drc` before kicad-cli was ever invoked.
+
+**Fix Applied**: Extracted `_save_and_refresh(board)` helper that does its own `try: import wx; wx.CallAfter(pcbnew.Refresh); except Exception: pass` — wx is imported locally in the helper, and failure is silent (Refresh is cosmetic). All write handlers that save and refresh the board call this helper instead of using `wx` as a bare name.
+
+**Rule**: Never reference `wx` as a bare global name in the bridge. `wx` is not imported at module level. Import it locally (`try: import wx`) or use the `_save_and_refresh()` helper.
+
+**Files**: `kicad_plugin/kicad_mcp_bridge.py` — requires reinstall via `install_bridge.ps1` + pcbnew restart
+
+### 39. `PluginDirectBackend.save_board()` Must Be Exception-Safe (FIXED)
+
+**Problem**: `PluginDirectBackend.save_board()` originally propagated bridge exceptions:
+```python
+def save_board(self, path: Path) -> bool:
+    self._board_ops.save_board(path)   # raises on bridge error
+    return True
+```
+When the bridge's `save_board` failed (e.g. due to the wx bug above), the exception propagated to the export/DRC tool callers. Those tools called `backend.save_board(p)` before invoking kicad-cli — the propagated exception aborted the entire tool call before kicad-cli was ever reached, even though the on-disk `.kicad_pcb` file was already up to date from the preceding `pcb_pipeline` run.
+
+By contrast, `CompositeBackend.save_board()` already caught and logged bridge exceptions silently.
+
+**Fix Applied**: Wrapped the `_board_ops.save_board(path)` call in try/except. Bridge failures are logged at DEBUG level; the method returns `False`. Callers (export and DRC tools) proceed normally using the on-disk file.
+
+**Rule**: Any `save_board()` call whose purpose is to flush in-memory changes before a read-only operation (kicad-cli DRC, kicad-cli export) must not propagate bridge exceptions. The on-disk file is the source of truth for CLI operations.
+
+**Files**: `src/kicad_mcp_plugin/backends/plugin_direct.py`
+
+### 40. `PluginDirectBackend` — Explicit Routing with No Silent Fallbacks (DONE)
+
+**Problem**: The `CompositeBackend` auto-detects available backends and silently falls back (e.g. file backend for board ops when plugin is unavailable). For the plugin entry point, this silent fallback is unacceptable — a board op that falls back to file parsing produces stale data that doesn't reflect the live in-memory board in KiCad.
+
+**Architecture**: `PluginDirectBackend` (in `src/kicad_mcp_plugin/`) is a `BackendProtocol` implementation with fixed, explicit routing:
+- Board read/write → `PluginBoardOps` (TCP bridge); raises at call time if bridge is down
+- DRC/export → `CLIBackend`; raises `CapabilityNotSupportedError` if kicad-cli is missing
+- Schematic/library → `FileBackend`; always succeeds
+
+There is no `is_available()` polling or capability map. The entry point `create_plugin_server()` starts even if KiCad is not yet open — `open_kicad` is registered unguarded so KiCad can be launched first.
+
+**Board/routing tools** are registered behind a bridge-liveness guard that re-pings `localhost:9760` on every call and returns a structured error (`_BRIDGE_DOWN_RESPONSE`) if the bridge is not reachable, instead of silently falling back.
+
+**Files**: `src/kicad_mcp_plugin/backends/plugin_direct.py`, `src/kicad_mcp_plugin/server.py`, `src/kicad_mcp_plugin/__main__.py`
 
 ---
 
@@ -367,8 +431,12 @@ Compiled from hands-on experience building the Air Quality Sensor schematic and 
 | 36 | FreeRouting v2.x `--gui.enabled=false` + Java threshold | **DONE** | Headless flag for v2.x; threshold corrected from ≥25 to ≥21 |
 | 37 | `autoroute` double preflight + orphan subprocess | **DONE** | Removed redundant preflight; `Popen`+`communicate`+`kill` prevents orphan Java process |
 | 38 | DRC reduction constants (hole_clearance, margin, clearance_mm) | **DONE** | 0.22mm hole_clearance, 5mm margin, 1.5mm component clearance → 0 DRC errors on fresh boards |
-| 39 | Plugin backend POC | **DONE** | In-KiCad TCP bridge (`pcbnew` API, board-read only); full coverage in future milestones |
+| 39 | Plugin backend — full read+write | **DONE** | TCP bridge covers all board ops; DRC/export via kicad-cli; E2E pcb_pipeline verified |
+| 40 | Bridge PCM install path | **DONE** | Must be in `3rdparty\plugins`, not `scripting\plugins`; `install_bridge.ps1` handles cleanup |
+| 41 | Bridge wx bare-name bug fix | **DONE** | `_save_and_refresh()` helper with local `import wx`; requires bridge reinstall |
+| 42 | `PluginDirectBackend` — explicit routing | **DONE** | Fixed routing to plugin/CLI/file; bridge-liveness guard on board+routing tools |
+| 43 | `save_board()` exception safety | **DONE** | Bridge failures are logged and swallowed; CLI export/DRC proceed with on-disk file |
 | 18 | `add_text` / `add_graphic` (schematic) | Planned | Annotations like "AIRFLOW ->" on the schematic |
 | 19 | Batch operations | Planned | Place multiple components/wires in one call for performance |
 | 20 | Undo/redo support | Planned | Track changes and allow rollback beyond file backups |
-| 40 | Plugin backend full coverage | Planned | Expand plugin backend to modify ops, DRC, export; replaces IPC on Windows |
+| 44 | Board-switch reliability | Planned | `open_kicad` with a new board path does not re-open pcbnew reliably; user must open board manually |

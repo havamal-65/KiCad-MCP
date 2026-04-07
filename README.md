@@ -248,6 +248,21 @@ Use an absolute PowerShell path to avoid `Executable not found in $PATH: "powers
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `~/.config/Claude/claude_desktop_config.json` (Linux):
 
+Plugin entry point (recommended — requires bridge installed and pcbnew open):
+```json
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "/path/to/KiCad-MCP/run_plugin.sh",
+      "env": {
+        "KICAD_MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
+```
+
+Legacy composite entry point (no KiCad required for file/CLI ops):
 ```json
 {
   "mcpServers": {
@@ -555,47 +570,53 @@ If you try to use auto-routing tools without FreeRouting, you'll get a helpful e
 
 ### Plugin Backend Setup
 
-The plugin backend gives the MCP direct live access to `pcbnew`'s in-memory board data while KiCad is open, with no gRPC overhead. It is the primary recommended path on Windows with KiCad 9.
+The plugin backend gives the MCP direct live access to `pcbnew`'s in-memory board data while KiCad is open, with no gRPC overhead. It works on **Windows, Linux, and macOS** with KiCad 9.
 
-**Install (Windows, PowerShell 7+):**
+The install scripts:
+1. Remove any stale bridge copies from `scripting/plugins/` (these cause a `sys.modules` conflict that silently prevents the bridge from starting)
+2. Install `kicad_mcp_bridge.py` as `__init__.py` in KiCad's PCM plugins directory
+3. Patch `pcbnew.json` so KiCad auto-loads the bridge on every pcbnew startup
+
+**Windows (PowerShell 7+):**
 
 ```powershell
 pwsh -ExecutionPolicy Bypass -File kicad_plugin\install_bridge.ps1
 ```
 
-The script:
-1. Removes any stale bridge copies from `scripting\plugins\` (which cause a `sys.modules` conflict)
-2. Installs `kicad_mcp_bridge.py` as `__init__.py` in `[MyDocuments]\KiCad\9.0\3rdparty\plugins\kicad_mcp_bridge\`
-3. Patches `pcbnew.json` so KiCad auto-loads the bridge on every pcbnew startup
+Installs to: `[MyDocuments]\KiCad\9.0\3rdparty\plugins\kicad_mcp_bridge\`
 
-**After installing:**
+**Linux / macOS:**
+
+```bash
+bash kicad_plugin/install_bridge.sh
+```
+
+Installs to:
+- Linux: `$XDG_DATA_HOME/kicad/9.0/3rdparty/plugins/kicad_mcp_bridge/` (default: `~/.local/share/kicad/9.0/…`)
+- macOS: `~/Library/Preferences/kicad/9.0/3rdparty/plugins/kicad_mcp_bridge/`
+
+**After installing (all platforms):**
 1. Close all KiCad / pcbnew windows
 2. Open pcbnew and load your board
-3. Verify the bridge is running: `Test-NetConnection -ComputerName localhost -Port 9760`
-4. Start the MCP server with `python -m kicad_mcp_plugin`
+3. Verify the bridge is running:
+   - Windows: `Test-NetConnection -ComputerName localhost -Port 9760`
+   - Linux/macOS: `python3 -c "import socket; s=socket.create_connection(('localhost',9760),2); print('bridge OK'); s.close()"`
+4. Start the MCP server: `python -m kicad_mcp_plugin`
 
-**Reinstalling the bridge** (after source updates):
-
-```powershell
-pwsh -ExecutionPolicy Bypass -File kicad_plugin\install_bridge.ps1
-```
-
-Then close and reopen pcbnew to reload the updated bridge. Check `bridge_startup.log` in the plugin directory for startup diagnostics.
+**Reinstalling after source updates:** Re-run the install script, then close and reopen pcbnew. Check `bridge_startup.log` in the plugin directory for startup diagnostics.
 
 **Port configuration:** `KICAD_MCP_PLUGIN_PORT` env var (default `9760`).
-
-**macOS / Linux:** The bridge and plugin entry point are currently Windows-only. Use `python -m kicad_mcp` with the CLI or file backend on other platforms.
 
 ### Known Limitations (Plugin Backend)
 
 - **Board switching**: After calling `open_kicad` with a new board path, the bridge stays connected to the previously open board. You must manually open the new board in pcbnew before bridge operations will reflect the new board.
-- **Bridge reinstall required after source updates**: The installed bridge (`3rdparty\plugins\kicad_mcp_bridge\__init__.py`) is a snapshot. Re-run `install_bridge.ps1` and restart pcbnew after any bridge source changes.
+- **Bridge reinstall required after source updates**: The installed bridge (`3rdparty/plugins/kicad_mcp_bridge/__init__.py`) is a snapshot. Re-run the install script and restart pcbnew after any bridge source changes.
 
 ### Backend Not Available
 
 Run `python -m kicad_mcp --check` to see which backends are available. Install missing dependencies:
 
-- Plugin: Run `install_bridge.ps1`, restart pcbnew, then use `python -m kicad_mcp_plugin`
+- Plugin: Run `install_bridge.ps1` (Windows) or `install_bridge.sh` (Linux/macOS), restart pcbnew, then use `python -m kicad_mcp_plugin`
 - IPC: Requires KiCad to be running
 - SWIG: activate the venv then `pip install kicad-mcp[ipc]`
 - CLI: Install KiCad and ensure `kicad-cli` is in PATH

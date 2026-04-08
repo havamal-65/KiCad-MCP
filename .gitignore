@@ -37,3 +37,10 @@ examples/
 # OS
 Thumbs.db
 .DS_Store
+
+# Never push — internal dev notes and machine-local config
+LESSONS_LEARNED.md
+.claude/
+logs/
+null
+kicad-dev-docs/

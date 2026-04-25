@@ -10,22 +10,18 @@ from fastmcp import FastMCP
 from kicad_mcp import __version__
 from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.backends.factory import create_composite_backend
-from kicad_mcp.config import KiCadMCPConfig
+from kicad_mcp.config import BackendType, KiCadMCPConfig
 from kicad_mcp.logging_config import get_logger, setup_logging
 from kicad_mcp.resources.definitions import register_resources
 from kicad_mcp.tools import board, drc, export, library, library_manage, project, routing, schematic
 from kicad_mcp.utils.change_log import ChangeLog
-from kicad_mcp.utils.platform_helper import is_kicad_running, launch_kicad
+from kicad_mcp.utils.platform_helper import (
+    invalidate_kicad_running_cache,
+    is_kicad_running,
+    launch_kicad,
+)
 
 logger = get_logger("server")
-
-_KICAD_NOT_RUNNING_RESPONSE = json.dumps({
-    "status": "error",
-    "error": (
-        "KiCad GUI is not running. "
-        "Use the open_kicad tool to launch KiCad first, then retry."
-    ),
-}, indent=2)
 
 
 def create_server(config: KiCadMCPConfig | None = None) -> FastMCP:
@@ -99,9 +95,14 @@ def create_server(config: KiCadMCPConfig | None = None) -> FastMCP:
             "error": "Failed to launch KiCad. Verify it is installed.",
         }, indent=2)
 
-    # Wrap mcp.tool so every subsequently registered tool checks that KiCad is
-    # running before executing.  open_kicad (above) is already registered and
-    # is unaffected.
+    # Wrap mcp.tool with a backend-aware guard.  open_kicad (registered above)
+    # is already registered and is unaffected by this replacement.
+    #
+    # FILE / CLI / SWIG  → no guard; these backends work without KiCad open.
+    # AUTO               → no guard; CompositeBackend falls back to FILE if IPC
+    #                      is unavailable, so blocking here would be wrong.
+    # IPC                → check (cached) + auto-launch; return a retry prompt
+    #                      rather than a hard error so the user isn't stuck.
     _original_tool = mcp.tool
 
     def _guarded_tool(*args, **kwargs):
@@ -110,9 +111,30 @@ def create_server(config: KiCadMCPConfig | None = None) -> FastMCP:
         def wrapper(func):
             @functools.wraps(func)
             def guarded(*fargs, **fkwargs):
+                if config.backend != BackendType.IPC:
+                    return func(*fargs, **fkwargs)
+
                 if not is_kicad_running():
-                    return _KICAD_NOT_RUNNING_RESPONSE
+                    launched = launch_kicad()
+                    invalidate_kicad_running_cache()
+                    if launched:
+                        return json.dumps({
+                            "status": "info",
+                            "message": (
+                                "KiCad is launching. "
+                                "Please retry this tool in a few seconds once KiCad has fully started."
+                            ),
+                        }, indent=2)
+                    return json.dumps({
+                        "status": "error",
+                        "error": (
+                            "KiCad is not running and could not be launched automatically. "
+                            "Please open KiCad manually and retry."
+                        ),
+                    }, indent=2)
+
                 return func(*fargs, **fkwargs)
+
             return decorator(guarded)
 
         return wrapper

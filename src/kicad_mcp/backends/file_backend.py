@@ -2506,6 +2506,20 @@ class FileLibraryOps(LibraryOps):
         from kicad_mcp.utils.kicad_paths import find_footprint_libraries, find_symbol_libraries
         self._symbol_libs = find_symbol_libraries()
         self._footprint_libs = find_footprint_libraries()
+        if not self._footprint_libs:
+            logger.warning(
+                "No footprint libraries found. Footprint search and placement will return "
+                "empty results. If KiCad is installed at a non-standard path (e.g. Flatpak), "
+                "set the KICAD_SYMBOL_DIR environment variable to the symbols directory, "
+                "or register custom paths with the register_library_source tool."
+            )
+        if not self._symbol_libs:
+            logger.warning(
+                "No symbol libraries found. Symbol search will return empty results. "
+                "If KiCad is installed at a non-standard path (e.g. Flatpak), "
+                "set the KICAD_SYMBOL_DIR environment variable to the symbols directory, "
+                "or register custom paths with the register_library_source tool."
+            )
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
         results = []

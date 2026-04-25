@@ -22,7 +22,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 os.environ.setdefault("KICAD_MCP_LOG_LEVEL", "ERROR")
-KICAD_CLI = Path("C:/Program Files/KiCad/9.0/bin/kicad-cli.exe")
+
+# Detect kicad-cli on any platform; fall back to a sentinel that never exists.
+from kicad_mcp.utils.platform_helper import find_kicad_cli  # noqa: E402
+from kicad_mcp.utils.kicad_paths import get_system_library_paths  # noqa: E402
+
+KICAD_CLI: Path = find_kicad_cli() or Path("__no_kicad_cli__")
 
 # ---------------------------------------------------------------------------
 # Minimal KiCad file templates
@@ -676,7 +681,8 @@ def main() -> int:
             r.skip("create_project_library did not produce MySymbols.kicad_sym")
         # Import Device:R into our local library
         source_lib = next(
-            (str(p) for p in Path("C:/Program Files/KiCad/9.0/share/kicad/symbols").glob("Device.kicad_sym")),
+            (str(p / "Device.kicad_sym") for p in get_system_library_paths()
+             if p.name == "symbols" and (p / "Device.kicad_sym").exists()),
             None
         )
         if not source_lib:
@@ -699,7 +705,8 @@ def main() -> int:
 
     def t_import_footprint():
         source_lib = next(
-            (str(p) for p in Path("C:/Program Files/KiCad/9.0/share/kicad/footprints").glob("Resistor_SMD.pretty")),
+            (str(p / "Resistor_SMD.pretty") for p in get_system_library_paths()
+             if p.name == "footprints" and (p / "Resistor_SMD.pretty").exists()),
             None
         )
         if not source_lib:

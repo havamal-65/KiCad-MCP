@@ -2520,39 +2520,65 @@ class FileLibraryOps(LibraryOps):
                 "set the KICAD_SYMBOL_DIR environment variable to the symbols directory, "
                 "or register custom paths with the register_library_source tool."
             )
+        # Indexes are built lazily on first search and then reused.
+        self._footprint_index: dict[str, list[str]] | None = None
+        self._symbol_index: list[tuple[str, str]] | None = None  # [(sym_name, lib_name)]
+
+    # -- Lazy index builders -------------------------------------------------
+
+    def _get_footprint_index(self) -> dict[str, list[str]]:
+        """Return {lib_name: [fp_name, ...]} built once from directory listings."""
+        if self._footprint_index is None:
+            index: dict[str, list[str]] = {}
+            for lib_dir in self._footprint_libs:
+                lib_name = lib_dir.stem.replace(".pretty", "")
+                index[lib_name] = [fp.stem for fp in lib_dir.glob("*.kicad_mod")]
+            self._footprint_index = index
+        return self._footprint_index
+
+    def _get_symbol_index(self) -> list[tuple[str, str]]:
+        """Return [(sym_name, lib_name)] built once by regex-scanning library files.
+
+        Using a regex to extract symbol names avoids fully parsing every
+        .kicad_sym file with sexpdata on every search call, which is the
+        dominant cost on installs with hundreds of large symbol libraries.
+        """
+        if self._symbol_index is None:
+            import re
+            # Matches top-level symbol definitions: (symbol "Name" ...)
+            # Excludes sub-unit symbols like "R/0" or "R/body" (contain /)
+            pattern = re.compile(r'^\t\(symbol\s+"([^"/]+)"', re.MULTILINE)
+            entries: list[tuple[str, str]] = []
+            for lib_path in self._symbol_libs:
+                lib_name = lib_path.stem
+                try:
+                    text = lib_path.read_text(encoding="utf-8", errors="ignore")
+                    for m in pattern.finditer(text):
+                        entries.append((m.group(1), lib_name))
+                except Exception as e:
+                    logger.debug("Error scanning symbol lib %s: %s", lib_path, e)
+            self._symbol_index = entries
+        return self._symbol_index
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
-        results = []
         query_lower = query.lower()
-        for lib_path in self._symbol_libs:
-            lib_name = lib_path.stem
-            try:
-                tree = parse_sexp_file(lib_path)
-                for node in tree:
-                    if (isinstance(node, list) and len(node) >= 2
-                            and node[0] == "symbol"):
-                        sym_name = node[1] if isinstance(node[1], str) else ""
-                        if query_lower in sym_name.lower():
-                            results.append({
-                                "name": sym_name,
-                                "library": lib_name,
-                                "lib_id": f"{lib_name}:{sym_name}",
-                            })
-            except Exception as e:
-                logger.debug("Error reading symbol lib %s: %s", lib_path, e)
-        return results[:50]  # Limit results
+        results = [
+            {"name": sym, "library": lib, "lib_id": f"{lib}:{sym}"}
+            for sym, lib in self._get_symbol_index()
+            if query_lower in sym.lower()
+        ]
+        return results[:50]
 
     def search_footprints(self, query: str) -> list[dict[str, Any]]:
-        results = []
         query_lower = query.lower()
-        for lib_dir in self._footprint_libs:
-            lib_name = lib_dir.stem.replace(".pretty", "")
-            for fp_file in lib_dir.glob("*.kicad_mod"):
-                if query_lower in fp_file.stem.lower():
+        results = []
+        for lib_name, fp_names in self._get_footprint_index().items():
+            for fp_name in fp_names:
+                if query_lower in fp_name.lower():
                     results.append({
-                        "name": fp_file.stem,
+                        "name": fp_name,
                         "library": lib_name,
-                        "lib_id": f"{lib_name}:{fp_file.stem}",
+                        "lib_id": f"{lib_name}:{fp_name}",
                     })
         return results[:50]
 
@@ -2944,6 +2970,9 @@ class FileLibraryManageOps(LibraryManageOps):
 class FileBackend(KiCadBackend):
     """Pure Python file-parsing backend. Always available."""
 
+    def __init__(self) -> None:
+        self._library_ops: FileLibraryOps | None = None
+
     @property
     def name(self) -> str:
         return "file"
@@ -2973,7 +3002,9 @@ class FileBackend(KiCadBackend):
         return FileDRCOps(FileSchematicOps())
 
     def get_library_ops(self) -> FileLibraryOps:
-        return FileLibraryOps()
+        if self._library_ops is None:
+            self._library_ops = FileLibraryOps()
+        return self._library_ops
 
     def get_library_manage_ops(self) -> FileLibraryManageOps:
         return FileLibraryManageOps()

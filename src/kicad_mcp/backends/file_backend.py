@@ -156,11 +156,19 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
 
     width_mm = (courtyard["xmax"] - courtyard["xmin"]) if courtyard else 0.0
     height_mm = (courtyard["ymax"] - courtyard["ymin"]) if courtyard else 0.0
+    # x_origin / y_origin: distance from the courtyard's left/top edge to the
+    # footprint origin.  Used by auto_place so that the courtyard left edge
+    # lands exactly on the cursor, regardless of whether the courtyard is
+    # centred at the footprint origin or offset from it.
+    x_origin = (-courtyard["xmin"]) if courtyard else width_mm / 2
+    y_origin = (-courtyard["ymin"]) if courtyard else height_mm / 2
 
     return {
         "courtyard": courtyard,
         "width_mm": round(width_mm, 4),
         "height_mm": round(height_mm, 4),
+        "x_origin": round(x_origin, 4),
+        "y_origin": round(y_origin, 4),
         "pads": pads,
     }
 

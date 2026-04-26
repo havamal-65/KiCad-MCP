@@ -32,12 +32,15 @@ class TestServerCreation:
         config = KiCadMCPConfig(backend=BackendType.FILE, log_level="WARNING")
         mcp = create_server(config)
         tools = mcp._tool_manager._tools
-        # Should have 78 tools total
-        # project(13) + schematic(21) + board(14) + drc(4) + export(5) + routing(5) + library_search(7) + library_manage(9)
+        # Should have 84 tools total
+        # project(13) + schematic(21) + board(14) + drc(4) + export(5) + routing(5)
+        #   + library_search(7) + library_manage(9) + parts(6)
         # project(13): open_kicad, open_project, list_project_files, get_project_metadata, save_project,
         #               get_backend_info, get_active_project, get_text_variables, set_text_variables,
         #               create_project, get_pcb_workflow, plan_project, read_project_plan
-        assert len(tools) == 78
+        # parts(6): list_known_sources, bootstrap_known_source, index_library_source,
+        #           search_parts, install_part, parts_index_stats
+        assert len(tools) == 84
 
     def test_server_auto_backend(self):
         """Server creates with auto-detection."""

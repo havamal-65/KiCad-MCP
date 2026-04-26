@@ -90,7 +90,16 @@ def get_system_library_paths() -> list[Path]:
                     paths.append(lib_dir)
 
     else:  # linux
-        for share_base in ["/usr/share/kicad", "/usr/local/share/kicad"]:
+        candidate_bases = [
+            "/usr/share/kicad",
+            "/usr/local/share/kicad",
+            # Flatpak system-wide install
+            "/var/lib/flatpak/app/org.kicad.KiCad/current/active/files/share/kicad",
+            # Flatpak per-user install
+            str(Path.home() / ".local/share/flatpak/app/org.kicad.KiCad"
+                             "/current/active/files/share/kicad"),
+        ]
+        for share_base in candidate_bases:
             share = Path(share_base)
             if share.exists():
                 for subdir in ["symbols", "footprints", "3dmodels"]:

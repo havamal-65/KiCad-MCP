@@ -20,7 +20,7 @@ Scripts that bypass the MCP are forbidden regardless of whether they "work".
 When modifying `src/kicad_mcp/`, run the test suite to verify nothing regressed:
 
 ```
-source .venv/Scripts/activate && python -m pytest --tb=short -q
+source .venv/bin/activate && python -m pytest --tb=short -q
 ```
 
 ## Footprint Fixture Libraries

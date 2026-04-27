@@ -97,7 +97,7 @@ def _call_tool(board_path: Path) -> dict:
 
     # Find the registered tool by name and call it
     tool_fn = None
-    for tool in mcp._tool_manager.list_tools():
+    for tool in mcp._tool_manager._tools.values():
         if tool.name == "check_courtyard_overlaps":
             tool_fn = tool.fn
             break

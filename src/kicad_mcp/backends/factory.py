@@ -30,7 +30,7 @@ def create_composite_backend(
     backends: list[KiCadBackend] = []
 
     if backend_type == BackendType.AUTO:
-        backends = _auto_detect_backends(cli_path)
+        backends, plugin_watchdog = _auto_detect_backends(cli_path)
     elif backend_type == BackendType.IPC:
         backend = _try_ipc()
         if backend is None:
@@ -67,18 +67,33 @@ def create_composite_backend(
         "Initialized backends: %s",
         [b.name for b in backends],
     )
+    if backend_type == BackendType.AUTO:
+        return CompositeBackend(backends, plugin_watchdog=plugin_watchdog)
     return CompositeBackend(backends)
 
 
-def _auto_detect_backends(cli_path: str | None = None) -> list[KiCadBackend]:
-    """Detect all available backends in priority order."""
-    backends: list[KiCadBackend] = []
+def _auto_detect_backends(
+    cli_path: str | None = None,
+) -> tuple[list[KiCadBackend], KiCadBackend | None]:
+    """Detect all available backends in priority order.
 
-    # Try plugin first (direct pcbnew access via in-KiCad bridge — most accurate)
-    plugin = _try_plugin()
-    if plugin:
-        backends.append(plugin)
-        logger.info("Plugin backend available (kicad_mcp_bridge running in KiCad)")
+    Returns:
+        (backends, plugin_watchdog) where plugin_watchdog is a PluginBackend
+        instance kept as a watchdog for dynamic discovery even if not yet live.
+    """
+    backends: list[KiCadBackend] = []
+    plugin_watchdog: KiCadBackend | None = None
+
+    # Try plugin (direct pcbnew access via in-KiCad bridge — most accurate)
+    try:
+        from kicad_mcp.backends.plugin_backend import PluginBackend
+        pb = PluginBackend()
+        plugin_watchdog = pb  # keep as watchdog regardless of current availability
+        if pb.is_available():
+            backends.append(pb)
+            logger.info("Plugin backend available (kicad_mcp_bridge running in KiCad)")
+    except Exception as e:
+        logger.debug("Plugin backend not importable: %s", e)
 
     # Try IPC (KiCad 9+)
     ipc = _try_ipc()
@@ -92,6 +107,12 @@ def _auto_detect_backends(cli_path: str | None = None) -> list[KiCadBackend]:
         backends.append(swig)
         logger.info("SWIG backend available")
 
+    # Try subprocess pcbnew (DSN/SES routing when plugin bridge is not active)
+    subprocess_b = _try_subprocess()
+    if subprocess_b:
+        backends.append(subprocess_b)
+        logger.info("Subprocess backend available (pcbnew subprocess for DSN/SES)")
+
     # Try CLI
     cli = _try_cli(cli_path)
     if cli:
@@ -102,7 +123,7 @@ def _auto_detect_backends(cli_path: str | None = None) -> list[KiCadBackend]:
     backends.append(_create_file_backend())
     logger.info("File backend available (always)")
 
-    return backends
+    return backends, plugin_watchdog
 
 
 def _try_plugin() -> KiCadBackend | None:
@@ -114,6 +135,18 @@ def _try_plugin() -> KiCadBackend | None:
             return backend
     except Exception as e:
         logger.debug("Plugin backend not available: %s", e)
+    return None
+
+
+def _try_subprocess() -> KiCadBackend | None:
+    """Try to create a Subprocess backend (pcbnew via KiCad Python for DSN/SES ops)."""
+    try:
+        from kicad_mcp.backends.subprocess_backend import SubprocessBackend
+        backend = SubprocessBackend()
+        if backend.is_available():
+            return backend
+    except Exception as e:
+        logger.debug("Subprocess backend not available: %s", e)
     return None
 
 

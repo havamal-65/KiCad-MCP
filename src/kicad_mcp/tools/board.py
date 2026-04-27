@@ -1,4 +1,4 @@
-"""PCB board tools - 10 tools."""
+"""PCB board tools - 12 tools."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -22,7 +22,7 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.board")
 
 
-def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLog) -> None:
+def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register PCB board tools on the MCP server."""
 
     @mcp.tool()
@@ -383,8 +383,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         validate_positive(line_width, "line_width")
 
         backup = create_backup(p)
-        from kicad_mcp.backends.file_backend import FileBoardOps
-        result = FileBoardOps().add_board_outline(p, x, y, width, height, line_width)
+        result = backend.get_board_modify_ops().add_board_outline(p, x, y, width, height, line_width)
         change_log.record(
             "add_board_outline",
             {"path": path, "x": x, "y": y, "width": width, "height": height},
@@ -423,17 +422,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         Returns:
             JSON with components_placed, rows, total_area_mm2, and any warnings.
         """
-        from kicad_mcp.backends.file_backend import (
-            FileBoardOps,
-            _load_kicad_mod,
-            _parse_footprint_bounds,
-        )
-
         p = validate_kicad_path(path, ".kicad_pcb")
-        board_ops = FileBoardOps()
-        components = board_ops.get_components(p)
+        board_ops = backend.get_board_modify_ops()
 
-        if not components:
+        if not board_ops.get_components(p):
             return json.dumps({
                 "status": "success",
                 "message": "No components found on board",
@@ -441,107 +433,29 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 "rows": 0,
             }, indent=2)
 
-        def _component_class_key(ref: str) -> int:
-            """Sort order: connectors=0, ICs=1, discretes=2, transistors=3, LEDs=4, other=5."""
-            prefix = ''.join(c for c in ref if c.isalpha()).upper()
-            order = {"J": 0, "P": 0, "CON": 0, "U": 1, "IC": 1, "R": 2, "C": 2, "L": 2,
-                     "Q": 3, "T": 3, "D": 4, "LED": 4}
-            for k, v in order.items():
-                if prefix.startswith(k):
-                    return v
-            return 5
-
-        # Sort components by class then reference
-        components.sort(key=lambda c: (_component_class_key(c.get("reference", "")),
-                                        c.get("reference", "")))
-
-        warnings: list[str] = []
-        placements: list[dict] = []
-
-        # Gather dimensions for each component
-        comp_dims: list[dict] = []
-        for comp in components:
-            ref = comp.get("reference", "")
-            fp = comp.get("footprint", "")
-            if not ref or not fp:
-                warnings.append(f"Skipping {ref or '?'}: no footprint assigned")
-                continue
-
-            kicad_mod = _load_kicad_mod(fp)
-            if kicad_mod is None:
-                warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
-                w, h = 5.0, 5.0
-            else:
-                bounds = _parse_footprint_bounds(kicad_mod)
-                w = bounds["width_mm"] if bounds["width_mm"] > 0 else 5.0
-                h = bounds["height_mm"] if bounds["height_mm"] > 0 else 5.0
-
-            comp_dims.append({"reference": ref, "footprint": fp, "w": w, "h": h})
-
-        if not comp_dims:
-            return json.dumps({
-                "status": "success",
-                "message": "No placeable components found",
-                "components_placed": 0,
-                "rows": 0,
-                "warnings": warnings,
-            }, indent=2)
-
-        # Bin-pack into rows
-        cursor_x = board_x + clearance_mm
-        cursor_y = board_y + clearance_mm
-        row_height = 0.0
-        row_count = 1
-        right_limit = board_x + board_width - clearance_mm
-        bottom_limit = board_y + board_height - clearance_mm
-
-        board_modify_ops = FileBoardOps()
         backup = create_backup(p)
+        result = board_ops.auto_place(p, board_x, board_y, board_width, board_height, clearance_mm)
 
-        for item in comp_dims:
-            w, h = item["w"], item["h"]
+        for placement in result.get("placements", []):
+            change_log.record(
+                "auto_place_component",
+                {"path": path, **placement},
+                file_modified=path,
+                backup_path=str(backup) if backup else None,
+            )
 
-            # Check if we need to wrap to next row
-            if cursor_x + w > right_limit and cursor_x > board_x + clearance_mm:
-                cursor_x = board_x + clearance_mm
-                cursor_y += row_height + clearance_mm
-                row_height = 0.0
-                row_count += 1
+        # Compute board utilization and warn if routing will be difficult
+        board_area = board_width * board_height
+        total_courtyard_area = result.get("total_area_mm2", 0.0)
+        utilization_pct = round((total_courtyard_area / board_area * 100) if board_area > 0 else 0.0, 1)
+        result["utilization_pct"] = utilization_pct
+        if utilization_pct > 70:
+            result.setdefault("warnings", []).append(
+                f"Board utilization is {utilization_pct}% (>{70}%). Routing will be extremely difficult. "
+                "Consider enlarging the board with add_board_outline before autoroute."
+            )
 
-            if cursor_y + h > bottom_limit:
-                warnings.append(
-                    f"{item['reference']}: board area full, placed at ({cursor_x:.2f}, {cursor_y:.2f})"
-                )
-
-            # Place at center of footprint courtyard
-            cx = round(cursor_x + w / 2, 4)
-            cy = round(cursor_y + h / 2, 4)
-
-            try:
-                board_modify_ops.move_component(p, item["reference"], cx, cy, rotation=0.0)
-                placements.append({"reference": item["reference"], "x": cx, "y": cy})
-                change_log.record(
-                    "auto_place_component",
-                    {"path": path, "reference": item["reference"], "x": cx, "y": cy},
-                    file_modified=path,
-                    backup_path=str(backup) if backup else None,
-                )
-            except Exception as e:
-                warnings.append(f"{item['reference']}: move failed — {e}")
-
-            cursor_x += w + clearance_mm
-            row_height = max(row_height, h)
-
-        total_area = sum(d["w"] * d["h"] for d in comp_dims)
-
-        return json.dumps({
-            "status": "success",
-            "components_placed": len(placements),
-            "rows": row_count,
-            "total_area_mm2": round(total_area, 2),
-            "placements": placements,
-            "warnings": warnings,
-        }, indent=2)
+        return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
     def pcb_pipeline(
@@ -582,14 +496,9 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         Returns:
             JSON with status, per-step results, drc_passed, and violations list.
         """
-        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
+        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps  # FileBoardOps for set_board_design_rules (.kicad_pro file writes)
         from kicad_mcp.config import KiCadMCPConfig
-        from kicad_mcp.tools.routing import (
-            _impl_export_dsn,
-            _impl_import_ses,
-            _impl_run_freerouter,
-            _validate_board_preflight,
-        )
+        from kicad_mcp.tools.routing import _impl_run_freerouter
 
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
@@ -597,7 +506,6 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         pipeline_steps: list[dict] = []
         overall_status = "success"
-        MARGIN = 5.0  # mm between board edge and Edge.Cuts
 
         def _step(name: str, result_json: str) -> dict:
             r = json.loads(result_json)
@@ -613,12 +521,96 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                 "steps": pipeline_steps,
             }, indent=2)
 
+        # ── Step 0a: startup gate ────────────────────────────────────────────
+        try:
+            from kicad_mcp.tools.project import run_startup_checklist
+            checklist = run_startup_checklist()
+            pipeline_steps.append({"step": "startup_checklist", **checklist})
+            if not checklist["ready_for_pcb"]:
+                failed_items = [c["item"] for c in checklist["checklist"] if c["status"] == "FAIL"]
+                return _fail(
+                    "startup_checklist",
+                    f"Startup gate failed — fix these items before running the pipeline: "
+                    f"{', '.join(failed_items)}. Required actions: "
+                    f"{'; '.join(checklist['required_actions'])}",
+                )
+        except Exception as exc:
+            # Startup check failure is non-fatal if we can't import the module
+            pipeline_steps.append({
+                "step": "startup_checklist",
+                "status": "skipped",
+                "note": f"Startup check skipped: {exc}",
+            })
+
+        # ── Step 0b: schematic completeness check ────────────────────────────
+        try:
+            from kicad_mcp.tools.drc import run_validate_schematic_for_pcb
+            sch_check = run_validate_schematic_for_pcb(sch_p)
+            pipeline_steps.append({"step": "validate_schematic_for_pcb", **sch_check})
+            if not sch_check["ready_for_pcb_sync"]:
+                issues = [i.get("detail", str(i)) for i in sch_check["blocking_issues"][:5]]
+                return _fail(
+                    "validate_schematic_for_pcb",
+                    f"Schematic has {len(sch_check['blocking_issues'])} blocking issue(s). "
+                    f"First issues: {'; '.join(issues)}",
+                )
+        except Exception as exc:
+            pipeline_steps.append({
+                "step": "validate_schematic_for_pcb",
+                "status": "skipped",
+                "note": f"Schematic check skipped: {exc}",
+            })
+
+        # ── Step 0c: board size estimate warning ─────────────────────────────
+        if board_width_mm > 0 and board_height_mm > 0:
+            try:
+                from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
+                import math as _math
+                from kicad_mcp.backends.file_backend import FileSchematicOps as _FSO
+                _sch_data = _FSO().read_schematic(sch_p)
+                _fp_ids = [
+                    s.get("footprint", "")
+                    for s in _sch_data.get("symbols", [])
+                    if not s.get("is_power") and s.get("footprint")
+                ]
+                _comp_area = 0.0
+                for _fp_id in _fp_ids:
+                    _mod = _load_kicad_mod(_fp_id)
+                    if _mod:
+                        _b = _parse_footprint_bounds(_mod)
+                        _comp_area += (_b["width_mm"] or 5.0) * (_b["height_mm"] or 5.0)
+                if _comp_area > 0:
+                    _ra = _comp_area * 1.20  # 20% routing overhead
+                    _ew = _math.sqrt(_ra * 1.4) + 6  # + 2×edge_clearance
+                    _eh = _math.sqrt(_ra / 1.4) + 6
+                    _ceil5 = lambda v: _math.ceil(v / 5.0) * 5.0
+                    _est_w = _ceil5(_ceil5(_ew) * 1.25)
+                    _est_h = _ceil5(_ceil5(_eh) * 1.25)
+                    if board_width_mm < _est_w * 0.85 or board_height_mm < _est_h * 0.85:
+                        pipeline_steps.append({
+                            "step": "board_size_check",
+                            "status": "warning",
+                            "message": (
+                                f"Provided board size ({board_width_mm}×{board_height_mm} mm) "
+                                f"may be too small. Estimate: {_est_w}×{_est_h} mm. "
+                                "Routing may fail. Consider enlarging."
+                            ),
+                        })
+                    else:
+                        pipeline_steps.append({
+                            "step": "board_size_check",
+                            "status": "ok",
+                            "estimated_size_mm": f"{_est_w}×{_est_h}",
+                        })
+            except Exception:
+                pass  # Size check is best-effort
+
         # ── Step 1: sync_schematic_to_pcb ────────────────────────────────────
         try:
             sch_ops = FileSchematicOps()
             sch_data = sch_ops.read_schematic(sch_p)
 
-            pcb_ops = FileBoardOps()
+            pcb_ops = backend.get_board_ops()
             pcb_data = pcb_ops.read_board(pcb_p)
 
             sch_by_ref: dict[str, dict] = {}
@@ -633,10 +625,11 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
             pcb_by_ref = {c.get("reference", ""): c for c in pcb_data.get("components", []) if c.get("reference")}
 
-            board_modify = FileBoardOps()
+            board_modify = backend.get_board_modify_ops()
             place_x, place_y = 50.0, 50.0
             placed: list[str] = []
             sync_warnings: list[str] = []
+            to_place: list[dict] = []
 
             for ref, sym in sch_by_ref.items():
                 fp = sym.get("footprint", "")
@@ -644,18 +637,33 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     sync_warnings.append(f"{ref}: no footprint in schematic, skipped")
                     continue
                 if ref not in pcb_by_ref:
-                    board_modify.place_component(pcb_p, ref, fp, place_x, place_y)
-                    placed.append(ref)
+                    to_place.append({"reference": ref, "footprint": fp, "x": place_x, "y": place_y})
                     place_x += 10.0
                     if place_x > 200.0:
                         place_x = 50.0
                         place_y += 10.0
 
+            # Place all new components in one operation if supported
+            if to_place:
+                try:
+                    bulk_result = board_modify.place_components_bulk(pcb_p, to_place)
+                    placed = bulk_result.get("placed", [])
+                    for f in bulk_result.get("failed", []):
+                        sync_warnings.append(f"{f.get('reference', '?')}: place failed — {f.get('reason', '')}")
+                except NotImplementedError:
+                    # Fallback: per-component placement
+                    for comp in to_place:
+                        board_modify.place_component(
+                            pcb_p, comp["reference"], comp["footprint"],
+                            comp["x"], comp["y"],
+                        )
+                        placed.append(comp["reference"])
+
             # Assign nets from schematic connectivity to PCB pads
             connectivity = sch_ops._build_connectivity(sch_p)
             net_assign_count = 0
             net_assign_warnings: list[str] = []
-            board_assign = FileBoardOps()
+            board_assign = backend.get_board_modify_ops()
             for net_name, pins in connectivity.items():
                 if not net_name:
                     continue
@@ -703,12 +711,12 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             })
 
         # ── Step 3: add Edge.Cuts board outline ──────────────────────────────
-        # Delegates to FileBoardOps.add_board_outline, which removes any
-        # existing gr_rect on Edge.Cuts before inserting — safe on reruns.
+        # Centre the board at the KiCad canvas origin (0, 0) so it appears in
+        # the middle of the work area rather than near the top-left corner.
         try:
-            x1 = round(MARGIN, 4)
-            y1 = round(MARGIN, 4)
-            FileBoardOps().add_board_outline(pcb_p, x1, y1, board_width_mm, board_height_mm)
+            x1 = round(-board_width_mm / 2, 4)
+            y1 = round(-board_height_mm / 2, 4)
+            backend.get_board_modify_ops().add_board_outline(pcb_p, x1, y1, board_width_mm, board_height_mm)
             pipeline_steps.append({
                 "step": "add_board_outline",
                 "status": "success",
@@ -723,83 +731,56 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             return _fail("add_board_outline", str(exc))
 
         # ── Step 4: auto_place ───────────────────────────────────────────────
+        # FileBoardOps bypass is intentional — same pattern as set_board_design_rules.
         try:
-            from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
-
-            components = FileBoardOps().get_components(pcb_p)
-            components.sort(key=lambda c: (
-                {"J": 0, "P": 0, "U": 1, "IC": 1, "R": 2, "C": 2, "L": 2,
-                 "Q": 3, "T": 3, "D": 4}.get(
-                    ''.join(ch for ch in c.get("reference", "") if ch.isalpha()).upper()[:2], 5
-                ),
-                c.get("reference", ""),
-            ))
-
-            ap_clearance = 1.5
-            cx_cur = MARGIN + ap_clearance
-            cy_cur = MARGIN + ap_clearance
-            row_h = 0.0
-            row_n = 1
-            right_lim = MARGIN + board_width_mm - ap_clearance
-            bot_lim = MARGIN + board_height_mm - ap_clearance
-            ap_warnings: list[str] = []
-            ap_placed: list[str] = []
-            board_mv = FileBoardOps()
-
-            for comp in components:
-                ref = comp.get("reference", "")
-                fp = comp.get("footprint", "")
-                if not ref or not fp:
-                    continue
-                kicad_mod = _load_kicad_mod(fp)
-                if kicad_mod:
-                    b = _parse_footprint_bounds(kicad_mod)
-                    w = b["width_mm"] if b["width_mm"] > 0 else 5.0
-                    h = b["height_mm"] if b["height_mm"] > 0 else 5.0
-                else:
-                    w, h = 5.0, 5.0
-                    ap_warnings.append(f"{ref}: footprint not in libraries, using 5×5 mm")
-
-                if cx_cur + w > right_lim and cx_cur > MARGIN + ap_clearance:
-                    cx_cur = MARGIN + ap_clearance
-                    cy_cur += row_h + ap_clearance
-                    row_h = 0.0
-                    row_n += 1
-
-                comp_cx = round(cx_cur + w / 2, 4)
-                comp_cy = round(cy_cur + h / 2, 4)
-                try:
-                    board_mv.move_component(pcb_p, ref, comp_cx, comp_cy, rotation=0.0)
-                    ap_placed.append(ref)
-                except Exception as mv_exc:
-                    ap_warnings.append(f"{ref}: move failed — {mv_exc}")
-
-                cx_cur += w + ap_clearance
-                row_h = max(row_h, h)
-
+            ap_result = FileBoardOps().auto_place(
+                pcb_p, x1, y1, board_width_mm, board_height_mm, 1.5
+            )
             pipeline_steps.append({
                 "step": "auto_place",
                 "status": "success",
-                "components_placed": len(ap_placed),
-                "rows": row_n,
-                "warnings": ap_warnings,
+                "components_placed": ap_result["components_placed"],
+                "rows": ap_result["rows"],
+                "warnings": ap_result.get("warnings", []),
             })
         except Exception as exc:
             return _fail("auto_place", str(exc))
 
+        # ── Step 4b: courtyard overlap check ────────────────────────────────
+        # CLAUDE.md hard rule: NEVER start routing with courtyard overlaps present.
+        try:
+            from kicad_mcp.tools.drc import run_check_courtyard_overlaps
+            cy_result = run_check_courtyard_overlaps(pcb_p)
+            pipeline_steps.append({
+                "step": "courtyard_overlaps",
+                "status": "success",
+                "passed": cy_result["passed"],
+                "footprints_checked": cy_result["footprints_checked"],
+                "overlap_count": cy_result["overlap_count"],
+                "overlaps": cy_result["overlaps"],
+            })
+            if not cy_result["passed"]:
+                overlap_list = cy_result["overlaps"][:5]
+                return _fail(
+                    "courtyard_overlaps",
+                    f"{cy_result['overlap_count']} courtyard overlap(s) detected. "
+                    "Call move_component to resolve each conflict, then retry pcb_pipeline. "
+                    f"First overlaps: {overlap_list}",
+                )
+        except Exception as exc:
+            return _fail("courtyard_overlaps", str(exc))
+
         # ── Step 5: autoroute ────────────────────────────────────────────────
-        # Skip _validate_board_preflight: the outline was written in Step 3.
-        # Spawning a KiCad Python subprocess just to re-verify it would add
-        # 10-30 s of startup overhead on Windows without benefit.
+        # DSN/SES route via BOARD_ROUTE capability (plugin bridge if active,
+        # subprocess pcbnew otherwise). Preflight is done inside export_dsn.
         try:
             dsn = pcb_p.parent / "freerouting.dsn"
             ses = pcb_p.parent / "freerouting.ses"
 
-            dsn_result = json.loads(
-                _impl_export_dsn(str(pcb_p), str(dsn), config, change_log)
-            )
-            if dsn_result.get("status") != "success":
-                return _fail("autoroute_export_dsn", dsn_result.get("message", "DSN export failed"))
+            try:
+                backend.export_dsn(pcb_p, dsn)
+            except Exception as exc:
+                return _fail("autoroute_export_dsn", str(exc))
 
             router_result = json.loads(
                 _impl_run_freerouter(str(dsn), str(ses), max_passes, "", "", config, change_log)
@@ -807,11 +788,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             if router_result.get("status") != "success":
                 return _fail("autoroute_freerouter", router_result.get("message", "FreeRouting failed"))
 
-            ses_result = json.loads(
-                _impl_import_ses(str(pcb_p), str(ses), change_log)
-            )
-            if ses_result.get("status") != "success":
-                return _fail("autoroute_import_ses", ses_result.get("message", "SES import failed"))
+            try:
+                backend.import_ses(pcb_p, ses)
+            except Exception as exc:
+                return _fail("autoroute_import_ses", str(exc))
 
             pipeline_steps.append({
                 "step": "autoroute",
@@ -852,4 +832,87 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             "drc_passed": drc_passed,
             "violations": violations[:20],  # cap to avoid huge responses
             "steps": pipeline_steps,
+        }, indent=2)
+
+    @mcp.tool()
+    def diff_board(board_path_a: str, board_path_b: str) -> str:
+        """Detect changes between two PCB board snapshots.
+
+        Compares component positions and track counts between two .kicad_pcb files.
+        Useful for verifying what changed after auto_place, autoroute, or any board modification.
+
+        Args:
+            board_path_a: Path to the first (original) .kicad_pcb file.
+            board_path_b: Path to the second (modified) .kicad_pcb file.
+
+        Returns:
+            JSON with added, removed, and moved components plus track count delta.
+        """
+        from kicad_mcp.backends.file_backend import FileBoardOps
+        import math
+
+        pa = validate_kicad_path(board_path_a, ".kicad_pcb")
+        pb = validate_kicad_path(board_path_b, ".kicad_pcb")
+
+        board_ops = FileBoardOps()
+        comps_a = {c["reference"]: c for c in board_ops.get_components(pa) if c.get("reference")}
+        comps_b = {c["reference"]: c for c in board_ops.get_components(pb) if c.get("reference")}
+        tracks_a = board_ops.get_tracks(pa)
+        tracks_b = board_ops.get_tracks(pb)
+
+        MOVE_THRESHOLD_MM = 0.01  # positions differing by less than this are considered identical
+
+        added = []
+        removed = []
+        moved = []
+
+        for ref, comp in comps_b.items():
+            if ref not in comps_a:
+                added.append({
+                    "reference": ref,
+                    "footprint": comp.get("footprint", ""),
+                    "position": comp.get("position", {}),
+                })
+
+        for ref, comp in comps_a.items():
+            if ref not in comps_b:
+                removed.append({
+                    "reference": ref,
+                    "footprint": comp.get("footprint", ""),
+                    "position": comp.get("position", {}),
+                })
+            else:
+                pos_a = comp.get("position", {})
+                pos_b = comps_b[ref].get("position", {})
+                dx = pos_b.get("x", 0) - pos_a.get("x", 0)
+                dy = pos_b.get("y", 0) - pos_a.get("y", 0)
+                delta = math.sqrt(dx * dx + dy * dy)
+                if delta > MOVE_THRESHOLD_MM:
+                    moved.append({
+                        "reference": ref,
+                        "from": pos_a,
+                        "to": pos_b,
+                        "delta_mm": round(delta, 4),
+                    })
+
+        track_delta = len(tracks_b) - len(tracks_a)
+
+        summary = {
+            "added": len(added),
+            "removed": len(removed),
+            "moved": len(moved),
+            "track_delta": track_delta,
+        }
+
+        change_log.record("diff_board", {
+            "board_path_a": board_path_a,
+            "board_path_b": board_path_b,
+        })
+        return json.dumps({
+            "status": "success",
+            "summary": summary,
+            "added_components": added,
+            "removed_components": removed,
+            "moved_components": moved,
+            "track_delta": track_delta,
         }, indent=2)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import time
 
 from fastmcp import FastMCP
 
@@ -24,6 +25,30 @@ from kicad_mcp_plugin.backends.plugin_direct import BridgeNotAvailableError, Plu
 from kicad_mcp_plugin.config import KiCadPluginConfig
 
 logger = get_logger("plugin.server")
+
+
+def _wait_for_board(pcb_path: "Path", timeout: float = 10.0, interval: float = 0.5) -> bool:
+    """Poll get_active_project until board_path matches pcb_path or timeout expires.
+
+    The bridge answers ping as soon as the TCP port is bound, but pcbnew loads
+    the board file asynchronously.  This helper waits until the bridge reports
+    the correct board_path before callers assume the board is ready.
+    """
+    from pathlib import Path  # noqa: PLC0415 — avoid circular at module level
+
+    requested = os.path.normcase(os.path.normpath(str(pcb_path)))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            active = _tcp_call("get_active_project", _get_ping_timeout())
+            open_board = active.get("board_path", "") if isinstance(active, dict) else ""
+            if open_board and os.path.normcase(os.path.normpath(open_board)) == requested:
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
 
 _BRIDGE_DOWN_RESPONSE = json.dumps({
     "status": "error",
@@ -189,10 +214,21 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
 
             bridge_up = wait_for_bridge(port=port, timeout=20.0)
             if bridge_up:
+                board_ready = _wait_for_board(pcb_path, timeout=10.0)
+                if board_ready:
+                    return json.dumps({
+                        "status": "success",
+                        "bridge": "ready",
+                        "message": f"pcbnew opened with {pcb_path.name} and bridge is ready.",
+                    }, indent=2)
+                # Bridge is up but pcbnew hasn't finished loading the board yet.
                 return json.dumps({
                     "status": "success",
-                    "bridge": "ready",
-                    "message": f"pcbnew opened with {pcb_path.name} and bridge is ready.",
+                    "bridge": "pending",
+                    "message": (
+                        f"pcbnew launched with {pcb_path.name}. Bridge is reachable but "
+                        "the board has not finished loading yet. Retry in a few seconds."
+                    ),
                 }, indent=2)
             return json.dumps({
                 "status": "success",

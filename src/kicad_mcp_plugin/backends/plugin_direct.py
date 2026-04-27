@@ -30,6 +30,7 @@ from kicad_mcp.backends.base import (
 from kicad_mcp.backends.cli_backend import CLIBackend
 from kicad_mcp.backends.file_backend import FileBackend
 from kicad_mcp.backends.plugin_backend import (
+    BridgeTemporarilyUnavailableError,
     PluginBoardOps,
     _get_op_timeout,  # noqa: PLC2701
     _get_ping_timeout,  # noqa: PLC2701
@@ -59,6 +60,7 @@ class PluginDirectBackend(BackendProtocol):
     def __init__(self, cli_path: str | None = None) -> None:
         self._bridge_available = self._probe_bridge()
         self._board_ops = PluginBoardOps()
+        self._board_ops._on_disconnect = self._on_bridge_disconnect
         self._file = FileBackend()
         self._cli = CLIBackend(cli_path=cli_path)
         if self._bridge_available:
@@ -71,7 +73,7 @@ class PluginDirectBackend(BackendProtocol):
             )
 
     # ------------------------------------------------------------------
-    # Startup probe
+    # Startup probe + watchdog
     # ------------------------------------------------------------------
 
     def _probe_bridge(self) -> bool:
@@ -86,23 +88,56 @@ class PluginDirectBackend(BackendProtocol):
                 )
                 return False
             return True
-        except (ConnectionRefusedError, OSError, TimeoutError):
+        except (ConnectionRefusedError, OSError, TimeoutError,
+                BridgeTemporarilyUnavailableError):
             return False
+
+    def _on_bridge_disconnect(self) -> None:
+        """Called when PluginBoardOps detects a mid-session connection failure."""
+        if self._bridge_available:
+            logger.warning(
+                "Bridge connection lost on port %d. "
+                "Marking bridge unavailable — reopen KiCad to restore board operations.",
+                _get_port(),
+            )
+        self._bridge_available = False
+
+    def _check_bridge(self) -> None:
+        """Re-probe the bridge if it was previously marked unavailable.
+
+        Raises BridgeTemporarilyUnavailableError with a helpful message if the
+        bridge is still down after re-probing.
+        """
+        if self._bridge_available:
+            return
+        # Bridge was marked down — try once more before failing
+        if self._probe_bridge():
+            self._bridge_available = True
+            logger.info("Bridge reconnected on port %d.", _get_port())
+            return
+        raise BridgeTemporarilyUnavailableError(
+            f"Bridge unreachable on port {_get_port()}. "
+            "Open KiCad and ensure kicad_mcp_bridge is active, then retry."
+        )
 
     # ------------------------------------------------------------------
     # Board ops — always plugin bridge, no fallback
     # ------------------------------------------------------------------
 
     def get_board_ops(self) -> BoardOps:
+        self._check_bridge()
         return self._board_ops
 
     def get_board_modify_ops(self) -> BoardOps:
+        self._check_bridge()
         return self._board_ops
 
     def get_zone_refill_ops(self) -> BoardOps | None:
+        self._check_bridge()
         return self._board_ops
 
     def get_board_stackup_ops(self) -> BoardOps | None:
+        self._check_bridge()
         return self._board_ops
 
     def save_board(self, path: Path) -> bool:
@@ -115,25 +150,40 @@ class PluginDirectBackend(BackendProtocol):
         try:
             self._board_ops.save_board(path)
             return True
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            logger.debug("save_board skipped: bridge unavailable")
+            return False
         except Exception as exc:
             logger.debug(
                 "save_board via bridge failed (proceeding with on-disk file): %s", exc
             )
             return False
 
-    def export_dsn(self, path: Path, dsn_path: Path) -> bool:
+    def export_dsn(self, path: Path, dsn_path: Path) -> dict:
         """Export DSN from live in-memory board via bridge. Always executes."""
-        self._board_ops.export_dsn(path, dsn_path)
-        return True
+        try:
+            return self._board_ops.export_dsn(path, dsn_path)
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
 
     def import_ses(self, path: Path, ses_path: Path) -> dict:
         """Import FreeRouting SES into live in-memory board via bridge. Always executes."""
-        return self._board_ops.import_ses(path, ses_path)
+        try:
+            return self._board_ops.import_ses(path, ses_path)
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
 
     def reload_board(self, path: Path) -> bool:
         """Reload pcbnew board from disk via bridge. Always executes."""
-        self._board_ops.reload_board(path)
-        return True
+        try:
+            self._board_ops.reload_board(path)
+            return True
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
 
     # ------------------------------------------------------------------
     # Schematic ops — always file backend (KiCad 9 platform constraint)
@@ -192,7 +242,11 @@ class PluginDirectBackend(BackendProtocol):
     # ------------------------------------------------------------------
 
     def get_active_project(self) -> dict[str, Any]:
-        return _tcp_call("get_active_project", _get_op_timeout())
+        try:
+            return _tcp_call("get_active_project", _get_op_timeout())
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
 
     def get_text_variables(self, project_path: Any) -> dict[str, Any]:
         return {
@@ -217,6 +271,7 @@ class PluginDirectBackend(BackendProtocol):
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
         BackendCapability.BOARD_STACKUP,
+        BackendCapability.BOARD_ROUTE,
     })
     _FILE_CAPS = frozenset({
         BackendCapability.SCHEMATIC_READ,

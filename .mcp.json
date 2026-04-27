@@ -1,14 +1,12 @@
 {
   "mcpServers": {
     "kicad": {
-      "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "command": "D:\\GitHub\\KiCad-MCP\\.venv\\Scripts\\python.exe",
       "args": [
-        "-ExecutionPolicy", "Bypass",
-        "-NonInteractive",
-        "-File", "run.ps1"
+        "-m",
+        "kicad_mcp_plugin"
       ],
       "env": {
-        "KICAD_MCP_BACKEND": "auto",
         "KICAD_MCP_LOG_LEVEL": "INFO",
         "PYTHONPATH": ""
       }

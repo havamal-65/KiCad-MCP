@@ -179,6 +179,33 @@ class CLIExportOps(ExportOps):
         }
 
 
+    def export_step(self, board_path: Path, output_path: Path) -> dict[str, Any]:
+        """Export 3D STEP model via kicad-cli pcb export step."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self._run(
+            ["pcb", "export", "step", "--output", str(output_path), str(board_path)],
+            timeout=EXPORT_3D_TIMEOUT,
+        )
+        return {
+            "success": result.returncode == 0,
+            "output_file": str(output_path) if result.returncode == 0 else None,
+            "message": result.stderr if result.returncode != 0 else "STEP exported",
+        }
+
+    def export_vrml(self, board_path: Path, output_path: Path) -> dict[str, Any]:
+        """Export 3D VRML model via kicad-cli pcb export vrml."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self._run(
+            ["pcb", "export", "vrml", "--output", str(output_path), str(board_path)],
+            timeout=EXPORT_3D_TIMEOUT,
+        )
+        return {
+            "success": result.returncode == 0,
+            "output_file": str(output_path) if result.returncode == 0 else None,
+            "message": result.stderr if result.returncode != 0 else "VRML exported",
+        }
+
+
 class CLIDRCOps(DRCOps):
     """DRC/ERC operations via kicad-cli."""
 

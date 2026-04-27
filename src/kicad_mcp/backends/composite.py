@@ -6,6 +6,7 @@ from typing import Any
 
 from kicad_mcp.backends.base import (
     BackendCapability,
+    BackendProtocol,
     BoardOps,
     DRCOps,
     ExportOps,
@@ -15,27 +16,28 @@ from kicad_mcp.backends.base import (
     SchematicOps,
 )
 from kicad_mcp.logging_config import get_logger
-from kicad_mcp.models.errors import CapabilityNotSupportedError, KiCadFileOpenError
+from kicad_mcp.models.errors import CapabilityNotSupportedError
 
 logger = get_logger("backend.composite")
 
 
-class CompositeBackend:
+class CompositeBackend(BackendProtocol):
     """Routes operations to the best available backend by capability.
 
     Priority order: IPC > SWIG > CLI > File
     Each operation type resolves to the highest-priority backend that supports it.
     """
 
-    def __init__(self, backends: list[KiCadBackend]) -> None:
-        self._backends = backends
+    def __init__(self, backends: list[KiCadBackend], *, plugin_watchdog=None) -> None:
+        self._backends = list(backends)
+        self._plugin_watchdog = plugin_watchdog
         self._capability_map: dict[BackendCapability, KiCadBackend] = {}
         self._build_capability_map()
 
     def _build_capability_map(self) -> None:
         """Build the mapping from capabilities to their best backend."""
         # Priority order (last wins, so process in reverse priority)
-        priority = {"file": 0, "cli": 1, "swig": 2, "ipc": 3}
+        priority = {"file": 0, "pcbnew_subprocess": 1, "cli": 2, "swig": 3, "ipc": 4, "plugin": 5}
         sorted_backends = sorted(
             self._backends,
             key=lambda b: priority.get(b.name, -1),
@@ -50,6 +52,14 @@ class CompositeBackend:
 
     def _get_backend_for(self, capability: BackendCapability) -> KiCadBackend:
         """Get the best backend for a given capability."""
+        # Dynamic plugin discovery: if watchdog just became available, add it
+        if (self._plugin_watchdog is not None
+                and self._plugin_watchdog not in self._backends
+                and self._plugin_watchdog.is_available()):
+            self._backends.append(self._plugin_watchdog)
+            self._build_capability_map()
+            logger.info("Plugin backend came online; capability map rebuilt")
+
         backend = self._capability_map.get(capability)
         if backend is None:
             raise CapabilityNotSupportedError(
@@ -57,29 +67,6 @@ class CompositeBackend:
                 f"Available capabilities: {[c.name for c in self._capability_map]}"
             )
         return backend
-
-    def _check_file_write_safety(self, operation: str) -> None:
-        """Raise if a file-backend write would conflict with a running KiCad instance.
-
-        When KiCad is running (IPC backend available / REAL_TIME_SYNC capability),
-        it holds .kicad_sch and .kicad_pcb files open in memory. Direct file writes
-        would be silently overwritten when KiCad saves, corrupting the user's work.
-        """
-        if not self.has_capability(BackendCapability.REAL_TIME_SYNC):
-            return  # No IPC = no KiCad running, file writes are safe
-        raise KiCadFileOpenError(
-            f"Cannot {operation} via direct file write while KiCad is running. "
-            f"KiCad has files open in memory and would overwrite changes on save. "
-            f"Close KiCad first, or use IPC-capable operations."
-        )
-
-    def check_file_write_safe(self, operation: str) -> None:
-        """Public version of the file-write safety check.
-
-        Tools that bypass the backend routing (e.g. direct file writes in
-        sync_schematic_to_pcb) can call this to enforce the same guard.
-        """
-        self._check_file_write_safety(operation)
 
     def get_board_ops(self) -> BoardOps:
         """Get board operations from the best available backend."""
@@ -91,11 +78,68 @@ class CompositeBackend:
             )
         return ops
 
+    def export_dsn(self, path: "Path", dsn_path: "Path") -> dict:
+        """Export DSN via best available BOARD_ROUTE backend.
+
+        Routes to plugin bridge (reads live in-memory board) if plugin is active,
+        otherwise falls back to subprocess pcbnew. Raises CapabilityNotSupportedError
+        if no BOARD_ROUTE backend is available; raises RuntimeError on export failure.
+        """
+        backend = self._get_backend_for(BackendCapability.BOARD_ROUTE)
+        ops = backend.get_board_ops()
+        return ops.export_dsn(path, dsn_path)
+
+    def import_ses(self, path: "Path", ses_path: "Path") -> dict:
+        """Import SES via best available BOARD_ROUTE backend.
+
+        Routes to plugin bridge (updates live in-memory board) if plugin active,
+        otherwise falls back to subprocess pcbnew. Raises CapabilityNotSupportedError
+        if no BOARD_ROUTE backend is available; raises RuntimeError on import failure.
+        """
+        backend = self._get_backend_for(BackendCapability.BOARD_ROUTE)
+        ops = backend.get_board_ops()
+        return ops.import_ses(path, ses_path)
+
+    def reload_board(self, path: "Path") -> bool:
+        """Reload pcbnew board from disk if the plugin backend is active.
+
+        Call this after FreeRouting or other external processes write to the
+        .kicad_pcb file, so subsequent plugin reads reflect the current file.
+        Returns True if a reload was performed, False if plugin not active.
+        """
+        backend = self._capability_map.get(BackendCapability.BOARD_READ)
+        if backend is not None and backend.name == "plugin":
+            ops = backend.get_board_ops()
+            if ops is not None and hasattr(ops, "reload_board"):
+                try:
+                    ops.reload_board(path)
+                    return True
+                except Exception as exc:
+                    logger.debug("reload_board skipped: %s", exc)
+        return False
+
+    def save_board(self, path: "Path") -> bool:
+        """Save pcbnew board to disk if the plugin backend is active.
+
+        Call this before kicad-cli DRC/export so that any pcbnew in-memory
+        changes made via the plugin are flushed to the .kicad_pcb file first.
+        Returns True if a save was performed, False if plugin is not active or
+        the path does not match the currently open board (not an error).
+        """
+        backend = self._capability_map.get(BackendCapability.BOARD_READ)
+        if backend is not None and backend.name == "plugin":
+            ops = backend.get_board_ops()
+            if ops is not None and hasattr(ops, "save_board"):
+                try:
+                    ops.save_board(path)
+                    return True
+                except Exception as exc:
+                    logger.debug("save_board skipped: %s", exc)
+        return False
+
     def get_board_modify_ops(self) -> BoardOps:
         """Get board modification operations (requires BOARD_MODIFY capability)."""
         backend = self._get_backend_for(BackendCapability.BOARD_MODIFY)
-        if backend.name == "file" and self.has_capability(BackendCapability.REAL_TIME_SYNC):
-            self._check_file_write_safety("modify PCB board")
         ops = backend.get_board_ops()
         if ops is None:
             raise CapabilityNotSupportedError(
@@ -114,13 +158,8 @@ class CompositeBackend:
         return ops
 
     def get_schematic_modify_ops(self) -> SchematicOps:
-        """Get schematic modification operations (requires SCHEMATIC_MODIFY capability).
-
-        Guards against direct file writes when KiCad is running.
-        """
+        """Get schematic modification operations (requires SCHEMATIC_MODIFY capability)."""
         backend = self._get_backend_for(BackendCapability.SCHEMATIC_MODIFY)
-        if backend.name == "file" and self.has_capability(BackendCapability.REAL_TIME_SYNC):
-            self._check_file_write_safety("modify schematic")
         ops = backend.get_schematic_ops()
         if ops is None:
             raise CapabilityNotSupportedError(

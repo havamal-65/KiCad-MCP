@@ -1,4 +1,4 @@
-"""Abstract interfaces for KiCad backend operations."""
+"""Base interfaces for KiCad backend operations."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class BackendCapability(Enum):
     REAL_TIME_SYNC = auto()
     ZONE_REFILL = auto()
     BOARD_STACKUP = auto()
+    BOARD_ROUTE = auto()
 
 
 class BoardOps(ABC):
@@ -91,6 +92,51 @@ class BoardOps(ABC):
     def get_design_rules(self, path: Path) -> dict[str, Any]:
         """Get the board's design rules."""
         raise NotImplementedError("This backend does not support design rule reading")
+
+    def save_board(self, path: Path) -> dict[str, Any]:
+        """Save the board to disk (flush pcbnew in-memory state)."""
+        raise NotImplementedError("This backend does not support explicit board save")
+
+    def reload_board(self, path: Path) -> dict[str, Any]:
+        """Reload the board from disk into pcbnew (sync after external file writes)."""
+        raise NotImplementedError("This backend does not support explicit board reload")
+
+    def add_board_outline(
+        self, path: Path, x: float, y: float,
+        width: float, height: float, line_width: float = 0.05,
+    ) -> dict[str, Any]:
+        """Add a rectangular board outline on Edge.Cuts."""
+        raise NotImplementedError("This backend does not support add_board_outline")
+
+    def auto_place(
+        self, path: Path, board_x: float, board_y: float,
+        board_width: float, board_height: float, clearance_mm: float = 1.5,
+    ) -> dict[str, Any]:
+        """Place all components using geometry-driven bin-packing."""
+        raise NotImplementedError("This backend does not support auto_place")
+
+    def place_components_bulk(
+        self, path: Path, components: list[dict],
+    ) -> dict[str, Any]:
+        """Place multiple components in a single read/write cycle.
+
+        components: list of dicts with keys: reference, footprint, x, y,
+                    and optionally layer (default "F.Cu") and rotation (default 0.0).
+        Returns {"placed": [...], "failed": [...]}.
+        """
+        raise NotImplementedError("This backend does not support place_components_bulk")
+
+    def export_dsn(self, path: Path, dsn_path: Path) -> dict[str, Any]:
+        """Export board to Specctra DSN via live in-memory board."""
+        raise NotImplementedError("This backend does not support export_dsn")
+
+    def import_ses(self, path: Path, ses_path: Path) -> dict[str, Any]:
+        """Import Specctra SES routing into live in-memory board."""
+        raise NotImplementedError("This backend does not support import_ses")
+
+    def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
+        """Remove all routed tracks and vias from the board file."""
+        raise NotImplementedError("This backend does not support clear_routes")
 
 
 class SchematicOps(ABC):
@@ -240,6 +286,14 @@ class ExportOps(ABC):
         """Export PDF."""
         raise NotImplementedError("This backend does not support PDF export")
 
+    def export_step(self, board_path: Path, output_path: Path) -> dict[str, Any]:
+        """Export 3D STEP model."""
+        raise NotImplementedError("This backend does not support STEP export")
+
+    def export_vrml(self, board_path: Path, output_path: Path) -> dict[str, Any]:
+        """Export 3D VRML model."""
+        raise NotImplementedError("This backend does not support VRML export")
+
 
 class DRCOps(ABC):
     """Abstract interface for design rule checks."""
@@ -386,3 +440,88 @@ class KiCadBackend(ABC):
             Dict with project_name, project_path, and open_documents list.
         """
         raise NotImplementedError("This backend does not support active project queries")
+
+
+class BackendProtocol:
+    """Concrete base class that both CompositeBackend and PluginDirectBackend inherit.
+
+    All methods raise NotImplementedError by default. Subclasses override only what
+    they support. Adding a new method here makes it available on both backends without
+    requiring changes in both subclasses simultaneously.
+    """
+
+    def get_board_ops(self) -> BoardOps:
+        raise NotImplementedError("This backend does not support board operations")
+
+    def get_board_modify_ops(self) -> BoardOps:
+        raise NotImplementedError("This backend does not support board modification")
+
+    def get_schematic_ops(self) -> SchematicOps:
+        raise NotImplementedError("This backend does not support schematic operations")
+
+    def get_schematic_modify_ops(self) -> SchematicOps:
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def get_export_ops(self) -> ExportOps:
+        raise NotImplementedError("This backend does not support export operations")
+
+    def get_drc_ops(self) -> DRCOps:
+        raise NotImplementedError("This backend does not support DRC/ERC")
+
+    def get_library_ops(self) -> LibraryOps:
+        raise NotImplementedError("This backend does not support library operations")
+
+    def get_library_manage_ops(self) -> LibraryManageOps:
+        raise NotImplementedError("This backend does not support library management")
+
+    def get_zone_refill_ops(self) -> BoardOps | None:
+        return None
+
+    def get_board_stackup_ops(self) -> BoardOps | None:
+        return None
+
+    def get_active_project(self) -> dict[str, Any]:
+        raise NotImplementedError("This backend does not support active project queries")
+
+    def has_capability(self, capability: BackendCapability) -> bool:
+        return False
+
+    def get_status(self) -> dict[str, Any]:
+        raise NotImplementedError("This backend does not implement get_status")
+
+    def save_board(self, path: Path) -> bool:
+        """Flush in-memory board state to disk.
+
+        Returns True if a save was performed, False if plugin is not active.
+        PluginDirectBackend always returns True or raises.
+        """
+        return False
+
+    def export_dsn(self, path: Path, dsn_path: Path) -> dict:
+        """Export DSN for FreeRouting.
+
+        Routes to the best available BOARD_ROUTE backend (plugin bridge if active,
+        otherwise subprocess pcbnew). Raises on failure.
+        """
+        raise NotImplementedError("This backend does not support DSN export")
+
+    def import_ses(self, path: Path, ses_path: Path) -> dict:
+        """Import FreeRouting SES result.
+
+        Routes to the best available BOARD_ROUTE backend (plugin bridge if active,
+        otherwise subprocess pcbnew). Raises on failure.
+        """
+        raise NotImplementedError("This backend does not support SES import")
+
+    def reload_board(self, path: Path) -> bool:
+        """Reload pcbnew in-memory board from disk after an external write.
+
+        Returns True if a reload was performed, False if plugin not active.
+        """
+        return False
+
+    def get_text_variables(self, project_path: Any) -> dict[str, Any]:
+        raise NotImplementedError("This backend does not support text variables")
+
+    def set_text_variables(self, project_path: Any, variables: dict[str, str]) -> dict[str, Any]:
+        raise NotImplementedError("This backend does not support text variables")

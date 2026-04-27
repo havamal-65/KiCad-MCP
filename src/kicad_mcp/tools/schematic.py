@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -16,7 +16,7 @@ from kicad_mcp.utils.validation import validate_kicad_path, validate_reference, 
 logger = get_logger("tools.schematic")
 
 
-def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLog) -> None:
+def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register schematic tools on the MCP server."""
 
     @mcp.tool()
@@ -605,13 +605,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
 
-        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
+        from kicad_mcp.backends.file_backend import FileSchematicOps
 
-        # Always use file-backend reads: compare_schematic_pcb is read-only and
-        # IPC read_board on a large routed board can hang (serializing hundreds
-        # of tracks through the gRPC layer adds seconds and risks timeouts).
         sch_data = FileSchematicOps().read_schematic(sch_p)
-        pcb_data = FileBoardOps().read_board(pcb_p)
+        pcb_data = backend.get_board_ops().read_board(pcb_p)
 
         # Build dicts keyed by reference, filtering out power symbols.
         # Multi-unit components appear once per unit; merge so the footprint
@@ -838,12 +835,21 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         actions: list[dict] = []
         warnings: list[dict] = []
 
-        # Try IPC board modify ops; fall back to file backend if unavailable/timeout.
-        # The file backend is safe here: the PCB was just created (not open in KiCad).
-        try:
-            board_modify_ops = backend.get_board_modify_ops()
-        except Exception:
+        # Select board modify ops based on whether the earlier read succeeded via the
+        # plugin backend.  If the read had to fall back to FileBoardOps (bridge down or
+        # board not open in KiCad), use FileBoardOps for mutations too — that is safe
+        # when the PCB was just created and has not been opened in the PCB editor yet.
+        # This avoids the previous bug where get_board_modify_ops() always succeeded
+        # (it returns an ops object without probing the bridge), then every individual
+        # place_component / assign_net call failed with [WinError 10061] and was
+        # silently turned into a warning, producing status:"success" with 0 placements.
+        if isinstance(pcb_ops, FileBoardOps):
             board_modify_ops = FileBoardOps()
+        else:
+            try:
+                board_modify_ops = backend.get_board_modify_ops()
+            except Exception:
+                board_modify_ops = FileBoardOps()
 
         # Auto-position grid for new components
         place_x, place_y = 50.0, 50.0

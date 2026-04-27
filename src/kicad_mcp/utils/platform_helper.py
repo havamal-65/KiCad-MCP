@@ -272,6 +272,95 @@ def launch_kicad(project_path: Path | None = None) -> bool:
         return False
 
 
+def find_pcbnew_executable() -> Path | None:
+    """Find the pcbnew standalone executable.
+
+    Returns:
+        Path to pcbnew if found, None otherwise.
+    """
+    platform = get_platform()
+
+    if platform == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for base in [program_files, program_files_x86]:
+            for version in ["9.0", "8.0", "7.0"]:
+                candidate = Path(base) / "KiCad" / version / "bin" / "pcbnew.exe"
+                if candidate.exists():
+                    return candidate
+
+    elif platform == "macos":
+        candidate = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/pcbnew")
+        if candidate.exists():
+            return candidate
+
+    else:  # linux
+        for name in ["/usr/bin/pcbnew", "/usr/local/bin/pcbnew"]:
+            candidate = Path(name)
+            if candidate.exists():
+                return candidate
+        in_path = shutil.which("pcbnew")
+        if in_path:
+            return Path(in_path)
+
+    return None
+
+
+def launch_pcbnew(pcb_path: Path) -> bool:
+    """Launch the pcbnew PCB editor with a specific board file.
+
+    Args:
+        pcb_path: Path to a .kicad_pcb file.
+
+    Returns:
+        True if the launch command succeeded, False otherwise.
+    """
+    import subprocess
+
+    platform = get_platform()
+    exe = find_pcbnew_executable()
+    if exe is None:
+        logger.warning("pcbnew executable not found — cannot launch")
+        return False
+
+    try:
+        args = [str(exe), str(pcb_path)]
+        if platform == "windows":
+            subprocess.Popen(
+                args,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            )
+        else:
+            subprocess.Popen(args)
+        return True
+    except Exception as e:
+        logger.warning("Failed to launch pcbnew: %s", e)
+        return False
+
+
+def wait_for_bridge(port: int = 9760, timeout: float = 20.0) -> bool:
+    """Poll the bridge TCP port until it accepts connections or timeout expires.
+
+    Args:
+        port: TCP port to probe (default 9760).
+        timeout: Maximum seconds to wait (default 20).
+
+    Returns:
+        True if the bridge came up within the timeout, False otherwise.
+    """
+    import socket
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
 def detect_kicad_version() -> str | None:
     """Try to detect the installed KiCad version.
 

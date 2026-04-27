@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
-import os
-import re
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
+from kicad_mcp.backends.subprocess_backend import (
+    _BOARD_CLEAN_TIMEOUT_SECONDS,
+    _BOARD_LOAD_FAILED_SENTINEL,
+    _format_pcbnew_error,
+    _get_pcbnew,
+    _malformed_board_message,
+    _run_pcbnew_script,
+)
 from kicad_mcp.config import KiCadMCPConfig
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
@@ -26,575 +31,9 @@ from kicad_mcp.utils.validation import validate_kicad_path
 logger = get_logger("tools.routing")
 
 
-_BOARD_LOAD_FAILED_SENTINEL = "BOARD_LOAD_FAILED"
-_BOARD_OUTLINE_MISSING_SENTINEL = "BOARD_OUTLINE_MISSING"
-_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL = "BOARD_OUTLINE_NO_SEGMENTS"
-_BOARD_OUTLINE_OPEN_SENTINEL = "BOARD_OUTLINE_OPEN"
-_DSN_EXPORT_TIMEOUT_SECONDS = 900
-_SES_IMPORT_TIMEOUT_SECONDS = 900
-_BOARD_CLEAN_TIMEOUT_SECONDS = 300
-_BOARD_PREFLIGHT_TIMEOUT_SECONDS = 180
-
-
-def _get_pcbnew():
-    """Try to import pcbnew module.
-
-    Returns:
-        The pcbnew module, or None if not available.
-    """
-    from kicad_mcp.utils.platform_helper import add_kicad_to_sys_path
-    add_kicad_to_sys_path()
-    try:
-        import pcbnew
-        return pcbnew
-    except ImportError:
-        return None
-
-
-def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
-    """Run a Python script using KiCad's bundled Python interpreter.
-
-    Falls back to subprocess execution when pcbnew is not importable
-    in the current Python environment.
-
-    Args:
-        script: Python code to execute.
-        timeout: Timeout in seconds.
-
-    Returns:
-        Tuple of (success, output_text).
-    """
-    from kicad_mcp.utils.platform_helper import get_platform
-
-    platform = get_platform()
-    kicad_python = None
-
-    if platform == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        for version in ["9.0", "8.0", "7.0"]:
-            candidate = Path(program_files) / "KiCad" / version / "bin" / "python.exe"
-            if candidate.exists():
-                kicad_python = candidate
-                break
-    elif platform == "macos":
-        candidate = Path("/Applications/KiCad/KiCad.app/Contents/Frameworks/"
-                         "Python.framework/Versions/Current/bin/python3")
-        if candidate.exists():
-            kicad_python = candidate
-    else:
-        # On Linux, pcbnew is usually importable system-wide
-        kicad_python = Path("/usr/bin/python3")
-
-    if kicad_python is None or not kicad_python.exists():
-        return False, "KiCad Python interpreter not found"
-
-    env = os.environ.copy()
-    if platform == "windows":
-        kicad_bin = kicad_python.parent
-        env["PYTHONHOME"] = str(kicad_bin)
-        env["PYTHONPATH"] = ";".join([
-            str(kicad_bin / "Lib" / "site-packages"),
-            str(kicad_bin / "Lib"),
-        ])
-        # Add kicad_bin to PATH so Windows can resolve DLLs when _pcbnew.pyd loads
-        env["PATH"] = str(kicad_bin) + ";" + env.get("PATH", "")
-        site_pkgs = str(kicad_bin / "Lib" / "site-packages")
-        preamble = (
-            f"import ctypes; ctypes.windll.kernel32.SetErrorMode(3)\n"
-            f"import os, sys; "
-            f"os.add_dll_directory({str(kicad_bin)!r}); "
-            f"sys.path.insert(0, {site_pkgs!r})\n"
-        )
-        script = preamble + script
-
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    try:
-        result = subprocess.run(
-            [str(kicad_python), "-S", "-u", "-c", script],
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            timeout=timeout,
-            env=env,
-            creationflags=creationflags,
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        if result.returncode != 0 and not output.strip():
-            output = (
-                f"KiCad Python exited with code {result.returncode} "
-                "and produced no diagnostic output."
-            )
-        return result.returncode == 0, output
-    except subprocess.TimeoutExpired as e:
-        partial_output = ""
-        if isinstance(e.stdout, str):
-            partial_output += e.stdout
-        elif isinstance(e.stdout, bytes):
-            partial_output += e.stdout.decode(errors="replace")
-        if isinstance(e.stderr, str):
-            partial_output += e.stderr
-        elif isinstance(e.stderr, bytes):
-            partial_output += e.stderr.decode(errors="replace")
-
-        normalized = _normalize_error_text(partial_output)
-        if normalized:
-            return False, (
-                f"Script timed out after {timeout} seconds. "
-                f"Partial output: {normalized}"
-            )
-        return False, f"Script timed out after {timeout} seconds with no output."
-    except OSError as e:
-        return False, f"Failed to run KiCad Python: {e}"
-
-
-def _normalize_error_text(text: str, max_chars: int = 1200) -> str:
-    """Normalize multiline stderr into a compact single-line message."""
-    compact = " ".join((text or "").split())
-    if len(compact) > max_chars:
-        return compact[:max_chars] + "..."
-    return compact
-
-
-def _malformed_board_message(board_path: Path, details: str = "") -> str:
-    message = (
-        f"Malformed board: KiCad could not load '{board_path}'. "
-        "Ensure the .kicad_pcb file is valid before running autoroute."
-    )
-    normalized = _normalize_error_text(details)
-    if normalized:
-        message += f" Details: {normalized}"
-    return message
-
-
-def _board_outline_error_message(board_path: Path, details: str = "") -> str:
-    message = (
-        f"Board outline error: '{board_path}' must include a closed Edge.Cuts outline "
-        "before running autoroute."
-    )
-    normalized = _normalize_error_text(details)
-    if normalized:
-        message += f" Details: {normalized}"
-    return message
-
-
-def _format_pcbnew_error(prefix: str, output_text: str, board_path: Path | None = None) -> str:
-    """Build a stable error message from pcbnew subprocess output."""
-    has_load_failed = _BOARD_LOAD_FAILED_SENTINEL in (output_text or "")
-    cleaned = (output_text or "").replace(_BOARD_LOAD_FAILED_SENTINEL, "")
-    normalized = _normalize_error_text(cleaned)
-
-    if board_path is not None and (has_load_failed or not normalized):
-        detail = normalized or "KiCad did not provide additional diagnostics."
-        return _malformed_board_message(board_path, detail)
-
-    if normalized:
-        return f"{prefix}: {normalized}"
-    return f"{prefix}: KiCad did not provide additional diagnostics."
-
-
-def _point_key(point: object) -> tuple[int, int] | None:
-    x = getattr(point, "x", None)
-    y = getattr(point, "y", None)
-    if x is None or y is None:
-        try:
-            return int(point[0]), int(point[1])  # type: ignore[index]
-        except Exception:
-            return None
-    return int(x), int(y)
-
-
-def _is_closed_outline_item(item: object) -> bool:
-    """Return True for closed geometric edge items (rectangles, polygons, circles)."""
-    if hasattr(item, "IsClosed"):
-        try:
-            if bool(item.IsClosed()):
-                return True
-        except Exception:
-            pass
-
-    # Fallback for APIs where IsClosed is unavailable/restricted.
-    if hasattr(item, "GetShapeStr"):
-        try:
-            shape = str(item.GetShapeStr()).lower()
-            if any(token in shape for token in ("rect", "polygon", "poly", "circle")):
-                return True
-        except Exception:
-            pass
-
-    return False
-
-
-def _is_edge_cuts_item(item: object, board: object, edge_layer_id: int | None) -> bool:
-    if hasattr(item, "GetLayerName"):
-        try:
-            if item.GetLayerName() == "Edge.Cuts":
-                return True
-        except Exception:
-            pass
-
-    if hasattr(item, "GetLayer"):
-        try:
-            layer = int(item.GetLayer())
-            if edge_layer_id is not None:
-                return layer == edge_layer_id
-            if hasattr(board, "GetLayerName"):
-                return board.GetLayerName(layer) == "Edge.Cuts"
-        except Exception:
-            return False
-    return False
-
-
-def _check_edge_cuts_closed(board: object, edge_layer_id: int | None) -> tuple[bool, str]:
-    if not hasattr(board, "GetDrawings"):
-        return False, "Board API does not expose drawings for outline validation."
-
-    edge_items = 0
-    endpoint_counts: dict[tuple[int, int], int] = {}
-    closed_items = 0
-    drawings = board.GetDrawings()
-    for item in drawings:
-        if not _is_edge_cuts_item(item, board, edge_layer_id):
-            continue
-        edge_items += 1
-        if _is_closed_outline_item(item):
-            closed_items += 1
-            continue
-        if hasattr(item, "GetStart") and hasattr(item, "GetEnd"):
-            try:
-                start_key = _point_key(item.GetStart())
-                end_key = _point_key(item.GetEnd())
-            except Exception:
-                start_key = None
-                end_key = None
-            if start_key is not None and end_key is not None:
-                endpoint_counts[start_key] = endpoint_counts.get(start_key, 0) + 1
-                endpoint_counts[end_key] = endpoint_counts.get(end_key, 0) + 1
-
-    if edge_items == 0:
-        return False, "No Edge.Cuts geometry found."
-    if closed_items > 0 and not endpoint_counts:
-        return True, ""
-    if not endpoint_counts:
-        return False, "Edge.Cuts exists but no drawable outline segments were found."
-
-    unmatched = sum(1 for count in endpoint_counts.values() if count % 2 != 0)
-    if unmatched:
-        return False, f"Edge.Cuts outline appears open ({unmatched} unmatched endpoints)."
-    return True, ""
-
-
-def _validate_board_preflight(board_path: Path) -> tuple[bool, str]:
-    """Validate board loadability and basic outline integrity before routing."""
-    pcbnew = _get_pcbnew()
-    if pcbnew is not None:
-        try:
-            board = pcbnew.LoadBoard(str(board_path))
-            if board is None:
-                return False, _malformed_board_message(board_path)
-            edge_layer_id = getattr(pcbnew, "Edge_Cuts", None)
-            is_closed, details = _check_edge_cuts_closed(board, edge_layer_id)
-            if not is_closed:
-                return False, _board_outline_error_message(board_path, details)
-            return True, ""
-        except Exception as e:
-            return False, _format_pcbnew_error("Board preflight failed", str(e), board_path)
-
-    script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(board_path)!r})
-if board is None:
-    print("{_BOARD_LOAD_FAILED_SENTINEL}")
-    sys.exit(2)
-
-edge_layer_id = getattr(pcbnew, "Edge_Cuts", None)
-edge_items = 0
-endpoint_counts = {{}}
-closed_items = 0
-
-def point_key(point):
-    x = getattr(point, "x", None)
-    y = getattr(point, "y", None)
-    if x is None or y is None:
-        try:
-            return int(point[0]), int(point[1])
-        except Exception:
-            return None
-    return int(x), int(y)
-
-def is_edge_cuts(item):
-    if hasattr(item, "GetLayerName"):
-        try:
-            if item.GetLayerName() == "Edge.Cuts":
-                return True
-        except Exception:
-            pass
-    if hasattr(item, "GetLayer"):
-        try:
-            layer = int(item.GetLayer())
-            if edge_layer_id is not None:
-                return layer == edge_layer_id
-            if hasattr(board, "GetLayerName"):
-                return board.GetLayerName(layer) == "Edge.Cuts"
-        except Exception:
-            return False
-    return False
-
-def is_closed_item(item):
-    if hasattr(item, "IsClosed"):
-        try:
-            if bool(item.IsClosed()):
-                return True
-        except Exception:
-            pass
-    if hasattr(item, "GetShapeStr"):
-        try:
-            shape = str(item.GetShapeStr()).lower()
-            if ("rect" in shape or "polygon" in shape or "poly" in shape or "circle" in shape):
-                return True
-        except Exception:
-            pass
-    return False
-
-if not hasattr(board, "GetDrawings"):
-    print("{_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL}")
-    sys.exit(4)
-
-for item in board.GetDrawings():
-    if not is_edge_cuts(item):
-        continue
-    edge_items += 1
-    if is_closed_item(item):
-        closed_items += 1
-        continue
-    if hasattr(item, "GetStart") and hasattr(item, "GetEnd"):
-        try:
-            start_key = point_key(item.GetStart())
-            end_key = point_key(item.GetEnd())
-        except Exception:
-            start_key = None
-            end_key = None
-        if start_key is not None and end_key is not None:
-            endpoint_counts[start_key] = endpoint_counts.get(start_key, 0) + 1
-            endpoint_counts[end_key] = endpoint_counts.get(end_key, 0) + 1
-
-if edge_items == 0:
-    print("{_BOARD_OUTLINE_MISSING_SENTINEL}")
-    sys.exit(3)
-
-if closed_items > 0 and not endpoint_counts:
-    print("BOARD_PREFLIGHT_OK")
-    sys.exit(0)
-
-if not endpoint_counts:
-    print("{_BOARD_OUTLINE_NO_SEGMENTS_SENTINEL}")
-    sys.exit(4)
-
-unmatched = sum(1 for count in endpoint_counts.values() if count % 2 != 0)
-if unmatched:
-    print(f"{_BOARD_OUTLINE_OPEN_SENTINEL}:{{unmatched}}")
-    sys.exit(5)
-
-print("BOARD_PREFLIGHT_OK")
-"""
-    ok, output_text = _run_pcbnew_script(script, timeout=_BOARD_PREFLIGHT_TIMEOUT_SECONDS)
-    if ok and "BOARD_PREFLIGHT_OK" in output_text:
-        return True, ""
-
-    output_text = output_text or ""
-    if _BOARD_LOAD_FAILED_SENTINEL in output_text:
-        return False, _malformed_board_message(board_path)
-    if _BOARD_OUTLINE_MISSING_SENTINEL in output_text:
-        return False, _board_outline_error_message(board_path, "No Edge.Cuts geometry found.")
-    if _BOARD_OUTLINE_NO_SEGMENTS_SENTINEL in output_text:
-        return False, _board_outline_error_message(
-            board_path,
-            "Edge.Cuts exists but no drawable outline segments were found.",
-        )
-    if _BOARD_OUTLINE_OPEN_SENTINEL in output_text:
-        detail = "Edge.Cuts outline appears open."
-        for line in output_text.splitlines():
-            if line.startswith(f"{_BOARD_OUTLINE_OPEN_SENTINEL}:"):
-                unmatched = line.split(":", 1)[1].strip()
-                if unmatched.isdigit():
-                    detail = f"Edge.Cuts outline appears open ({unmatched} unmatched endpoints)."
-                break
-        return False, _board_outline_error_message(board_path, detail)
-
-    return False, _format_pcbnew_error("Board preflight failed", output_text, board_path)
-
-
 # ---------------------------------------------------------------------------
 # Implementation helpers — plain Python functions callable from autoroute
 # ---------------------------------------------------------------------------
-
-def _impl_export_dsn(
-    path: str,
-    output: str,
-    config: KiCadMCPConfig,
-    change_log: ChangeLog,
-) -> str:
-    """Export a PCB board to Specctra DSN format."""
-    p = validate_kicad_path(path, ".kicad_pcb")
-    dsn_path = Path(output) if output else p.parent / "freerouting.dsn"
-    dsn_path = dsn_path.resolve()
-
-    preflight_ok, preflight_message = _validate_board_preflight(p)
-    if not preflight_ok:
-        return json.dumps({
-            "status": "error",
-            "message": preflight_message,
-        })
-
-    dsn_path.parent.mkdir(parents=True, exist_ok=True)
-
-    pcbnew = _get_pcbnew()
-    if pcbnew is not None:
-        try:
-            board = pcbnew.LoadBoard(str(p))
-            if board is None:
-                return json.dumps({
-                    "status": "error",
-                    "message": _malformed_board_message(p),
-                })
-            ok = pcbnew.ExportSpecctraDSN(board, str(dsn_path))
-            if not ok:
-                return json.dumps({
-                    "status": "error",
-                    "message": "ExportSpecctraDSN returned False. "
-                               "Check for duplicate reference designators.",
-                })
-        except Exception as e:
-            return json.dumps({
-                "status": "error",
-                "message": _format_pcbnew_error("pcbnew DSN export failed", str(e), p),
-            })
-    else:
-        script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(p)!r})
-if board is None:
-    print("{_BOARD_LOAD_FAILED_SENTINEL}")
-    sys.exit(2)
-ok = pcbnew.ExportSpecctraDSN(board, {str(dsn_path)!r})
-if not ok:
-    print("EXPORT_FAILED")
-    sys.exit(1)
-print("EXPORT_OK")
-"""
-        ok, output_text = _run_pcbnew_script(script, timeout=_DSN_EXPORT_TIMEOUT_SECONDS)
-        if not ok or "EXPORT_FAILED" in output_text:
-            return json.dumps({
-                "status": "error",
-                "message": _format_pcbnew_error("DSN export failed", output_text, p),
-            })
-
-    # Clean Unicode characters that FreeRouting can't handle
-    if dsn_path.exists():
-        content = dsn_path.read_text(encoding="utf-8")
-        cleaned = re.sub("[ΩµΦ°]", "", content)
-        dsn_path.write_text(cleaned, encoding="utf-8")
-
-    if not dsn_path.exists():
-        return json.dumps({
-            "status": "error",
-            "message": "DSN file was not created",
-        })
-
-    size = dsn_path.stat().st_size
-    change_log.record("export_dsn", {"path": path, "output": str(dsn_path)})
-    return json.dumps({
-        "status": "success",
-        "dsn_path": str(dsn_path),
-        "size_bytes": size,
-        "message": f"DSN exported: {dsn_path.name} ({size} bytes)",
-    }, indent=2)
-
-
-def _impl_import_ses(
-    path: str,
-    ses_path: str,
-    change_log: ChangeLog,
-) -> str:
-    """Import a routed Specctra SES session file into a PCB board."""
-    p = validate_kicad_path(path, ".kicad_pcb")
-    ses = Path(ses_path).resolve()
-    if not ses.exists():
-        return json.dumps({
-            "status": "error",
-            "message": f"SES file not found: {ses}",
-        })
-
-    backup = create_backup(p)
-    tracks_before = 0
-    tracks_after = 0
-
-    pcbnew = _get_pcbnew()
-    if pcbnew is not None:
-        try:
-            board = pcbnew.LoadBoard(str(p))
-            if board is None:
-                return json.dumps({
-                    "status": "error",
-                    "message": _malformed_board_message(p),
-                })
-            tracks_before = len(board.GetTracks())
-            ok = pcbnew.ImportSpecctraSES(board, str(ses))
-            if not ok:
-                return json.dumps({
-                    "status": "error",
-                    "message": "ImportSpecctraSES returned False",
-                })
-            tracks_after = len(board.GetTracks())
-            pcbnew.SaveBoard(str(p), board)
-        except Exception as e:
-            return json.dumps({
-                "status": "error",
-                "message": _format_pcbnew_error("SES import failed", str(e), p),
-            })
-    else:
-        script = f"""
-import pcbnew, sys
-board = pcbnew.LoadBoard({str(p)!r})
-if board is None:
-    print("{_BOARD_LOAD_FAILED_SENTINEL}")
-    sys.exit(2)
-before = len(board.GetTracks())
-ok = pcbnew.ImportSpecctraSES(board, {str(ses)!r})
-if not ok:
-    print("IMPORT_FAILED")
-    sys.exit(1)
-after = len(board.GetTracks())
-pcbnew.SaveBoard({str(p)!r}, board)
-print(f"TRACKS_BEFORE={{before}}")
-print(f"TRACKS_AFTER={{after}}")
-"""
-        ok, output_text = _run_pcbnew_script(script, timeout=_SES_IMPORT_TIMEOUT_SECONDS)
-        if not ok or "IMPORT_FAILED" in output_text:
-            return json.dumps({
-                "status": "error",
-                "message": _format_pcbnew_error("SES import failed", output_text, p),
-            })
-        for line in output_text.splitlines():
-            if line.startswith("TRACKS_BEFORE="):
-                tracks_before = int(line.split("=")[1])
-            elif line.startswith("TRACKS_AFTER="):
-                tracks_after = int(line.split("=")[1])
-
-    new_tracks = tracks_after - tracks_before
-    change_log.record(
-        "import_ses",
-        {"path": path, "ses_path": ses_path},
-        file_modified=path,
-        backup_path=str(backup) if backup else None,
-    )
-    return json.dumps({
-        "status": "success",
-        "tracks_before": tracks_before,
-        "tracks_after": tracks_after,
-        "new_tracks": new_tracks,
-        "message": f"Imported {new_tracks} routed tracks",
-    }, indent=2)
-
 
 def _impl_run_freerouter(
     dsn_path: str,
@@ -606,6 +45,8 @@ def _impl_run_freerouter(
     change_log: ChangeLog,
 ) -> str:
     """Run FreeRouting auto-router on a Specctra DSN file."""
+    import re
+
     dsn = Path(dsn_path).resolve()
     if not dsn.exists():
         return json.dumps({
@@ -842,12 +283,169 @@ print(f"TRACKS={{tracks}}")
 
 
 # ---------------------------------------------------------------------------
+# NPTH keepout injection helpers
+# ---------------------------------------------------------------------------
+
+def _extract_npth_pads(pcb_path: Path) -> list[dict]:
+    """Return absolute positions and drill sizes for all NPTH pads in a .kicad_pcb file.
+
+    Parses each footprint block, rotates the pad's local offset by the footprint
+    rotation, and adds the footprint origin to get the board-coordinate centre.
+    Returns a list of {"x": float, "y": float, "drill_mm": float} dicts.
+    """
+    import math
+    import re as _re
+
+    content = pcb_path.read_text(encoding="utf-8")
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    fp_at_re  = _re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
+    pad_re    = _re.compile(r'\(pad\s+"[^"]*"\s+np_thru_hole')
+    drill_re  = _re.compile(r'\(drill\s+([-\d.]+)')
+    pat_at_re = _re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
+
+    results: list[dict] = []
+    i = 0
+    n = len(content)
+
+    while i < n:
+        if content[i:i+11] != "(footprint ":
+            i += 1
+            continue
+        end = _walk_balanced_parens(content, i)
+        if end is None:
+            i += 1
+            continue
+        fp_block = content[i:end + 1]
+
+        # Footprint origin and rotation (first (at ...) in the block)
+        at_m = fp_at_re.search(fp_block)
+        if not at_m:
+            i = end + 1
+            continue
+        fp_x   = float(at_m.group(1))
+        fp_y   = float(at_m.group(2))
+        fp_rot = float(at_m.group(3)) if at_m.group(3) else 0.0
+
+        # Find each NPTH pad inside this footprint
+        for pad_m in pad_re.finditer(fp_block):
+            pad_start = pad_m.start()
+            pad_end   = _walk_balanced_parens(fp_block, pad_start)
+            if pad_end is None:
+                continue
+            pad_block = fp_block[pad_start:pad_end + 1]
+
+            drill_m = drill_re.search(pad_block)
+            if not drill_m:
+                continue
+            drill_mm = float(drill_m.group(1))
+
+            # Pad local offset (skip the first (at ...) which belongs to footprint)
+            pad_ats = list(pat_at_re.finditer(pad_block))
+            if not pad_ats:
+                dx, dy = 0.0, 0.0
+            else:
+                first_at = pad_ats[0]
+                dx = float(first_at.group(1))
+                dy = float(first_at.group(2))
+
+            # Rotate local offset by footprint rotation (KiCad: positive angle = CW)
+            if fp_rot:
+                angle_rad = math.radians(fp_rot)
+                cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+                rdx =  cos_a * dx + sin_a * dy
+                rdy = -sin_a * dx + cos_a * dy
+            else:
+                rdx, rdy = dx, dy
+
+            results.append({
+                "x":        round(fp_x + rdx, 6),
+                "y":        round(fp_y + rdy, 6),
+                "drill_mm": drill_mm,
+            })
+
+        i = end + 1
+
+    return results
+
+
+def _inject_npth_keepouts_into_dsn(
+    dsn_path: Path,
+    npth_pads: list[dict],
+    expansion_mm: float = 0.22,
+) -> int:
+    """Append keepout circles for NPTH pads into the DSN (structure ...) block.
+
+    Returns the number of keepout entries written (0 if structure block not found).
+    FreeRouting respects these and will not route copper through the drill areas.
+    """
+    import re as _re
+
+    content = dsn_path.read_text(encoding="utf-8")
+
+    # Collect signal layer names from the DSN structure
+    layer_re = _re.compile(r'\(layer\s+"?([^")\s]+)"?\s+\(type\s+signal\)')
+    layers = layer_re.findall(content)
+    if not layers:
+        # Fall back: accept any named layer
+        layers = _re.findall(r'\(layer\s+"?([^")\s]+)"?', content)
+    if not layers:
+        return 0
+
+    keepout_lines: list[str] = []
+    for pad in npth_pads:
+        radius = round(pad["drill_mm"] / 2.0 + expansion_mm, 4)
+        x = round(pad["x"], 4)
+        y = round(pad["y"], 4)
+        for layer in layers:
+            keepout_lines.append(
+                f'    (keepout "" (circle "{layer}" {radius} {x} {y}))'
+            )
+
+    if not keepout_lines:
+        return 0
+
+    injection = "\n" + "\n".join(keepout_lines) + "\n  "
+
+    # Insert before the closing ) of the (structure ...) block
+    struct_start = content.find("(structure")
+    if struct_start == -1:
+        return 0
+
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+    struct_end = _walk_balanced_parens(content, struct_start)
+    if struct_end is None:
+        return 0
+
+    content = content[:struct_end] + injection + content[struct_end:]
+    dsn_path.write_text(content, encoding="utf-8")
+    return len(keepout_lines)
+
+
+def _read_hole_clearance_from_pro(pcb_path: Path, default: float = 0.22) -> float:
+    """Read min_hole_clearance from the sibling .kicad_pro design_settings."""
+    import json as _json
+
+    pro_path = pcb_path.with_suffix(".kicad_pro")
+    try:
+        pro = _json.loads(pro_path.read_text(encoding="utf-8"))
+        return float(
+            pro.get("board", {})
+               .get("design_settings", {})
+               .get("rules", {})
+               .get("min_hole_clearance", default)
+        )
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
 def register_tools(
     mcp: FastMCP,
-    backend: CompositeBackend,
+    backend: BackendProtocol,
     change_log: ChangeLog,
     config: KiCadMCPConfig,
 ) -> None:
@@ -863,6 +461,9 @@ def register_tools(
         Exports the board to DSN format and cleans Unicode characters
         that FreeRouting cannot handle (Omega, mu, Phi, degree symbols).
 
+        Routes to plugin bridge if active (reads live in-memory board),
+        otherwise uses subprocess pcbnew.
+
         Args:
             path: Path to .kicad_pcb file.
             output: Output DSN file path. Defaults to <board_dir>/freerouting.dsn.
@@ -870,7 +471,26 @@ def register_tools(
         Returns:
             JSON with export result and output file path.
         """
-        return _impl_export_dsn(path, output, config, change_log)
+        p = validate_kicad_path(path, ".kicad_pcb")
+        dsn_path = Path(output) if output else p.parent / "freerouting.dsn"
+        dsn_path = dsn_path.resolve()
+        try:
+            result = backend.export_dsn(p, dsn_path)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, indent=2)
+
+        # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
+        try:
+            npth_pads = _extract_npth_pads(p)
+            if npth_pads:
+                expansion = _read_hole_clearance_from_pro(p)
+                n_keepouts = _inject_npth_keepouts_into_dsn(dsn_path, npth_pads, expansion)
+                result["npth_keepouts_injected"] = n_keepouts
+        except Exception as exc:
+            logger.warning("NPTH keepout injection failed (non-fatal): %s", exc)
+
+        change_log.record("export_dsn", {"path": path, "output": str(dsn_path)})
+        return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
     def import_ses(
@@ -882,6 +502,9 @@ def register_tools(
         Applies auto-routed traces from a FreeRouting session file back
         into the KiCad PCB. Creates a backup before importing.
 
+        Routes to plugin bridge if active (updates live in-memory board),
+        otherwise uses subprocess pcbnew.
+
         Args:
             path: Path to .kicad_pcb file.
             ses_path: Path to .ses session file from FreeRouting.
@@ -889,7 +512,21 @@ def register_tools(
         Returns:
             JSON with import result and track count.
         """
-        return _impl_import_ses(path, ses_path, change_log)
+        p = validate_kicad_path(path, ".kicad_pcb")
+        ses = Path(ses_path).resolve()
+        backup = create_backup(p)
+        try:
+            result = backend.import_ses(p, ses)
+        except Exception as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, indent=2)
+        change_log.record(
+            "import_ses",
+            {"path": path, "ses_path": ses_path},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        backend.reload_board(p)
+        return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
     def run_freerouter(
@@ -944,6 +581,49 @@ def register_tools(
         )
 
     @mcp.tool()
+    def clear_routes(path: str, backup: bool = True) -> str:
+        """Remove all routed tracks and vias from a board, preserving component placement.
+
+        Strips every (segment ...) and (via ...) block from the .kicad_pcb file
+        so the board can be re-placed and re-routed without manual file surgery.
+        If the plugin bridge is active, reloads the board so KiCad reflects the change.
+
+        This is the correct tool to use when placement needs to be redone after routing
+        has already started. Use clear_routes + auto_place instead of routing over bad
+        placement.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            backup: Write a .clear_routes_backup.kicad_pcb file before modifying (default True).
+
+        Returns:
+            JSON with tracks_removed, vias_removed, and backup_path.
+        """
+        from kicad_mcp.backends.file_backend import FileBoardOps
+
+        p = validate_kicad_path(path, ".kicad_pcb")
+        result = FileBoardOps().clear_routes(p, backup=backup)
+
+        # Reload the in-memory board so KiCad's PCB editor reflects the change
+        if result.get("status") == "success":
+            try:
+                backend.reload_board(p)
+            except Exception:
+                pass  # reload is best-effort; file is already written
+
+        change_log.record(
+            "clear_routes",
+            {
+                "path": path,
+                "tracks_removed": result.get("tracks_removed", 0),
+                "vias_removed": result.get("vias_removed", 0),
+            },
+            file_modified=path,
+            backup_path=result.get("backup_path"),
+        )
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
     def autoroute(
         path: str,
         freerouting_jar: str = "",
@@ -987,13 +667,23 @@ def register_tools(
                 report["message"] = f"Board cleanup failed: {result.get('message', '')}"
                 return json.dumps(report, indent=2)
 
-        # Step 2: Export DSN
-        result_json = _impl_export_dsn(path, str(dsn), config, change_log)
-        result = json.loads(result_json)
-        report["steps"].append({"step": "export_dsn", **result})
-        if result["status"] != "success":
+        # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board)
+        # or subprocess pcbnew, via BOARD_ROUTE capability.
+        try:
+            dsn_result = backend.export_dsn(p, dsn)
+            # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
+            try:
+                npth_pads = _extract_npth_pads(p)
+                if npth_pads:
+                    expansion = _read_hole_clearance_from_pro(p)
+                    n_keepouts = _inject_npth_keepouts_into_dsn(dsn, npth_pads, expansion)
+                    dsn_result["npth_keepouts_injected"] = n_keepouts
+            except Exception as npth_exc:
+                logger.warning("NPTH keepout injection failed (non-fatal): %s", npth_exc)
+            report["steps"].append({"step": "export_dsn", "status": "success", **dsn_result})
+        except Exception as exc:
             report["status"] = "error"
-            report["message"] = f"DSN export failed: {result.get('message', '')}"
+            report["message"] = f"DSN export failed: {exc}"
             return json.dumps(report, indent=2)
 
         # Step 3: Run FreeRouting
@@ -1009,17 +699,46 @@ def register_tools(
             dsn.unlink(missing_ok=True)
             return json.dumps(report, indent=2)
 
-        # Step 4: Import SES
-        result_json = _impl_import_ses(path, str(ses), change_log)
-        result = json.loads(result_json)
-        report["steps"].append({"step": "import_ses", **result})
-        if result["status"] != "success":
-            report["status"] = "error"
-            report["message"] = f"SES import failed: {result.get('message', '')}"
-        else:
+        # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves)
+        # or subprocess pcbnew, via BOARD_ROUTE capability.
+        try:
+            ses_result = backend.import_ses(p, ses)
+            report["steps"].append({"step": "import_ses", "status": "success", **ses_result})
             report["message"] = (
-                f"Auto-routing complete: {result.get('new_tracks', 0)} tracks routed"
+                f"Auto-routing complete: {ses_result.get('new_tracks', 0)} tracks routed"
             )
+            result = {"status": "success", **ses_result}
+        except Exception as exc:
+            report["status"] = "error"
+            report["message"] = f"SES import failed: {exc}"
+            return json.dumps(report, indent=2)
+
+        # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking)
+        if result["status"] == "success":
+            try:
+                drc_ops = backend.get_drc_ops()
+                drc_result = drc_ops.run_drc(p, None)
+                drc_passed = drc_result.get("passed", False)
+                error_count = drc_result.get("error_count", 0)
+                report["steps"].append({
+                    "step": "post_route_drc",
+                    "status": "success",
+                    "passed": drc_passed,
+                    "error_count": error_count,
+                    "warning_count": drc_result.get("warning_count", 0),
+                })
+                if not drc_passed:
+                    report["status"] = "success_with_drc_errors"
+                    report["message"] = (
+                        f"Routed {result.get('new_tracks', 0)} tracks but DRC found "
+                        f"{error_count} error(s) — inspect board before fabrication."
+                    )
+            except Exception as drc_exc:
+                report["steps"].append({
+                    "step": "post_route_drc",
+                    "status": "unavailable",
+                    "message": f"Post-route DRC skipped: {drc_exc}",
+                })
 
         # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking)
         if result["status"] == "success":

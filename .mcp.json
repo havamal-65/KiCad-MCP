@@ -1,10 +1,12 @@
 {
   "mcpServers": {
     "kicad": {
-      "command": "python3",
-      "args": ["run.py"],
+      "command": "D:\\GitHub\\KiCad-MCP\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "kicad_mcp_plugin"
+      ],
       "env": {
-        "KICAD_MCP_BACKEND": "auto",
         "KICAD_MCP_LOG_LEVEL": "INFO",
         "PYTHONPATH": ""
       }

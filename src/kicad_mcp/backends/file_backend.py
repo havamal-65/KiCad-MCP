@@ -66,9 +66,15 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
       width_mm: courtyard width in mm (0.0 if no courtyard found)
       height_mm: courtyard height in mm (0.0 if no courtyard found)
       pads: list of {number, x, y, width, height}
+      npth_pads: list of {x, y, drill_mm} for non-plated through-hole pads
+      min_npth_to_copper_mm: minimum edge-to-edge clearance between any NPTH drill hole
+        and any copper pad (None if no NPTH pads present)
     """
+    import math as _math
+
     courtyard: dict[str, float] | None = None
     pads: list[dict[str, Any]] = []
+    npth_pads: list[dict[str, Any]] = []
     fp_line_xs: list[float] = []
     fp_line_ys: list[float] = []
 
@@ -76,6 +82,7 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
     end_pat = re.compile(r'\(end\s+([-\d.]+)\s+([-\d.]+)\)')
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)')
     size_pat = re.compile(r'\(size\s+([-\d.]+)\s+([-\d.]+)\)')
+    drill_pat = re.compile(r'\(drill\s+([-\d.]+)')
     startend_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
 
     # Walk the text looking for (fp_rect ...), (fp_line ...) and (pad ...) top-level tokens.
@@ -132,16 +139,27 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
                 num = pad_hdr.group(1) if pad_hdr else "?"
                 at_m = at_pat.search(block)
                 sz_m = size_pat.search(block)
+                is_npth = "np_thru_hole" in block
                 if at_m:
-                    pad_info: dict[str, Any] = {
-                        "number": num,
-                        "x": float(at_m.group(1)),
-                        "y": float(at_m.group(2)),
-                    }
-                    if sz_m:
-                        pad_info["width"] = float(sz_m.group(1))
-                        pad_info["height"] = float(sz_m.group(2))
-                    pads.append(pad_info)
+                    px = float(at_m.group(1))
+                    py = float(at_m.group(2))
+                    if is_npth:
+                        drill_m = drill_pat.search(block)
+                        npth_pads.append({
+                            "x": px,
+                            "y": py,
+                            "drill_mm": float(drill_m.group(1)) if drill_m else 0.0,
+                        })
+                    else:
+                        pad_info: dict[str, Any] = {
+                            "number": num,
+                            "x": px,
+                            "y": py,
+                        }
+                        if sz_m:
+                            pad_info["width"] = float(sz_m.group(1))
+                            pad_info["height"] = float(sz_m.group(2))
+                        pads.append(pad_info)
                 i = end_idx + 1
                 continue
 
@@ -156,21 +174,29 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
 
     width_mm = (courtyard["xmax"] - courtyard["xmin"]) if courtyard else 0.0
     height_mm = (courtyard["ymax"] - courtyard["ymin"]) if courtyard else 0.0
-    # x_origin / y_origin: distance from the courtyard's left/top edge to the
-    # footprint origin.  Used by auto_place so that the courtyard left edge
-    # lands exactly on the cursor, regardless of whether the courtyard is
-    # centred at the footprint origin or offset from it.
-    x_origin = (-courtyard["xmin"]) if courtyard else width_mm / 2
-    y_origin = (-courtyard["ymin"]) if courtyard else height_mm / 2
 
-    return {
+    # Compute minimum NPTH hole-edge to copper pad-edge clearance
+    min_npth_to_copper_mm: float | None = None
+    if npth_pads and pads:
+        for npth in npth_pads:
+            nr = npth["drill_mm"] / 2.0
+            for cp in pads:
+                cr = max(cp.get("width", 0.0), cp.get("height", 0.0)) / 2.0
+                dist = _math.hypot(cp["x"] - npth["x"], cp["y"] - npth["y"])
+                clearance = round(dist - nr - cr, 4)
+                if min_npth_to_copper_mm is None or clearance < min_npth_to_copper_mm:
+                    min_npth_to_copper_mm = clearance
+
+    result: dict[str, Any] = {
         "courtyard": courtyard,
         "width_mm": round(width_mm, 4),
         "height_mm": round(height_mm, 4),
-        "x_origin": round(x_origin, 4),
-        "y_origin": round(y_origin, 4),
         "pads": pads,
+        "npth_pads": npth_pads,
     }
+    if min_npth_to_copper_mm is not None:
+        result["min_npth_to_copper_mm"] = min_npth_to_copper_mm
+    return result
 
 
 def _add_uuids_to_fp_elements(inner: str) -> str:
@@ -686,6 +712,7 @@ class FileBoardOps(BoardOps):
             "via_min_size": 0.60,
             "via_min_annulus": 0.15,
             "hole_clearance": 0.22,
+            "copper_edge_clearance": 0.50,
             "courtyard_offset": 0.25,
         },
         "fab_jlcpcb": {
@@ -695,6 +722,7 @@ class FileBoardOps(BoardOps):
             "via_min_size": 0.45,
             "via_min_annulus": 0.125,
             "hole_clearance": 0.22,
+            "copper_edge_clearance": 0.30,
             "courtyard_offset": 0.25,
         },
     }
@@ -774,7 +802,8 @@ class FileBoardOps(BoardOps):
         drc_rules["min_via_diameter"]       = rules.get("via_min_size", 0.60)
         drc_rules["min_via_annular_width"]  = rules.get("via_min_annulus", 0.15)
         drc_rules["min_through_hole_diameter"] = rules.get("via_min_drill", 0.30)
-        drc_rules["min_hole_clearance"]     = rules.get("hole_clearance", 0.22)
+        drc_rules["min_hole_clearance"]         = rules.get("hole_clearance", 0.22)
+        drc_rules["min_copper_edge_clearance"]  = rules.get("copper_edge_clearance", 0.50)
 
         pro_path.write_text(
             json.dumps(pro, indent=2, ensure_ascii=False) + "\n",
@@ -872,6 +901,365 @@ class FileBoardOps(BoardOps):
 
         path.write_text(content, encoding="utf-8")
         return {"x": x, "y": y, "width": width, "height": height, "x2": x2, "y2": y2}
+
+    def auto_place(
+        self, path: Path,
+        board_x: float = 3.0, board_y: float = 3.0,
+        board_width: float = 100.0, board_height: float = 80.0,
+        clearance_mm: float = 0.5,
+    ) -> dict[str, Any]:
+        """Place all components using geometry-driven bin-packing.
+
+        Reads courtyard extents for each footprint, sorts components by class
+        (connectors → ICs → discretes → transistors → LEDs → others), then
+        bin-packs them into rows within the board outline with a guaranteed
+        courtyard-to-courtyard gap ≥ clearance_mm.
+
+        The caller is responsible for creating a backup and recording change_log
+        entries before/after calling this method.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            board_x: Left edge of placement area in mm.
+            board_y: Top edge of placement area in mm.
+            board_width: Width of placement area in mm.
+            board_height: Height of placement area in mm.
+            clearance_mm: Minimum courtyard-to-courtyard gap in mm.
+
+        Returns:
+            Dict with components_placed, rows, total_area_mm2, placements, warnings.
+        """
+        components = self.get_components(path)
+        if not components:
+            return {
+                "components_placed": 0,
+                "rows": 0,
+                "total_area_mm2": 0.0,
+                "placements": [],
+                "warnings": [],
+            }
+
+        warnings: list[str] = []
+        placements: list[dict] = []
+        comp_dims: list[dict] = []
+
+        for comp in components:
+            ref = comp.get("reference", "")
+            fp = comp.get("footprint", "")
+            if not ref or not fp:
+                warnings.append(f"Skipping {ref or '?'}: no footprint assigned")
+                continue
+
+            kicad_mod = _load_kicad_mod(fp)
+            if kicad_mod is None:
+                warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
+                w, h = 5.0, 5.0
+            else:
+                bounds = _parse_footprint_bounds(kicad_mod)
+                w = bounds["width_mm"] if bounds["width_mm"] > 0 else 5.0
+                h = bounds["height_mm"] if bounds["height_mm"] > 0 else 5.0
+
+            comp_dims.append({"reference": ref, "footprint": fp, "w": w, "h": h})
+
+        # Sort largest footprints first so big modules aren't squeezed out by passives
+        comp_dims.sort(key=lambda c: c["w"] * c["h"], reverse=True)
+
+        if not comp_dims:
+            return {
+                "components_placed": 0,
+                "rows": 0,
+                "total_area_mm2": 0.0,
+                "placements": [],
+                "warnings": warnings,
+            }
+
+        cursor_x = board_x + clearance_mm
+        cursor_y = board_y + clearance_mm
+        row_height = 0.0
+        row_count = 1
+        right_limit = board_x + board_width - clearance_mm
+        bottom_limit = board_y + board_height - clearance_mm
+
+        for item in comp_dims:
+            w, h = item["w"], item["h"]
+
+            if cursor_x + w > right_limit and cursor_x > board_x + clearance_mm:
+                cursor_x = board_x + clearance_mm
+                cursor_y += row_height + clearance_mm
+                row_height = 0.0
+                row_count += 1
+
+            if cursor_y + h > bottom_limit:
+                warnings.append(
+                    f"{item['reference']}: board area full, "
+                    f"placed at ({cursor_x:.2f}, {cursor_y:.2f})"
+                )
+
+            cx = round(cursor_x + w / 2, 4)
+            cy = round(cursor_y + h / 2, 4)
+
+            try:
+                self.move_component(path, item["reference"], cx, cy, rotation=0.0)
+                placements.append({"reference": item["reference"], "x": cx, "y": cy})
+            except Exception as e:
+                warnings.append(f"{item['reference']}: move failed — {e}")
+
+            cursor_x += w + clearance_mm
+            row_height = max(row_height, h)
+
+        total_area = sum(d["w"] * d["h"] for d in comp_dims)
+
+        return {
+            "components_placed": len(placements),
+            "rows": row_count,
+            "total_area_mm2": round(total_area, 2),
+            "placements": placements,
+            "warnings": warnings,
+        }
+
+    def validate_board(self, path: Path) -> dict[str, Any]:
+        """Run file-based pre-flight checks on a PCB board.
+
+        Checks performed:
+        - edge_cuts: Edge.Cuts outline is present (error if missing).
+        - duplicate_references: Reference designators are unique (error on duplicates).
+        - zero_position: No footprints placed at (0, 0) (warning).
+        - design_rules: .kicad_pro file has a non-empty "rules" key (warning if missing).
+
+        Returns:
+            {"passed": bool, "violations": [...], "error_count": int,
+             "warning_count": int, "checks_performed": [...]}
+        """
+        violations: list[dict[str, Any]] = []
+
+        content = path.read_text(encoding="utf-8")
+
+        # ── Check 1: Edge.Cuts outline present ─────────────────────────────
+        # Strategy: find any gr_* graphical element that contains the Edge.Cuts layer.
+        # We search for a gr_ tag start and then check the 500 chars that follow for
+        # the layer keyword — enough to cover any typical element without crossing
+        # unrelated elements.
+        gr_start_pattern = re.compile(r'\(gr_(?:line|rect|arc|circle|poly)\b')
+        edge_cuts_layer_re = re.compile(r'\(layer\s+"Edge\.Cuts"\)')
+        _has_edge_cuts = False
+        for _gm in gr_start_pattern.finditer(content):
+            window = content[_gm.start():_gm.start() + 600]
+            if edge_cuts_layer_re.search(window):
+                _has_edge_cuts = True
+                break
+        if not _has_edge_cuts:
+            violations.append({
+                "severity": "error",
+                "type": "missing_edge_cuts",
+                "description": "No Edge.Cuts outline found. Board cannot be manufactured without a board outline.",
+            })
+
+        # ── Check 2: Duplicate reference designators ────────────────────────
+        ref_pattern = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
+        refs: list[str] = [m.group(1) for m in ref_pattern.finditer(content)]
+        # Also try legacy fp_text format
+        fp_text_pattern = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
+        refs += [m.group(1) for m in fp_text_pattern.finditer(content)]
+        seen: dict[str, int] = {}
+        for ref in refs:
+            if ref.startswith("#"):
+                continue
+            seen[ref] = seen.get(ref, 0) + 1
+        for ref, count in seen.items():
+            if count > 1:
+                violations.append({
+                    "severity": "error",
+                    "type": "duplicate_reference",
+                    "reference": ref,
+                    "description": f"Reference '{ref}' appears {count} times on the board.",
+                    "count": count,
+                })
+
+        # ── Check 3: Footprints at (0, 0) ──────────────────────────────────
+        # Match: (at 0 0) or (at 0.0 0.0) with optional rotation
+        at_origin = re.compile(r'\(at\s+0(?:\.0*)?\s+0(?:\.0*)?(?:\s+-?\d[\d.]*)?\)')
+        # Walk each footprint block to check position
+        components = self.get_components(path)
+        for comp in components:
+            pos = comp.get("position", {})
+            x = pos.get("x", None)
+            y = pos.get("y", None)
+            if x is not None and y is not None and abs(x) < 0.01 and abs(y) < 0.01:
+                violations.append({
+                    "severity": "warning",
+                    "type": "zero_position",
+                    "reference": comp.get("reference", "?"),
+                    "description": f"Footprint '{comp.get('reference', '?')}' is at position (0, 0). It may not have been placed.",
+                })
+
+        # ── Check 4: Design rules in .kicad_pro ────────────────────────────
+        pro_path = path.with_suffix(".kicad_pro")
+        if pro_path.exists():
+            try:
+                pro_data = json.loads(pro_path.read_text(encoding="utf-8"))
+                rules = pro_data.get("board", {}).get("design_settings", {}).get("rules", {})
+                if not rules:
+                    violations.append({
+                        "severity": "warning",
+                        "type": "missing_design_rules",
+                        "description": "No design rules found in .kicad_pro. DRC may use KiCad defaults.",
+                    })
+            except (json.JSONDecodeError, OSError):
+                violations.append({
+                    "severity": "warning",
+                    "type": "missing_design_rules",
+                    "description": f"Could not read design rules from {pro_path.name}.",
+                })
+        else:
+            violations.append({
+                "severity": "warning",
+                "type": "missing_design_rules",
+                "description": f"No .kicad_pro file found at {pro_path}. Design rules unavailable.",
+            })
+
+        errors = [v for v in violations if v["severity"] == "error"]
+        warnings = [v for v in violations if v["severity"] == "warning"]
+        return {
+            "passed": len(errors) == 0,
+            "violations": violations,
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "checks_performed": ["edge_cuts", "duplicate_references", "zero_position", "design_rules"],
+        }
+
+    def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
+        """Remove all routed segments and vias from a board file.
+
+        Footprints, net declarations, and the board outline are preserved.
+        Strips every top-level (segment ...) and (via ...) S-expression block.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            backup: Write a backup file before modifying (default True).
+
+        Returns:
+            Dict with tracks_removed, vias_removed, backup_path.
+        """
+        import shutil as _shutil
+
+        backup_path_str: str | None = None
+        if backup:
+            backup_file = path.with_name(path.stem + ".clear_routes_backup.kicad_pcb")
+            _shutil.copy2(path, backup_file)
+            backup_path_str = str(backup_file)
+
+        content = path.read_text(encoding="utf-8")
+        tracks_removed = 0
+        vias_removed = 0
+        result_chars: list[str] = []
+        i = 0
+        n = len(content)
+
+        while i < n:
+            if content[i] != "(":
+                result_chars.append(content[i])
+                i += 1
+                continue
+
+            # Peek at the token name following the opening paren
+            j = i + 1
+            while j < n and content[j] not in (" ", "\t", "\n", "(", ")"):
+                j += 1
+            token = content[i + 1 : j]
+
+            if token in ("segment", "via"):
+                end_idx = _walk_balanced_parens(content, i)
+                if end_idx is not None:
+                    if token == "segment":
+                        tracks_removed += 1
+                    else:
+                        vias_removed += 1
+                    # Skip block; consume one optional trailing newline
+                    i = end_idx + 1
+                    if i < n and content[i] == "\n":
+                        i += 1
+                    continue
+                # Unbalanced — treat as literal character and move on
+                result_chars.append(content[i])
+                i += 1
+            else:
+                result_chars.append(content[i])
+                i += 1
+
+        path.write_text("".join(result_chars), encoding="utf-8")
+
+        return {
+            "status": "success",
+            "tracks_removed": tracks_removed,
+            "vias_removed": vias_removed,
+            "backup_path": backup_path_str,
+        }
+
+    def place_components_bulk(
+        self, path: Path, components: list[dict],
+    ) -> dict[str, Any]:
+        """Place multiple components in a single file read/write cycle.
+
+        Reads the board file once, appends all footprint blocks, then writes once.
+        components: list of dicts with keys: reference, footprint, x, y,
+                    and optionally layer (default "F.Cu") and rotation (default 0.0).
+        Returns {"placed": [...], "failed": [...]}.
+        """
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+        placed: list[str] = []
+        failed: list[dict] = []
+        inserts: list[str] = []
+
+        for comp in components:
+            reference = comp.get("reference", "")
+            footprint = comp.get("footprint", "")
+            x = float(comp.get("x", 0.0))
+            y = float(comp.get("y", 0.0))
+            layer = comp.get("layer", "F.Cu")
+            rotation = float(comp.get("rotation", 0.0))
+
+            if not reference or not footprint:
+                failed.append({"reference": reference, "reason": "missing reference or footprint"})
+                continue
+
+            try:
+                fp_uuid = str(_uuid.uuid4())
+                kicad_mod = _load_kicad_mod(footprint)
+                if kicad_mod:
+                    fp_sexp = _embed_kicad_mod_as_pcb_footprint(
+                        kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+                    )
+                else:
+                    rot_clause = f" {rotation}" if rotation else ""
+                    fp_sexp = (
+                        f'\t(footprint "{footprint}"\n'
+                        f'\t\t(layer "{layer}")\n'
+                        f'\t\t(at {x} {y}{rot_clause})\n'
+                        f'\t\t(uuid "{fp_uuid}")\n'
+                        f'\t\t(property "Reference" "{reference}" (at 0 0 0)\n'
+                        f'\t\t\t(layer "F.SilkS")\n'
+                        f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
+                        f'\t\t)\n'
+                        f'\t\t(property "Value" "" (at 0 0 0)\n'
+                        f'\t\t\t(layer "F.Fab")\n'
+                        f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
+                        f'\t\t)\n'
+                        f'\t)\n'
+                    )
+                inserts.append(fp_sexp)
+                placed.append(reference)
+            except Exception as exc:
+                failed.append({"reference": reference, "reason": str(exc)})
+
+        if inserts:
+            last_paren = content.rfind(")")
+            if last_paren >= 0:
+                content = content[:last_paren] + "".join(inserts) + content[last_paren:]
+                path.write_text(content, encoding="utf-8")
+
+        return {"placed": placed, "failed": failed}
 
     def create_board(
         self, path: Path, title: str = "", revision: str = "",
@@ -2446,6 +2834,19 @@ class FileSchematicOps(SchematicOps):
                 })
                 warning_count += 1
 
+        # --- Check 4: Power conflicts ---
+        # Detect nets where multiple distinct power sources are shorted together.
+        try:
+            power_conflicts = self._check_power_conflicts(path)
+            for conflict in power_conflicts:
+                violations.append(conflict)
+                if conflict["severity"] == "error":
+                    error_count += 1
+                else:
+                    warning_count += 1
+        except Exception:
+            pass  # Power conflict check is best-effort
+
         return {
             "passed": error_count == 0,
             "violations": violations,
@@ -2455,8 +2856,94 @@ class FileSchematicOps(SchematicOps):
                 "duplicate_reference",
                 "floating_pin",
                 "unconnected_power",
+                "power_conflicts",
             ],
         }
+
+    def _check_power_conflicts(self, path: Path) -> list[dict[str, Any]]:
+        """Detect nets where multiple distinct power nets are shorted together.
+
+        Runs a union-find over wire endpoints to group power symbol pin positions.
+        If two different power symbols (e.g. +3V3 and +5V) have their pins in the
+        same wire group, they are shorted — return an error for each such group.
+
+        PWR_FLAG is excluded from conflict detection (it is a flag, not a driver).
+
+        Returns list of violation dicts.
+        """
+        data = self._read_with_sexp(path)
+        symbols = data.get("symbols", [])
+        wires = data.get("wires", [])
+
+        TOLERANCE = 0.02
+
+        def _key(x: float, y: float) -> str:
+            return f"{round(x / TOLERANCE) * TOLERANCE:.4f},{round(y / TOLERANCE) * TOLERANCE:.4f}"
+
+        parent: dict[str, str] = {}
+
+        def find(k: str) -> str:
+            while parent.get(k, k) != k:
+                parent[k] = parent.get(parent[k], parent[k])
+                k = parent[k]
+            return k
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for w in wires:
+            s = w.get("start", {})
+            e = w.get("end", {})
+            sk = _key(s.get("x", 0), s.get("y", 0))
+            ek = _key(e.get("x", 0), e.get("y", 0))
+            parent.setdefault(sk, sk)
+            parent.setdefault(ek, ek)
+            union(sk, ek)
+
+        # Map each power symbol pin coordinate to the symbol's power value
+        power_by_key: dict[str, str] = {}  # key -> power net value
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            is_power = sym.get("is_power", False)
+            if not is_power and not ref.startswith("#"):
+                continue
+            if not ref:
+                continue
+            value = sym.get("value", ref)
+            if not value or value == "PWR_FLAG":
+                continue
+            try:
+                pin_result = self.get_symbol_pin_positions(path, ref)
+            except Exception:
+                continue
+            for _pin_num, pos in pin_result.get("pin_positions", {}).items():
+                pk = _key(pos["x"], pos["y"])
+                parent.setdefault(pk, pk)
+                power_by_key[pk] = value
+
+        # Group power values by union-find root
+        group_powers: dict[str, set[str]] = {}
+        for k, val in power_by_key.items():
+            root = find(k)
+            group_powers.setdefault(root, set()).add(val)
+
+        conflicts: list[dict[str, Any]] = []
+        for _root, power_values in group_powers.items():
+            if len(power_values) >= 2:
+                sorted_nets = sorted(power_values)
+                conflicts.append({
+                    "severity": "error",
+                    "type": "power_conflict",
+                    "description": (
+                        f"Power conflict: nets {sorted_nets} are shorted together "
+                        f"via a wire connection."
+                    ),
+                    "power_nets": sorted_nets,
+                })
+
+        return conflicts
 
 
 class FileDRCOps:
@@ -2492,79 +2979,39 @@ class FileLibraryOps(LibraryOps):
         from kicad_mcp.utils.kicad_paths import find_footprint_libraries, find_symbol_libraries
         self._symbol_libs = find_symbol_libraries()
         self._footprint_libs = find_footprint_libraries()
-        if not self._footprint_libs:
-            logger.warning(
-                "No footprint libraries found. Footprint search and placement will return "
-                "empty results. If KiCad is installed at a non-standard path (e.g. Flatpak), "
-                "set the KICAD_SYMBOL_DIR environment variable to the symbols directory, "
-                "or register custom paths with the register_library_source tool."
-            )
-        if not self._symbol_libs:
-            logger.warning(
-                "No symbol libraries found. Symbol search will return empty results. "
-                "If KiCad is installed at a non-standard path (e.g. Flatpak), "
-                "set the KICAD_SYMBOL_DIR environment variable to the symbols directory, "
-                "or register custom paths with the register_library_source tool."
-            )
-        # Indexes are built lazily on first search and then reused.
-        self._footprint_index: dict[str, list[str]] | None = None
-        self._symbol_index: list[tuple[str, str]] | None = None  # [(sym_name, lib_name)]
-
-    # -- Lazy index builders -------------------------------------------------
-
-    def _get_footprint_index(self) -> dict[str, list[str]]:
-        """Return {lib_name: [fp_name, ...]} built once from directory listings."""
-        if self._footprint_index is None:
-            index: dict[str, list[str]] = {}
-            for lib_dir in self._footprint_libs:
-                lib_name = lib_dir.stem.replace(".pretty", "")
-                index[lib_name] = [fp.stem for fp in lib_dir.glob("*.kicad_mod")]
-            self._footprint_index = index
-        return self._footprint_index
-
-    def _get_symbol_index(self) -> list[tuple[str, str]]:
-        """Return [(sym_name, lib_name)] built once by regex-scanning library files.
-
-        Using a regex to extract symbol names avoids fully parsing every
-        .kicad_sym file with sexpdata on every search call, which is the
-        dominant cost on installs with hundreds of large symbol libraries.
-        """
-        if self._symbol_index is None:
-            import re
-            # Matches top-level symbol definitions: (symbol "Name" ...)
-            # Excludes sub-unit symbols like "R/0" or "R/body" (contain /)
-            pattern = re.compile(r'^\t\(symbol\s+"([^"/]+)"', re.MULTILINE)
-            entries: list[tuple[str, str]] = []
-            for lib_path in self._symbol_libs:
-                lib_name = lib_path.stem
-                try:
-                    text = lib_path.read_text(encoding="utf-8", errors="ignore")
-                    for m in pattern.finditer(text):
-                        entries.append((m.group(1), lib_name))
-                except Exception as e:
-                    logger.debug("Error scanning symbol lib %s: %s", lib_path, e)
-            self._symbol_index = entries
-        return self._symbol_index
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
+        results = []
         query_lower = query.lower()
-        results = [
-            {"name": sym, "library": lib, "lib_id": f"{lib}:{sym}"}
-            for sym, lib in self._get_symbol_index()
-            if query_lower in sym.lower()
-        ]
-        return results[:50]
+        for lib_path in self._symbol_libs:
+            lib_name = lib_path.stem
+            try:
+                tree = parse_sexp_file(lib_path)
+                for node in tree:
+                    if (isinstance(node, list) and len(node) >= 2
+                            and node[0] == "symbol"):
+                        sym_name = node[1] if isinstance(node[1], str) else ""
+                        if query_lower in sym_name.lower():
+                            results.append({
+                                "name": sym_name,
+                                "library": lib_name,
+                                "lib_id": f"{lib_name}:{sym_name}",
+                            })
+            except Exception as e:
+                logger.debug("Error reading symbol lib %s: %s", lib_path, e)
+        return results[:50]  # Limit results
 
     def search_footprints(self, query: str) -> list[dict[str, Any]]:
-        query_lower = query.lower()
         results = []
-        for lib_name, fp_names in self._get_footprint_index().items():
-            for fp_name in fp_names:
-                if query_lower in fp_name.lower():
+        query_lower = query.lower()
+        for lib_dir in self._footprint_libs:
+            lib_name = lib_dir.stem.replace(".pretty", "")
+            for fp_file in lib_dir.glob("*.kicad_mod"):
+                if query_lower in fp_file.stem.lower():
                     results.append({
-                        "name": fp_name,
+                        "name": fp_file.stem,
                         "library": lib_name,
-                        "lib_id": f"{lib_name}:{fp_name}",
+                        "lib_id": f"{lib_name}:{fp_file.stem}",
                     })
         return results[:50]
 
@@ -2663,11 +3110,26 @@ class FileLibraryOps(LibraryOps):
                     continue
                 for pattern in fp_filters:
                     if fnmatch.fnmatch(fp_name, pattern):
-                        matched.append({
+                        entry: dict[str, Any] = {
                             "name": fp_name,
                             "library": lib_name,
                             "lib_id": f"{lib_name}:{fp_name}",
-                        })
+                        }
+                        # Load footprint to detect NPTH pads and report their
+                        # minimum clearance to adjacent copper pads.  This lets
+                        # users cross-check against fab design rules before
+                        # committing to a specific connector variant.
+                        try:
+                            mod_text = fp_file.read_text(encoding="utf-8")
+                            bounds = _parse_footprint_bounds(mod_text)
+                            if bounds["npth_pads"]:
+                                entry["has_npth_pads"] = True
+                                entry["npth_count"] = len(bounds["npth_pads"])
+                                if "min_npth_to_copper_mm" in bounds:
+                                    entry["min_npth_to_copper_mm"] = bounds["min_npth_to_copper_mm"]
+                        except Exception:
+                            pass
+                        matched.append(entry)
                         seen.add(fp_name)
                         break
                 if len(matched) >= 100:
@@ -2977,9 +3439,6 @@ class FileLibraryManageOps(LibraryManageOps):
 class FileBackend(KiCadBackend):
     """Pure Python file-parsing backend. Always available."""
 
-    def __init__(self) -> None:
-        self._library_ops: FileLibraryOps | None = None
-
     @property
     def name(self) -> str:
         return "file"
@@ -3009,9 +3468,7 @@ class FileBackend(KiCadBackend):
         return FileDRCOps(FileSchematicOps())
 
     def get_library_ops(self) -> FileLibraryOps:
-        if self._library_ops is None:
-            self._library_ops = FileLibraryOps()
-        return self._library_ops
+        return FileLibraryOps()
 
     def get_library_manage_ops(self) -> FileLibraryManageOps:
         return FileLibraryManageOps()

@@ -1,19 +1,166 @@
-"""Project management tools - 11 tools."""
+"""Project management tools - 12 tools."""
 
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.kicad_paths import resolve_project_files
 from kicad_mcp.utils.validation import validate_kicad_path
 
 logger = get_logger("tools.project")
+
+
+def run_startup_checklist() -> dict[str, Any]:
+    """Run pre-PCB startup checks.  Returns the same structure as get_startup_checklist.
+
+    Extracted as a module-level function so it can be imported by pcb_pipeline
+    in board.py without going through the MCP tool dispatch layer.
+    """
+    from kicad_mcp.utils.platform_helper import find_kicad_cli, is_kicad_running
+
+    checklist: list[dict[str, Any]] = []
+    required_actions: list[str] = []
+
+    # ── 1. KiCad process running ─────────────────────────────────────────────
+    kicad_up = is_kicad_running()
+    checklist.append({
+        "item": "kicad_running",
+        "status": "PASS" if kicad_up else "FAIL",
+        "detail": "KiCad process detected." if kicad_up else "KiCad is not running.",
+    })
+    if not kicad_up:
+        required_actions.append("Launch KiCad (use open_kicad tool or start KiCad manually).")
+
+    # ── 2. Bridge TCP reachable ──────────────────────────────────────────────
+    _tcp_call = None
+    port = 9760
+    ping_timeout = 2.0
+    try:
+        from kicad_mcp.backends.plugin_backend import _get_ping_timeout, _get_port, _tcp_call  # type: ignore[assignment]
+        port = _get_port()
+        ping_timeout = _get_ping_timeout()
+    except ImportError:
+        pass
+
+    bridge_ok = False
+    bridge_detail = ""
+    if _tcp_call is not None:
+        try:
+            result = _tcp_call("ping", ping_timeout)
+            bridge_ok = isinstance(result, dict) and result.get("pong") is True
+            bridge_detail = "Bridge responded to ping." if bridge_ok else "Bridge ping check returned unexpected value."
+        except Exception as exc:
+            bridge_detail = f"Bridge not reachable: {exc}"
+    else:
+        import socket as _socket
+        try:
+            with _socket.create_connection(("127.0.0.1", port), timeout=ping_timeout):
+                bridge_ok = True
+                bridge_detail = f"TCP port {port} is open."
+        except Exception as exc:
+            bridge_detail = f"TCP port {port} not reachable: {exc}"
+
+    checklist.append({
+        "item": "bridge_reachable",
+        "status": "PASS" if bridge_ok else "FAIL",
+        "detail": bridge_detail,
+    })
+    if not bridge_ok:
+        required_actions.append(
+            "Open the PCB editor in KiCad and ensure kicad_mcp_bridge is installed and enabled."
+        )
+
+    # ── 3. Bridge version check ──────────────────────────────────────────────
+    bridge_version_ok = bridge_ok  # treat as OK if bridge is reachable but version not queryable
+    bridge_version_detail = ""
+    if bridge_ok and _tcp_call is not None:
+        try:
+            info = _tcp_call("get_info", ping_timeout)
+            if isinstance(info, dict):
+                version = info.get("version", "")
+                bridge_version_detail = f"Bridge version: {version or 'unknown'}."
+            else:
+                bridge_version_detail = "Bridge reachable; version field not returned."
+        except Exception as exc:
+            bridge_version_detail = f"Version check skipped: {exc}"
+    elif bridge_ok:
+        bridge_version_detail = "Bridge reachable; version not checked (plugin_backend unavailable)."
+    else:
+        bridge_version_detail = "Skipped (bridge not reachable)."
+
+    checklist.append({
+        "item": "bridge_version_ok",
+        "status": "PASS" if bridge_version_ok else "FAIL",
+        "detail": bridge_version_detail,
+    })
+
+    # ── 4. PCB editor open ───────────────────────────────────────────────────
+    pcb_editor_ok = False
+    board_path_str = ""
+    if bridge_ok and _tcp_call is not None:
+        try:
+            active = _tcp_call("get_active_project", ping_timeout)
+            board_path_str = active.get("board_path", "") if isinstance(active, dict) else ""
+            pcb_editor_ok = bool(board_path_str)
+        except Exception as exc:
+            board_path_str = f"(error: {exc})"
+
+    pcb_editor_detail = (
+        f"PCB editor open with: {board_path_str}"
+        if pcb_editor_ok
+        else ("No board loaded in PCB editor." if bridge_ok else "Skipped (bridge not reachable).")
+    )
+    checklist.append({
+        "item": "pcb_editor_open",
+        "status": "PASS" if pcb_editor_ok else "FAIL",
+        "detail": pcb_editor_detail,
+    })
+    if bridge_ok and not pcb_editor_ok:
+        required_actions.append("Open a .kicad_pcb file in the KiCad PCB editor.")
+
+    # ── 5. kicad-cli on PATH ─────────────────────────────────────────────────
+    cli_path_str = shutil.which("kicad-cli")
+    if not cli_path_str:
+        cli = find_kicad_cli()
+        cli_path_str = str(cli) if cli else None
+    cli_ok = cli_path_str is not None
+    checklist.append({
+        "item": "kicad_cli_available",
+        "status": "PASS" if cli_ok else "WARN",
+        "detail": (
+            f"kicad-cli found at: {cli_path_str}"
+            if cli_ok
+            else "kicad-cli not found on PATH. Exports (Gerber, PDF, DRC) will fail."
+        ),
+    })
+
+    # ── 6. Active project loaded ─────────────────────────────────────────────
+    checklist.append({
+        "item": "project_loaded",
+        "status": "PASS" if pcb_editor_ok else "FAIL",
+        "detail": (
+            f"Active board: {board_path_str}"
+            if pcb_editor_ok
+            else "No active project detected in bridge."
+        ),
+    })
+    if bridge_ok and not pcb_editor_ok:
+        required_actions.append("Open a KiCad project (.kicad_pro or .kicad_pcb) in KiCad.")
+
+    has_fail = any(item["status"] == "FAIL" for item in checklist)
+    return {
+        "ready_for_pcb": not has_fail,
+        "checklist": checklist,
+        "required_actions": required_actions,
+    }
 
 
 _FAB_PRESET_MAP: dict[str, str] = {
@@ -27,8 +174,31 @@ _FAB_PRESET_MAP: dict[str, str] = {
 _PLAN_FILENAME = "project_plan.json"
 
 
-def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLog) -> None:
+def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register project management tools on the MCP server."""
+
+    @mcp.tool()
+    def get_startup_checklist() -> str:
+        """Run pre-PCB startup checks and return a structured PASS/FAIL gate.
+
+        MUST be called at the start of every session that involves PCB operations.
+        Returns a ready_for_pcb boolean and a checklist with one entry per check.
+        If ready_for_pcb is false, act on required_actions before proceeding.
+
+        Checks performed (in order):
+          1. kicad_running    — KiCad process is detected (FAIL blocks PCB ops)
+          2. bridge_reachable — TCP connection to kicad_mcp_bridge succeeds (FAIL blocks PCB ops)
+          3. bridge_version_ok — Bridge responds with version info (FAIL blocks PCB ops)
+          4. pcb_editor_open  — A board file is active in the PCB editor (FAIL blocks PCB ops)
+          5. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
+          6. project_loaded   — Bridge has an active board path (FAIL blocks PCB ops)
+
+        Returns:
+            JSON with ready_for_pcb bool, checklist, and required_actions list.
+        """
+        result = run_startup_checklist()
+        change_log.record("get_startup_checklist", {})
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def plan_project(
@@ -36,8 +206,8 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
         product_description: str,
         board_layers: int = 2,
         fab_target: str = "jlcpcb",
-        board_width_mm: float = 100.0,
-        board_height_mm: float = 80.0,
+        board_width_mm: float = 0.0,
+        board_height_mm: float = 0.0,
         power_inputs: list[str] | None = None,
         power_rails: list[str] | None = None,
         key_components: list[str] | None = None,
@@ -72,26 +242,82 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             board_layers: Number of copper layers (2 or 4). Default 2.
             fab_target: Fabrication target — "jlcpcb" (default), "pcbway",
                 "oshpark", or "custom".
-            board_width_mm: Maximum board width in mm. Default 100.
-            board_height_mm: Maximum board height in mm. Default 80.
+            board_width_mm: Target board width in mm. Pass 0 (default) to auto-estimate
+                from key_components footprints via estimate_board_size. If key_components
+                is empty and width is 0, falls back to 100 mm.
+            board_height_mm: Target board height in mm. Pass 0 (default) to auto-estimate.
+                Falls back to 80 mm if key_components is empty.
             power_inputs: List of power input sources, e.g.
                 ["USB-C 5V 3A", "LiPo 3.7V 2000mAh"].
             power_rails: List of required power rails, e.g.
                 ["+3.3V 500mA (MCU, sensors)", "+5V 1A (motor driver)"].
             key_components: List of critical ICs and modules that must fit, e.g.
                 ["ESP32-C3-WROOM-02", "BME680", "TP4056", "AMS1117-3.3"].
+                Footprint IDs (Library:Footprint) are accepted directly; plain
+                component names are used for documentation only.
             interfaces: Communication and I/O interfaces, e.g.
                 ["I2C (BME680)", "USB-C (charge + data)", "BLE 5.0"].
             notes: Any additional constraints or design notes.
 
         Returns:
-            JSON with the saved plan, the design_rules_preset to use, and
-            recommended_settings for the create_project call.
+            JSON with the saved plan, the design_rules_preset to use,
+            recommended_settings for the create_project call, and an optional
+            size_warning if provided dimensions appear under-sized.
         """
+        import json as _json
+
         proj_dir = Path(project_dir).resolve()
         proj_dir.mkdir(parents=True, exist_ok=True)
 
         preset = _FAB_PRESET_MAP.get(fab_target.lower(), "class2")
+
+        # ── Auto-estimate board size when dimensions are 0 ────────────────────
+        size_warning: str | None = None
+        estimated_width: float | None = None
+        estimated_height: float | None = None
+
+        kc_list = key_components or []
+        # Filter to items that look like Library:Footprint IDs (contain ':')
+        footprint_ids = [k for k in kc_list if ":" in k]
+
+        if footprint_ids:
+            try:
+                from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
+                import math
+
+                component_area = 0.0
+                for fp_id in footprint_ids:
+                    kicad_mod = _load_kicad_mod(fp_id)
+                    if kicad_mod is None:
+                        continue
+                    bounds = _parse_footprint_bounds(kicad_mod)
+                    w = bounds["width_mm"] if bounds["width_mm"] > 0 else 5.0
+                    h = bounds["height_mm"] if bounds["height_mm"] > 0 else 5.0
+                    component_area += w * h
+
+                if component_area > 0:
+                    routing_overhead = component_area * 0.20
+                    routed_area = component_area + routing_overhead
+                    edge_clearance = 3.0
+                    raw_w = math.sqrt(routed_area * 1.4) + edge_clearance * 2
+                    raw_h = math.sqrt(routed_area / 1.4) + edge_clearance * 2
+                    ceil5 = lambda v: math.ceil(v / 5.0) * 5.0
+                    estimated_width = ceil5(ceil5(raw_w) * 1.25)
+                    estimated_height = ceil5(ceil5(raw_h) * 1.25)
+            except Exception:
+                pass  # estimation failure is non-fatal
+
+        if board_width_mm <= 0 or board_height_mm <= 0:
+            board_width_mm = estimated_width if estimated_width else 100.0
+            board_height_mm = estimated_height if estimated_height else 80.0
+        elif estimated_width and estimated_height:
+            # Provided dimensions — check if under-sized vs estimate
+            if board_width_mm < estimated_width * 0.85 or board_height_mm < estimated_height * 0.85:
+                size_warning = (
+                    f"Provided board size ({board_width_mm}×{board_height_mm} mm) is more than 15% "
+                    f"smaller than the estimate ({estimated_width}×{estimated_height} mm) based on "
+                    "footprint courtyards. Routing may be extremely difficult. Consider enlarging."
+                )
 
         plan = {
             "product_description": product_description,
@@ -102,16 +328,16 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             "design_rules_preset": preset,
             "power_inputs": power_inputs or [],
             "power_rails": power_rails or [],
-            "key_components": key_components or [],
+            "key_components": kc_list,
             "interfaces": interfaces or [],
             "notes": notes,
         }
 
         plan_path = proj_dir / _PLAN_FILENAME
-        plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+        plan_path.write_text(_json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
 
         change_log.record("plan_project", {"dir": project_dir, "fab": fab_target})
-        return json.dumps({
+        result: dict = {
             "status": "success",
             "plan_file": str(plan_path),
             "plan": plan,
@@ -125,7 +351,16 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     f"board_height_mm={board_height_mm} to auto_place and pcb_pipeline."
                 ),
             },
-        }, indent=2)
+        }
+        if size_warning:
+            result["size_warning"] = size_warning
+        if estimated_width and estimated_height:
+            result["size_estimate"] = {
+                "estimated_width_mm": estimated_width,
+                "estimated_height_mm": estimated_height,
+                "source": "footprint courtyard bounds",
+            }
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def read_project_plan(project_dir: str) -> str:

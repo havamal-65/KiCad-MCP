@@ -6,7 +6,7 @@ import json
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -14,7 +14,7 @@ from kicad_mcp.utils.response_limit import limit_response
 logger = get_logger("tools.library_manage")
 
 
-def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLog) -> None:
+def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register library management tools on the MCP server."""
 
     @mcp.tool()

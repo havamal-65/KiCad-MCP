@@ -83,9 +83,9 @@ def main() -> None:
     mcp = create_server(config)
 
     if config.transport == TransportType.SSE:
-        mcp.run(transport="sse")
+        mcp.run(transport="sse", show_banner=False)
     else:
-        mcp.run(transport="stdio")
+        mcp.run(transport="stdio", show_banner=False)
 
 
 def _check_backends() -> None:

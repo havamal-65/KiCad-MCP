@@ -2,9 +2,48 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
+import pytest
+
 from kicad_mcp.backends import ipc_backend
+
+
+@pytest.fixture(autouse=True)
+def _stub_kipy(monkeypatch):
+    """Inject minimal kipy stubs when kicad-python is not installed.
+
+    The IPC backend imports DocumentType lazily inside try/except blocks.
+    Without this stub the ImportError is swallowed before our mock's
+    get_open_documents() is ever called, breaking the fallback assertions.
+    """
+    if "kipy" in sys.modules:
+        yield  # real kipy installed — no stub needed
+        return
+
+    kipy_mod = types.ModuleType("kipy")
+    proto_mod = types.ModuleType("kipy.proto")
+    common_mod = types.ModuleType("kipy.proto.common")
+    types_mod = types.ModuleType("kipy.proto.common.types")
+
+    class DocumentType:
+        DOCTYPE_PCB = 1
+        DOCTYPE_SCHEMATIC = 2
+        DOCTYPE_PROJECT = 3
+
+    types_mod.DocumentType = DocumentType
+
+    for name, mod in [
+        ("kipy", kipy_mod),
+        ("kipy.proto", proto_mod),
+        ("kipy.proto.common", common_mod),
+        ("kipy.proto.common.types", types_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    yield
 
 
 class _DummyProject:

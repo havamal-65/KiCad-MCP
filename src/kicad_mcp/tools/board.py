@@ -470,13 +470,15 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
             kicad_mod = _load_kicad_mod(fp)
             if kicad_mod is None:
                 warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
-                w, h = 5.0, 5.0
+                w, h, xo, yo = 5.0, 5.0, 2.5, 2.5
             else:
                 bounds = _parse_footprint_bounds(kicad_mod)
                 w = bounds["width_mm"] if bounds["width_mm"] > 0 else 5.0
                 h = bounds["height_mm"] if bounds["height_mm"] > 0 else 5.0
+                xo = bounds.get("x_origin", w / 2)
+                yo = bounds.get("y_origin", h / 2)
 
-            comp_dims.append({"reference": ref, "footprint": fp, "w": w, "h": h})
+            comp_dims.append({"reference": ref, "footprint": fp, "w": w, "h": h, "xo": xo, "yo": yo})
 
         if not comp_dims:
             return json.dumps({
@@ -500,6 +502,7 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
 
         for item in comp_dims:
             w, h = item["w"], item["h"]
+            xo, yo = item["xo"], item["yo"]
 
             # Check if we need to wrap to next row
             if cursor_x + w > right_limit and cursor_x > board_x + clearance_mm:
@@ -513,9 +516,10 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     f"{item['reference']}: board area full, placed at ({cursor_x:.2f}, {cursor_y:.2f})"
                 )
 
-            # Place at center of footprint courtyard
-            cx = round(cursor_x + w / 2, 4)
-            cy = round(cursor_y + h / 2, 4)
+            # Place footprint origin so the courtyard left/top edge lands on the cursor.
+            # xo = distance from courtyard left edge to footprint origin (= -courtyard.xmin).
+            cx = round(cursor_x + xo, 4)
+            cy = round(cursor_y + yo, 4)
 
             try:
                 board_modify_ops.move_component(p, item["reference"], cx, cy, rotation=0.0)
@@ -756,8 +760,11 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     b = _parse_footprint_bounds(kicad_mod)
                     w = b["width_mm"] if b["width_mm"] > 0 else 5.0
                     h = b["height_mm"] if b["height_mm"] > 0 else 5.0
+                    xo = b.get("x_origin", w / 2)
+                    yo = b.get("y_origin", h / 2)
                 else:
                     w, h = 5.0, 5.0
+                    xo, yo = 2.5, 2.5
                     ap_warnings.append(f"{ref}: footprint not in libraries, using 5×5 mm")
 
                 if cx_cur + w > right_lim and cx_cur > MARGIN + ap_clearance:
@@ -766,8 +773,8 @@ def register_tools(mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLo
                     row_h = 0.0
                     row_n += 1
 
-                comp_cx = round(cx_cur + w / 2, 4)
-                comp_cy = round(cy_cur + h / 2, 4)
+                comp_cx = round(cx_cur + xo, 4)
+                comp_cy = round(cy_cur + yo, 4)
                 try:
                     board_mv.move_component(pcb_p, ref, comp_cx, comp_cy, rotation=0.0)
                     ap_placed.append(ref)

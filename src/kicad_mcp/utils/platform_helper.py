@@ -5,11 +5,16 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from kicad_mcp.logging_config import get_logger
 
 logger = get_logger("platform")
+
+# Cache for is_kicad_running() — avoids a subprocess spawn on every tool call.
+_kicad_running_cache: tuple[float, bool] | None = None
+_KICAD_RUNNING_CACHE_TTL = 10.0  # seconds
 
 
 def get_platform() -> str:
@@ -197,12 +202,8 @@ def find_kicad_executable() -> Path | None:
     return None
 
 
-def is_kicad_running() -> bool:
-    """Check whether the KiCad GUI application is currently running.
-
-    Returns:
-        True if a KiCad GUI process is found, False otherwise.
-    """
+def _check_kicad_process() -> bool:
+    """Perform the actual subprocess check for a running KiCad GUI process."""
     import subprocess
 
     platform = get_platform()
@@ -227,6 +228,37 @@ def is_kicad_running() -> bool:
     except Exception as e:
         logger.debug("KiCad process check failed: %s", e)
         return False
+
+
+def is_kicad_running() -> bool:
+    """Check whether the KiCad GUI application is currently running.
+
+    Result is cached for up to 10 seconds so rapid tool sequences only pay
+    the subprocess cost once.
+
+    Returns:
+        True if a KiCad GUI process is found, False otherwise.
+    """
+    global _kicad_running_cache
+    now = time.monotonic()
+    if _kicad_running_cache is not None:
+        ts, result = _kicad_running_cache
+        if now - ts < _KICAD_RUNNING_CACHE_TTL:
+            logger.debug("KiCad running check (cached): %s", result)
+            return result
+    result = _check_kicad_process()
+    _kicad_running_cache = (now, result)
+    return result
+
+
+def invalidate_kicad_running_cache() -> None:
+    """Clear the is_kicad_running() cache.
+
+    Call this after launching KiCad so the next check reflects reality
+    rather than serving a stale False result.
+    """
+    global _kicad_running_cache
+    _kicad_running_cache = None
 
 
 def launch_kicad(project_path: Path | None = None) -> bool:

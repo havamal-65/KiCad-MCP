@@ -3447,12 +3447,8 @@ class FileBackend(KiCadBackend):
     def capabilities(self) -> set[BackendCapability]:
         return {
             BackendCapability.BOARD_READ,
-            BackendCapability.BOARD_MODIFY,
             BackendCapability.SCHEMATIC_READ,
-            BackendCapability.SCHEMATIC_MODIFY,
-            BackendCapability.ERC,
             BackendCapability.LIBRARY_SEARCH,
-            BackendCapability.LIBRARY_MANAGE,
         }
 
     def is_available(self) -> bool:

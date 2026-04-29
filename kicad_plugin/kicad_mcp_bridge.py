@@ -550,7 +550,7 @@ def _handle_add_via(path: str, x: float, y: float,
         via = pcbnew.PCB_VIA(board)
         via.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
         via.SetWidth(_mm(size))
-        via.SetDrillValue(_mm(drill))
+        via.SetDrill(_mm(drill))
         _VIA_TYPES = {
             "through": pcbnew.VIATYPE_THROUGH,
             "blind": pcbnew.VIATYPE_BLIND_BURIED,

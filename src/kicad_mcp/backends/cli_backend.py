@@ -239,7 +239,22 @@ class CLIDRCOps(DRCOps):
             "--severity-all",
             str(board_path),
         ]
-        result = self._run(args)
+
+        # kicad-cli pcb drc re-serialises the .kicad_pro on open, overwriting
+        # any design-rule changes made since the project was last saved by KiCad.
+        # Preserve the file and restore it after the DRC subprocess exits.
+        pro_path = board_path.with_suffix(".kicad_pro")
+        pro_backup: bytes | None = None
+        if pro_path.exists():
+            pro_backup = pro_path.read_bytes()
+
+        try:
+            result = self._run(args)
+        finally:
+            if pro_backup is not None:
+                pro_path.write_bytes(pro_backup)
+
+
 
         drc_result: dict[str, Any] = {
             "passed": result.returncode == 0,

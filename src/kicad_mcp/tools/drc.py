@@ -42,6 +42,15 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
     symbols = sch_data.get("symbols", [])
     nets = sch_data.get("nets", [])
 
+    # The file-based reader doesn't build a nets list, so fall back to
+    # checking wires, labels, and power symbols as evidence of connectivity.
+    _has_connectivity = (
+        nets
+        or sch_data.get("wires", [])
+        or sch_data.get("labels", [])
+        or any(s.get("is_power") for s in symbols)
+    )
+
     # Filter to real (non-power, non-#) components
     real_components = [
         s for s in symbols
@@ -119,7 +128,7 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
             })
 
     # ── Check 5: Net count non-zero ──────────────────────────────────────────
-    if not nets:
+    if not _has_connectivity:
         blocking.append({
             "type": "no_nets",
             "detail": "Schematic has no nets. Add wires and labels to connect components.",

@@ -29,9 +29,10 @@ def test_file_backend_has_schematic_read():
     assert result.has_capability(BackendCapability.SCHEMATIC_READ)
 
 
-def test_file_backend_has_board_modify():
+def test_file_backend_no_board_modify():
+    """File backend is read-only; board writes require plugin/IPC."""
     result = create_composite_backend(BackendType.FILE)
-    assert result.has_capability(BackendCapability.BOARD_MODIFY)
+    assert not result.has_capability(BackendCapability.BOARD_MODIFY)
 
 
 def test_file_backend_no_zone_refill():

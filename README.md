@@ -8,15 +8,16 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **83 MCP Tools** across 8 categories:
+- **94 MCP Tools** across 9 categories:
   - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference, plan capture and retrieval, **startup gate checklist**
   - 📐 **Schematic Operations** (21 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
-  - 🔌 **PCB Board Operations** (14 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with utilization reporting), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate)
+  - 🔌 **PCB Board Operations** (15 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with utilization reporting), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
-  - ✅ **Design Rule Checks** (6 tools): Run DRC and ERC validations, file-based schematic validation, query board design rules, **pre-sync schematic completeness check**, **fast courtyard overlap check**
-  - 📤 **Export Operations** (5 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics)
+  - ✅ **Design Rule Checks** (8 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **pre-sync schematic completeness check**, **fast courtyard overlap check**
+  - 📤 **Export Operations** (7 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models**
   - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clear all routes for re-placement**
+  - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
 
 - **Multiple Backend Support**:
   - **Plugin Backend** *(primary on Windows)*: TCP bridge to KiCad's embedded Python — full board read+write via `pcbnew` API, DRC and export via `kicad-cli`, schematics via file backend
@@ -327,7 +328,7 @@ python -m kicad_mcp_plugin
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (14 tools)
+### PCB Board Operations (15 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
@@ -341,6 +342,7 @@ python -m kicad_mcp_plugin
 - `get_stackup`: Get the layer stackup definition for a board
 - `set_board_design_rules`: Write manufacturing-enforceable design rules into the `.kicad_pro` `net_settings.classes` Default entry. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
 - `auto_place`: Geometry-driven bin-packing placement. Reads the courtyard extents for every footprint, sorts by component class (connectors → ICs → discretes → transistors → LEDs → others), and packs components into rows with a guaranteed courtyard-to-courtyard gap ≥ `clearance_mm`. Returns `utilization_pct` (courtyard area / board area) and warns when >70%.
+- `diff_board`: Detect changes between two PCB board snapshots. Compares component positions and track counts between two `.kicad_pcb` files. Returns `added_components`, `removed_components`, `moved_components`, and `track_delta`. Useful for confirming `autoroute` added tracks or `auto_place` moved all components.
 - `pcb_pipeline`: Full schematic-to-routed-PCB pipeline in a single call. Step 0 runs a mandatory pre-flight gate (startup checklist + `validate_schematic_for_pcb` + board-size estimate); Steps 1–6: `sync_schematic_to_pcb` → `set_board_design_rules` → add Edge.Cuts outline (centered at origin) → `auto_place` → **courtyard overlap check** (fails pipeline if overlaps present) → `autoroute` → `run_drc`. Pipeline aborts with a clear error if any gate fails.
 
 ### Library Search (8 tools)
@@ -364,20 +366,24 @@ python -m kicad_mcp_plugin
 - `import_footprint`: Copy a footprint from one .pretty directory to another
 - `register_project_library`: Register a library in a project's sym-lib-table or fp-lib-table
 
-### Design Rule Checks (6 tools)
+### Design Rule Checks (8 tools)
 - `run_drc`: Run Design Rule Check on a PCB board
 - `run_erc`: Run Electrical Rules Check on a schematic
 - `validate_schematic`: File-based electrical rules validation (no kicad-cli required)
+- `validate_schematic_cli`: Validate schematic loadability using kicad-cli's strict C++ symbol loader. Exercises symbol geometry and `extends` chain resolution that the Python API accepts but kicad-cli export may reject. Returns `{"passed": bool, "backend": "kicad-cli", "message": "..."}` or `{"status": "unavailable"}` when kicad-cli is not installed.
+- `validate_board`: File-based pre-flight checks for a PCB board (no kicad-cli required). Checks: Edge.Cuts outline present (error), duplicate reference designators (error), footprints at (0, 0) (warning), design rules block absent (warning). Returns `{"passed": bool, "violations": [...], "error_count": n, "warning_count": n}`.
 - `get_board_design_rules`: Get the design rules configured for a board
 - `validate_schematic_for_pcb`: Pre-sync completeness check (no kicad-cli required). Verifies every component has a Footprint, references are unique, PWR_FLAG symbols cover power nets, no component sits at (0, 0), net count is non-zero, and optionally runs full ERC if kicad-cli is available. Returns `ready_for_pcb_sync` bool and a `blocking_issues` list. **Must pass before calling `sync_schematic_to_pcb`.**
 - `check_courtyard_overlaps`: Fast file-based courtyard AABB intersection check (milliseconds, no kicad-cli). Returns `passed` bool and a list of overlapping component pairs with `overlap_x_mm`, `overlap_y_mm`, and `suggested_move_mm`. **Must pass before calling `autoroute`.**
 
-### Export Operations (5 tools)
+### Export Operations (7 tools)
 - `export_gerbers`: Export Gerber manufacturing files from a PCB board
 - `export_drill`: Export drill files (Excellon format)
 - `export_bom`: Export Bill of Materials (CSV, JSON, etc.)
 - `export_pick_and_place`: Export pick-and-place component placement file
 - `export_pdf`: Export a board or schematic to PDF. Verifies kicad-cli is on PATH before attempting export and confirms the output file was actually created. On failure, surfaces the exact kicad-cli command attempted and stderr so you can diagnose the root cause.
+- `export_step`: Export a 3D STEP model from a PCB board for mechanical integration. Requires kicad-cli.
+- `export_vrml`: Export a 3D VRML model from a PCB board for 3D rendering and simulation tools. Requires kicad-cli.
 
 ### Auto-Routing (6 tools) - Optional
 **Requires:** [FreeRouting](https://github.com/freerouting/freerouting) and Java
@@ -392,6 +398,16 @@ These tools provide automated PCB trace routing capabilities:
 
 > **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without FreeRouting or Java.
 
+### Parts Catalog (6 tools)
+These tools index and search third-party KiCad library sources (GitHub releases, local directories) and install parts by MPN into project libraries. They extend the built-in Library Management tools with a content-addressed parts index.
+
+- `list_known_sources`: List all well-known third-party KiCad library sources (name, URL, type, description)
+- `bootstrap_known_source`: Download and register a well-known source by name (clones repo or extracts archive into `~/.kicad-mcp/sources/<name>/`, then registers it)
+- `index_library_source`: Build or rebuild the parts index for a registered source (scans `.kicad_sym` / `.kicad_mod` files, extracts MPN and manufacturer fields)
+- `search_parts`: Search the parts index by MPN, value, description, or manufacturer across all indexed sources. Returns ranked matches with symbol and footprint paths.
+- `install_part`: Copy a part from an indexed source into a project-local library by MPN. Installs both symbol and footprint if available.
+- `parts_index_stats`: Report index statistics for all registered sources (symbol count, footprint count, last indexed time, source path)
+
 ## Backend Details
 
 ### Plugin Entry Point Backend Routing
@@ -401,8 +417,8 @@ These tools provide automated PCB trace routing capabilities:
 | Operation | Backend |
 |-----------|---------|
 | Board read/write (place, move, track, via, zones, outline, DSN/SES) | Plugin bridge (TCP → `pcbnew`) |
-| Schematic read/write | File backend |
-| DRC / export (Gerbers, drill, BOM, PDF) | kicad-cli |
+| Schematic read-only | File backend |
+| DRC / export (Gerbers, drill, BOM, PDF, STEP, VRML) | kicad-cli |
 | Library search / management | File backend |
 
 ### Backend Capabilities
@@ -410,16 +426,17 @@ These tools provide automated PCB trace routing capabilities:
 | Feature | Plugin | IPC | SWIG | CLI | File |
 |---------|--------|-----|------|-----|------|
 | Board Read | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Board Modify | ✅ | ✅ | ✅ | ⚠️ | ⚠️ |
+| Board Modify | ✅ | ✅ | ✅ | ⚠️ | ❌ |
 | Export | ✅¹ | ✅ | ✅ | ✅ | ❌ |
 | DRC/ERC | ✅¹ | ✅ | ✅ | ✅ | ❌ |
-| Schematic | ✅² | ✅ | ❌ | ⚠️ | ✅ |
+| Schematic Read | ✅² | ✅ | ❌ | ⚠️ | ✅ |
+| Schematic Write | ❌² | ✅ | ❌ | ⚠️ | ❌ |
 | Live KiCad | ✅ | ✅ | ❌ | ❌ | ❌ |
 | No KiCad Required | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 ⚠️ = Limited support  
 ¹ Plugin entry point routes export/DRC to kicad-cli  
-² Plugin entry point routes schematic ops to file backend
+² Plugin entry point routes schematic ops to file backend (read-only)
 
 ## Development
 
@@ -552,7 +569,7 @@ The script also demonstrates how to inject a custom symbol library into the file
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 5 auto-routing tools. All other 73 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 88 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

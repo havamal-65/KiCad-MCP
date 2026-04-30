@@ -1,6 +1,6 @@
 # KiCad MCP — Development Roadmap
 
-*Branch: `feat/plugin-backend` · Last updated: 2026-04-14 (phased /build-pcb workflow + pcb_pipeline courtyard gate)*
+*Merged to `main` · Last updated: 2026-04-28 (file backend read-only, 11 undocumented tools surfaced, .kicad_pro DRC fix, SetDrill KiCad 9 fix)*
 
 ---
 
@@ -17,10 +17,10 @@
 
 These are known bugs or fragile behaviors that affect existing workflows.
 
-### 1.1 Fix bridge reinstall — wx bare-name bug
-**Status**: Source fixed (2026-04-07). Bridge code uses `_save_and_refresh()` with `try: import wx`. **Still needs**: run `kicad_plugin/install_bridge.ps1` and restart PCB editor to push the fix into KiCad's scripting/plugins directory.
+### 1.1 Fix bridge reinstall — wx bare-name bug + KiCad 9 API renames
+**Status**: Source fixed in two commits. `_save_and_refresh()` wx import fix: 2026-04-07. `SetDrillValue` → `SetDrill` KiCad 9 API rename: committed `0eb29e4` (2026-04-28). **Still needs**: run `kicad_plugin/install_bridge.ps1` and restart PCB editor to push both fixes into KiCad's scripting/plugins directory.
 
-**Impact**: `export_gerbers` and `export_drill` fail when the installed bridge has the old `save_board` handler that references `wx` as a bare name. This blocks the full export workflow.
+**Impact**: `export_gerbers` and `export_drill` fail when the installed bridge has the old `save_board` handler that references `wx` as a bare name. `add_via` drill size is silently ignored with the old `SetDrillValue` API. Both block the full PCB workflow.
 
 **Owner**: Codex (requires live KiCad session).
 
@@ -55,12 +55,12 @@ All tests run without KiCad installed (mock `_tcp_call`, `is_kicad_running`, `_l
 ---
 
 ### 1.4 Merge `feat/plugin-backend` → `main`
-After 1.1–1.3 are done, this branch is release-ready. Merge checklist:
-- [ ] Bridge reinstalled and gerber/drill export confirmed working
-- [ ] Board-switch fix passing (Codex E2E)
-- [x] pytest suite green with `--tb=short -q`
+**Status**: Merge completed 2026-04-27. `feat/plugin-backend` branch deleted; only `main` remains. Outstanding items:
+- [ ] Bridge reinstalled and gerber/drill export confirmed working (1.1 above)
+- [ ] Board-switch fix passing (Codex E2E) (1.2 above)
+- [x] pytest suite green with `--tb=short -q` (137 tests)
 - [x] README reflects plugin-first architecture and install steps
-- [x] Tool count updated in docs (83 tools)
+- [x] Tool count updated in docs (94 tools as of 2026-04-28)
 
 ---
 
@@ -162,23 +162,13 @@ New capabilities that address real workflow gaps.
 
 ---
 
-### 4.2 `get_board_3d` — export 3D board model via kicad-cli
-**Context**: kicad-cli supports `kicad-cli pcb export step` and `kicad-cli pcb export vrml`. These produce STEP and VRML files useful for mechanical integration. No MCP tool exposes this yet.
-
-**Plan**:
-1. Add `export_step(board_path, output)` and `export_vrml(board_path, output)` to `CLIBoardOps` (or a new `CLIExportOps` method).
-2. Register as `mcp__kicad__export_step` and `mcp__kicad__export_vrml` tools.
-3. Guard with `save_board()` before running kicad-cli (same pattern as `export_gerbers`).
+### 4.2 `export_step` / `export_vrml` — 3D board model export
+**Status**: Done (first documented 2026-04-28). Both tools are registered in `src/kicad_mcp/tools/export.py`. `export_step` calls `kicad-cli pcb export step`; `export_vrml` calls `kicad-cli pcb export vrml`. Both guard with `save_board()` before running kicad-cli and return `{"status": "success", "output_file": ...}` on success.
 
 ---
 
 ### 4.3 `validate_board` — file-based pre-flight checks without kicad-cli
-**Context**: `validate_schematic` exists for schematics. There's no equivalent for PCB files. Users can't check "does the board have an Edge.Cuts outline?", "are all footprints placed?", "are there duplicate reference designators?" without calling `run_drc` (which requires kicad-cli).
-
-**Plan**:
-1. Add `validate_board(path)` tool backed by `FileBoardOps`.
-2. Checks: Edge.Cuts outline present + closed, no duplicate reference designators, all footprints have at least one pad, no footprints at (0, 0), design rules block present in `.kicad_pro`.
-3. Returns `{"passed": bool, "issues": [...]}` — same shape as `run_drc`.
+**Status**: Done (first documented 2026-04-28). Tool is registered in `src/kicad_mcp/tools/drc.py`. Checks: Edge.Cuts outline present (error), duplicate reference designators (error), footprints at (0, 0) (warning), design rules block absent in `.kicad_pro` (warning). Returns `{"passed": bool, "violations": [...], "error_count": n, "warning_count": n, "checks_performed": [...]}`. Does not require kicad-cli.
 
 ---
 
@@ -201,12 +191,7 @@ New capabilities that address real workflow gaps.
 ---
 
 ### 4.6 `diff_board` — detect changes between two board snapshots
-**Context**: After `pcb_pipeline` runs, users sometimes want to know what changed vs. the previous state. Currently they must manually compare files.
-
-**Plan**:
-1. `diff_board(path_a, path_b)` → reads both, compares component positions, track counts, net assignments.
-2. Returns `{"added_components": [...], "removed_components": [...], "moved_components": [...], "track_delta": n}`.
-3. Useful for: confirming `autoroute` added tracks, verifying `auto_place` moved all components.
+**Status**: Done (first documented 2026-04-28). Tool is registered in `src/kicad_mcp/tools/board.py`. Takes two `.kicad_pcb` paths, compares component positions and track counts. Returns `{"added_components": [...], "removed_components": [...], "moved_components": [...], "track_delta": n}`. Useful for confirming `autoroute` added tracks or `auto_place` moved all components.
 
 ---
 
@@ -225,13 +210,15 @@ and `--dry-run`. Works on Windows, macOS, and Linux.
 - PyPI publish triggers on `refs/tags/v*` push after tests pass.
 
 ### 5.3 MCP tool count audit
-Currently 83 tools (78 at Phase 1 + 5 added in Phase 2). After Phase 4 additions:
-- `export_step`, `export_vrml` → +2
-- `validate_board` → +1
-- `diff_board` → +1
-- `place_components_bulk` → +1 (or internal only)
+**Status**: 94 tools as of 2026-04-28. Breakdown relative to the previously documented 83:
 
-Target: ~88 tools, all tested by the E2E suite.
+| Group | Tools | Count |
+|---|---|---|
+| Phase 2 additions (previously documented) | `get_startup_checklist`, `estimate_board_size`, `validate_schematic_for_pcb`, `check_courtyard_overlaps`, `clear_routes` | +5 |
+| Previously untracked (now documented) | `diff_board`, `validate_schematic_cli`, `validate_board`, `export_step`, `export_vrml` | +5 |
+| Parts catalog (`beb0484`, now documented) | `list_known_sources`, `bootstrap_known_source`, `index_library_source`, `search_parts`, `install_part`, `parts_index_stats` | +6 |
+
+Pending: `place_components_bulk` (4.4) — still planned; not yet implemented.
 
 ### 5.4 Linux/macOS bridge support
 **Status**: Done (2026-04-12).
@@ -246,9 +233,10 @@ Target: ~88 tools, all tested by the E2E suite.
 
 | Item | File | Severity |
 |---|---|---|
-| Bridge wx bare-name bug (needs reinstall) | `kicad_mcp_bridge.py` (installed copy) | High |
+| Bridge wx bare-name bug + SetDrill rename (source fixed; **needs reinstall**) | `kicad_mcp_bridge.py` (installed copy) | High |
 | `open_kicad` board-switch async | `tools/project.py` | High |
 | `kicad_mcp.__main__` legacy entry point | `src/kicad_mcp/__main__.py` | Medium |
 | `reload_board` uses `Refresh()` not `LoadBoard` | `kicad_mcp_bridge.py` | Medium |
 | `auto_place` uses file-based bounds (not pcbnew native) | `tools/board.py`, `file_backend.py` | Low |
 | Linux pcbnew path detection incomplete | `backends/subprocess_backend.py` | Low |
+| ~~`kicad-cli pcb drc` overwrites `.kicad_pro`~~ | ~~`backends/cli_backend.py`~~ | **FIXED** `0eb29e4` |

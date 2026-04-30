@@ -108,7 +108,7 @@ Structural improvements that make the codebase easier to maintain and extend.
 3. Update README to remove references to `python -m kicad_mcp`.
 4. Remove `CompositeBackend.check_file_write_safe()` and the `_check_file_write_safety` guard (no longer needed; plugin bridge is always the board writer when KiCad is running).
 
-**Risk**: Low. The legacy path has no known active users.
+**Risk**: Low. The legacy path has no known active users. Note: schematic write tools are already broken on the legacy entry point since `0eb29e4` removed `SCHEMATIC_MODIFY` from `FileBackend.capabilities` — `CompositeBackend` checks the capability map and finds no claimant, while `PluginDirectBackend` bypasses the check entirely (so the plugin entry point is unaffected). This accelerates retirement.
 
 ---
 

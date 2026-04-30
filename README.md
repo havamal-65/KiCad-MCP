@@ -417,7 +417,7 @@ These tools index and search third-party KiCad library sources (GitHub releases,
 | Operation | Backend |
 |-----------|---------|
 | Board read/write (place, move, track, via, zones, outline, DSN/SES) | Plugin bridge (TCP → `pcbnew`) |
-| Schematic read-only | File backend |
+| Schematic read/write | File backend |
 | DRC / export (Gerbers, drill, BOM, PDF, STEP, VRML) | kicad-cli |
 | Library search / management | File backend |
 
@@ -430,13 +430,13 @@ These tools index and search third-party KiCad library sources (GitHub releases,
 | Export | ✅¹ | ✅ | ✅ | ✅ | ❌ |
 | DRC/ERC | ✅¹ | ✅ | ✅ | ✅ | ❌ |
 | Schematic Read | ✅² | ✅ | ❌ | ⚠️ | ✅ |
-| Schematic Write | ❌² | ✅ | ❌ | ⚠️ | ❌ |
+| Schematic Write | ✅² | ✅ | ❌ | ⚠️ | ❌ |
 | Live KiCad | ✅ | ✅ | ❌ | ❌ | ❌ |
 | No KiCad Required | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 ⚠️ = Limited support  
 ¹ Plugin entry point routes export/DRC to kicad-cli  
-² Plugin entry point routes schematic ops to file backend (read-only)
+² Plugin entry point routes schematic ops to file backend (read/write)
 
 ## Development
 

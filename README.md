@@ -614,7 +614,7 @@ Installs to:
 
 ### Known Limitations (Plugin Backend)
 
-- **Board switching**: After calling `open_kicad` with a new board path, the bridge stays connected to the previously open board. You must manually open the new board in pcbnew before bridge operations will reflect the new board.
+- **Board switching**: `open_kicad` polls `get_active_project` for up to 10 s after launching pcbnew with a new board. If the board hasn't finished loading it returns `"bridge": "pending"` — call `open_kicad` again in a few seconds. If switching still fails, open the board manually in the PCB editor and retry.
 - **Bridge reinstall required after source updates**: The installed bridge (`3rdparty/plugins/kicad_mcp_bridge/__init__.py`) is a snapshot. Re-run the install script and restart pcbnew after any bridge source changes.
 
 ### Backend Not Available

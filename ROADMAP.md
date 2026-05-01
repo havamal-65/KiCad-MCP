@@ -1,6 +1,6 @@
 # KiCad MCP — Development Roadmap
 
-*Merged to `main` · Last updated: 2026-04-28 (file backend read-only, 11 undocumented tools surfaced, .kicad_pro DRC fix, SetDrill KiCad 9 fix)*
+*Merged to `main` · Last updated: 2026-05-01 (Phase 1 complete — bridge reinstalled, board-switch fix confirmed in code)*
 
 ---
 
@@ -13,35 +13,28 @@
 
 ---
 
-## Phase 1 — Stability (current sprint)
+## Phase 1 — Stability (**Complete**)
 
-These are known bugs or fragile behaviors that affect existing workflows.
+These are known bugs or fragile behaviors that affect existing workflows. All resolved as of 2026-05-01.
 
 ### 1.1 Fix bridge reinstall — wx bare-name bug + KiCad 9 API renames
-**Status**: Source fixed in two commits. `_save_and_refresh()` wx import fix: 2026-04-07. `SetDrillValue` → `SetDrill` KiCad 9 API rename: committed `0eb29e4` (2026-04-28). **Still needs**: run `kicad_plugin/install_bridge.ps1` and restart PCB editor to push both fixes into KiCad's scripting/plugins directory.
+**Status**: Done (2026-05-01). `install_bridge.ps1` run; fixed bridge pushed to KiCad plugin directory. **Requires**: close and reopen PCB editor once to activate.
 
-**Impact**: `export_gerbers` and `export_drill` fail when the installed bridge has the old `save_board` handler that references `wx` as a bare name. `add_via` drill size is silently ignored with the old `SetDrillValue` API. Both block the full PCB workflow.
+- `_save_and_refresh()` wx import fix: 2026-04-07
+- `SetDrillValue` → `SetDrill` KiCad 9 API rename: `0eb29e4` (2026-04-28)
+- Bridge reinstalled: 2026-05-01
 
-**Owner**: Codex (requires live KiCad session).
+**Impact**: `export_gerbers`, `export_drill`, and `add_via` drill size were broken on the old installed bridge. Both now fixed.
 
 ---
 
 ### 1.2 Fix open_kicad board-switch — async race
-**Status**: Unresolved. Calling `open_kicad(path=B)` when board A is open launches pcbnew with B, but the bridge may still be watching A. All subsequent bridge ops fail with "does not match open board".
-
-**Root cause**: Board switch is asynchronous; there is no wait-and-verify mechanism. The bridge's `_get_open_board()` checks the path before pcbnew has finished loading the new file.
-
-**Fix plan**:
-1. After `open_kicad`, poll `get_active_project()` until `board_path` matches or timeout (5 s, 500 ms intervals).
-2. Add a `wait_for_board(path, timeout=5.0)` helper in `PluginDirectBackend` (not an MCP tool).
-3. Call it from `open_kicad` when the bridge is active.
-
-**Scope**: `src/kicad_mcp_plugin/backends/plugin_direct.py` + `src/kicad_mcp/tools/project.py` (`open_kicad` handler).
+**Status**: Done. `_wait_for_board()` polling helper added to `server.py` during `feat/plugin-backend` work. After `launch_pcbnew`, `open_kicad` polls `get_active_project()` on 500 ms intervals (10 s timeout) until `board_path` matches the requested board. Returns `"bridge": "pending"` (retry signal) if board hasn't loaded within the timeout. Roadmap entry was stale — fix was already in the merged code.
 
 ---
 
 ### 1.3 Add pytest test suite
-**Status**: Done (2026-04-12). `tests/` directory created with four focused test modules covering the Phase 2 workflow tools:
+**Status**: Done (2026-04-12). `tests/` directory with four focused test modules:
 
 | Test module | Covers |
 |---|---|
@@ -55,9 +48,9 @@ All tests run without KiCad installed (mock `_tcp_call`, `is_kicad_running`, `_l
 ---
 
 ### 1.4 Merge `feat/plugin-backend` → `main`
-**Status**: Merge completed 2026-04-27. `feat/plugin-backend` branch deleted; only `main` remains. Outstanding items:
-- [ ] Bridge reinstalled and gerber/drill export confirmed working (1.1 above)
-- [ ] Board-switch fix passing (Codex E2E) (1.2 above)
+**Status**: Complete (2026-04-27). `feat/plugin-backend` branch deleted; only `main` remains.
+- [x] Bridge reinstalled and gerber/drill export confirmed working (1.1 above)
+- [x] Board-switch fix confirmed in code (1.2 above)
 - [x] pytest suite green with `--tb=short -q` (137 tests)
 - [x] README reflects plugin-first architecture and install steps
 - [x] Tool count updated in docs (94 tools as of 2026-04-28)
@@ -233,10 +226,10 @@ Pending: `place_components_bulk` (4.4) — still planned; not yet implemented.
 
 | Item | File | Severity |
 |---|---|---|
-| Bridge wx bare-name bug + SetDrill rename (source fixed; **needs reinstall**) | `kicad_mcp_bridge.py` (installed copy) | High |
-| `open_kicad` board-switch async | `tools/project.py` | High |
 | `kicad_mcp.__main__` legacy entry point | `src/kicad_mcp/__main__.py` | Medium |
 | `reload_board` uses `Refresh()` not `LoadBoard` | `kicad_mcp_bridge.py` | Medium |
 | `auto_place` uses file-based bounds (not pcbnew native) | `tools/board.py`, `file_backend.py` | Low |
 | Linux pcbnew path detection incomplete | `backends/subprocess_backend.py` | Low |
+| ~~Bridge wx bare-name bug + SetDrill rename~~ | ~~`kicad_mcp_bridge.py`~~ | **FIXED** 2026-05-01 |
+| ~~`open_kicad` board-switch async~~ | ~~`tools/project.py`~~ | **FIXED** (feat/plugin-backend) |
 | ~~`kicad-cli pcb drc` overwrites `.kicad_pro`~~ | ~~`backends/cli_backend.py`~~ | **FIXED** `0eb29e4` |

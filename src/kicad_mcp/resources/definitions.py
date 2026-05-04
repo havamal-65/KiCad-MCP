@@ -7,13 +7,13 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 
 logger = get_logger("resources")
 
 
-def register_resources(mcp: FastMCP, backend: CompositeBackend) -> None:
+def register_resources(mcp: FastMCP, backend: BackendProtocol) -> None:
     """Register MCP resources on the server."""
 
     @mcp.resource("kicad://project/{path}")

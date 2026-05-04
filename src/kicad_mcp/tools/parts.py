@@ -22,7 +22,7 @@ import json
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.known_sources import (
@@ -38,7 +38,7 @@ logger = get_logger("tools.parts")
 
 
 def register_tools(
-    mcp: FastMCP, backend: CompositeBackend, change_log: ChangeLog,
+    mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog,
 ) -> None:
     """Register the parts catalog tools."""
 

@@ -13,7 +13,7 @@ from kicad_mcp import __version__
 from kicad_mcp.backends.plugin_backend import _get_ping_timeout, _get_port, _tcp_call  # noqa: PLC2701
 from kicad_mcp.logging_config import get_logger, setup_logging
 from kicad_mcp.resources.definitions import register_resources
-from kicad_mcp.tools import board, drc, export, library, library_manage, project, routing, schematic
+from kicad_mcp.tools import board, drc, export, library, library_manage, parts, project, routing, schematic
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.platform_helper import (
     is_kicad_running,
@@ -265,6 +265,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     schematic.register_tools(mcp, backend, change_log)
     library.register_tools(mcp, backend, change_log)
     library_manage.register_tools(mcp, backend, change_log)
+    parts.register_tools(mcp, backend, change_log)
     drc.register_tools(mcp, backend, change_log)
     export.register_tools(mcp, backend, change_log)
 

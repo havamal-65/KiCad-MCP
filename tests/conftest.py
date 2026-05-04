@@ -11,6 +11,7 @@ import pytest
 
 from kicad_mcp.backends.base import (
     BackendCapability,
+    BackendProtocol,
     BoardOps,
     DRCOps,
     ExportOps,
@@ -19,7 +20,6 @@ from kicad_mcp.backends.base import (
     LibraryOps,
     SchematicOps,
 )
-from kicad_mcp.backends.composite import CompositeBackend
 from kicad_mcp.utils.change_log import ChangeLog
 
 
@@ -323,9 +323,19 @@ def mock_backend() -> MockBackend:
     return MockBackend()
 
 
+class MockProtocolBackend(BackendProtocol):
+    """Minimal BackendProtocol implementation for testing tools that accept BackendProtocol."""
+
+    def get_library_ops(self) -> LibraryOps:
+        return MockLibraryOps()
+
+    def get_library_manage_ops(self) -> LibraryManageOps:
+        return MockLibraryManageOps()
+
+
 @pytest.fixture
-def mock_composite(mock_backend: MockBackend) -> CompositeBackend:
-    return CompositeBackend([mock_backend])
+def mock_composite() -> BackendProtocol:
+    return MockProtocolBackend()
 
 
 @pytest.fixture

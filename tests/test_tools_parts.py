@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.composite import CompositeBackend
+from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.tools import parts as parts_module
 from kicad_mcp.utils import library_sources as lib_sources_module
 from kicad_mcp.utils import parts_index as parts_index_module
@@ -36,7 +36,7 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def mcp_app(
-    mock_composite: CompositeBackend,
+    mock_composite: BackendProtocol,
     tmp_change_log: ChangeLog,
     isolated_paths: Path,
 ) -> FastMCP:

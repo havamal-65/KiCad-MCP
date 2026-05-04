@@ -19,14 +19,11 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clear all routes for re-placement**
   - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
 
-- **Multiple Backend Support**:
-  - **Plugin Backend** *(primary on Windows)*: TCP bridge to KiCad's embedded Python — full board read+write via `pcbnew` API, DRC and export via `kicad-cli`, schematics via file backend
-  - **IPC Backend**: Direct communication with running KiCad instance via gRPC
-  - **SWIG Backend**: Native Python bindings (requires `kicad-python`)
-  - **CLI Backend**: Uses `kicad-cli` command-line tool
-  - **File Backend**: Pure Python file parsing (no KiCad installation required)
-
-- **Smart Backend Selection**: Automatically detects and uses the best available backend
+- **Plugin Backend Architecture**: `PluginDirectBackend` routes each operation to the right subsystem — no fallback ambiguity:
+  - **Board read/write** → TCP bridge to KiCad's embedded `pcbnew` Python (requires KiCad open)
+  - **Schematic read/write** → Pure Python file backend (no KiCad instance required)
+  - **DRC / export** → `kicad-cli` subprocess
+  - **Library search/management** → Pure Python file backend
 - **Safe Response Sizes**: Large list results (symbols, wires, tracks, components) are automatically capped to prevent AI token-limit errors. Truncated fields include `<field>_total` and `<field>_truncated` metadata so you always know the full count.
 - **Change Tracking**: Built-in logging of all operations for debugging and auditing
 - **Backup Support**: Automatic file backups before modifications
@@ -61,11 +58,6 @@ Activate the venv first, then install the extras inside it:
 
 ```bash
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-```
-
-For IPC backend (direct KiCad communication):
-```bash
-pip install kicad-mcp[ipc]
 ```
 
 For auto-routing functionality (requires Java and FreeRouting):
@@ -130,12 +122,7 @@ python -m kicad_mcp_plugin --transport sse --sse-host 127.0.0.1 --sse-port 8765
 
 ### Environment Variables
 
-Copy `.env.example` to `.env` and customize:
-
 ```bash
-# Backend selection: auto, ipc, swig, cli, file
-KICAD_MCP_BACKEND=auto
-
 # Transport: stdio, sse
 KICAD_MCP_TRANSPORT=stdio
 
@@ -151,6 +138,9 @@ KICAD_MCP_KICAD_CLI_PATH=
 # Enable file backups before modification (default: true)
 KICAD_MCP_BACKUP_ENABLED=true
 
+# Bridge port (default: 9760)
+KICAD_MCP_PLUGIN_PORT=9760
+
 # SSE server settings (only used with --transport sse)
 KICAD_MCP_SSE_HOST=127.0.0.1
 KICAD_MCP_SSE_PORT=8765
@@ -159,26 +149,22 @@ KICAD_MCP_SSE_PORT=8765
 ### Programmatic Configuration
 
 ```python
-from kicad_mcp.config import BackendType, KiCadMCPConfig
-from kicad_mcp.server import create_server
+from kicad_mcp_plugin.config import KiCadPluginConfig
+from kicad_mcp_plugin.server import create_plugin_server
 
-config = KiCadMCPConfig(
-    backend=BackendType.AUTO,
-    log_level="INFO",
-)
-
-mcp = create_server(config)
+config = KiCadPluginConfig(log_level="INFO")
+mcp = create_plugin_server(config)
 mcp.run(transport="stdio")
 ```
 
 ## Client Integration
 
-The repo ships two sets of bootstrap scripts:
+The repo ships bootstrap scripts for the plugin entry point:
 
-- **`run.ps1` / `run.sh`** — legacy composite entry point (`kicad_mcp`)
-- **`run_plugin.ps1` / `run_plugin.sh`** — plugin entry point (`kicad_mcp_plugin`, recommended on Windows with KiCad 9)
+- **`run_plugin.ps1`** — Windows (PowerShell 7+)
+- **`run_plugin.sh`** — macOS / Linux
 
-Both automatically create a virtual environment and install all dependencies on first run, and they clear inherited `PYTHONHOME` / `PYTHONPATH` overrides so MCP clients use the repo's venv instead of global Python packages.
+These automatically create a virtual environment and install all dependencies on first run, and they clear inherited `PYTHONHOME` / `PYTHONPATH` overrides so MCP clients use the repo's venv instead of global Python packages.
 
 ### Codex CLI
 
@@ -188,21 +174,19 @@ Windows:
 
 ```powershell
 codex mcp add kicad `
-  --env KICAD_MCP_BACKEND=auto `
   --env KICAD_MCP_LOG_LEVEL=INFO `
   -- "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
   -ExecutionPolicy Bypass `
   -NonInteractive `
-  -File "C:\path\to\KiCad-MCP\run.ps1"
+  -File "C:\path\to\KiCad-MCP\run_plugin.ps1"
 ```
 
 macOS / Linux:
 
 ```bash
 codex mcp add kicad \
-  --env KICAD_MCP_BACKEND=auto \
   --env KICAD_MCP_LOG_LEVEL=INFO \
-  -- /path/to/KiCad-MCP/run.sh
+  -- /path/to/KiCad-MCP/run_plugin.sh
 ```
 
 Verify with:
@@ -228,10 +212,9 @@ Use an absolute PowerShell path to avoid `Executable not found in $PATH: "powers
       "args": [
         "-ExecutionPolicy", "Bypass",
         "-NonInteractive",
-        "-File", "C:\\path\\to\\KiCad-MCP\\run.ps1"
+        "-File", "C:\\path\\to\\KiCad-MCP\\run_plugin.ps1"
       ],
       "env": {
-        "KICAD_MCP_BACKEND": "auto",
         "KICAD_MCP_LOG_LEVEL": "INFO"
       }
     }
@@ -243,7 +226,6 @@ Use an absolute PowerShell path to avoid `Executable not found in $PATH: "powers
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `~/.config/Claude/claude_desktop_config.json` (Linux):
 
-Plugin entry point (recommended — requires bridge installed and pcbnew open):
 ```json
 {
   "mcpServers": {
@@ -257,24 +239,9 @@ Plugin entry point (recommended — requires bridge installed and pcbnew open):
 }
 ```
 
-Legacy composite entry point (no KiCad required for file/CLI ops):
-```json
-{
-  "mcpServers": {
-    "kicad": {
-      "command": "/path/to/KiCad-MCP/run.sh",
-      "env": {
-        "KICAD_MCP_BACKEND": "auto",
-        "KICAD_MCP_LOG_LEVEL": "INFO"
-      }
-    }
-  }
-}
-```
-
 ### Cursor
 
-Add to your Cursor MCP settings (use `run.ps1` on Windows, `run.sh` on macOS/Linux as above).
+Add to your Cursor MCP settings (use `run_plugin.ps1` on Windows, `run_plugin.sh` on macOS/Linux as above).
 
 ### Manual setup (advanced)
 
@@ -290,13 +257,13 @@ python -m kicad_mcp_plugin
 ## Available Tools
 
 ### Project Management (14 tools)
-- `open_kicad`: Launch KiCad (IPC backend only)
+- `open_kicad`: Launch KiCad and wait for the bridge to become ready
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
 - `get_project_metadata`: Read detailed metadata from a KiCad project file
-- `save_project`: Trigger save for an open KiCad project (requires IPC backend)
+- `save_project`: Trigger save for an open KiCad project (requires bridge)
 - `get_backend_info`: Get information about available backends and their capabilities
-- `get_active_project`: Query the currently open KiCad project and documents (requires IPC backend; on Linux IPC builds without `GetOpenDocuments`, falls back to active board document metadata)
+- `get_active_project`: Query the currently open KiCad project and board path (requires bridge)
 - `get_text_variables`: Get all project-level text variables (`${VAR}` substitutions)
 - `set_text_variables`: Set one or more project-level text variables
 - `create_project`: Create a new KiCad project with blank `.kicad_pro`, `.kicad_sch`, and `.kicad_pcb` files
@@ -421,22 +388,15 @@ These tools index and search third-party KiCad library sources (GitHub releases,
 | DRC / export (Gerbers, drill, BOM, PDF, STEP, VRML) | kicad-cli |
 | Library search / management | File backend |
 
-### Backend Capabilities
+### Capability Routing (PluginDirectBackend)
 
-| Feature | Plugin | IPC | SWIG | CLI | File |
-|---------|--------|-----|------|-----|------|
-| Board Read | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Board Modify | ✅ | ✅ | ✅ | ⚠️ | ❌ |
-| Export | ✅¹ | ✅ | ✅ | ✅ | ❌ |
-| DRC/ERC | ✅¹ | ✅ | ✅ | ✅ | ❌ |
-| Schematic Read | ✅² | ✅ | ❌ | ⚠️ | ✅ |
-| Schematic Write | ✅² | ✅ | ❌ | ⚠️ | ❌ |
-| Live KiCad | ✅ | ✅ | ❌ | ❌ | ❌ |
-| No KiCad Required | ❌ | ❌ | ❌ | ❌ | ✅ |
-
-⚠️ = Limited support  
-¹ Plugin entry point routes export/DRC to kicad-cli  
-² Plugin entry point routes schematic ops to file backend (read/write)
+| Operation | Subsystem | KiCad required? |
+|-----------|-----------|-----------------|
+| Board read/write | TCP bridge → pcbnew | Yes (PCB editor open) |
+| Schematic read/write | File backend | No |
+| DRC / ERC / export | kicad-cli | Yes (kicad-cli on PATH) |
+| Library search/manage | File backend | No |
+| Parts catalog | SQLite + HTTP APIs | No |
 
 ## Development
 
@@ -480,18 +440,16 @@ mypy src
 ```
 KiCad-MCP/
 ├── src/kicad_mcp/
-│   ├── backends/          # Backend implementations (composite, plugin, CLI, SWIG, file, IPC)
+│   ├── backends/          # plugin_backend, cli_backend, file_backend, subprocess_backend (helpers)
 │   ├── models/            # Data models and error types
 │   ├── resources/         # MCP resources
-│   ├── tools/             # MCP tools (board, schematic, export, routing, library, DRC, project)
-│   ├── utils/             # Utilities (platform detection, sexp parser, validation)
-│   ├── config.py          # Configuration
-│   └── server.py          # MCP server setup
+│   ├── tools/             # MCP tools (board, schematic, export, routing, library, DRC, project, parts)
+│   └── utils/             # Utilities (platform detection, sexp parser, validation, parts index)
 ├── src/kicad_mcp_plugin/
 │   ├── backends/
 │   │   └── plugin_direct.py  # PluginDirectBackend — explicit routing, no fallbacks
 │   ├── config.py          # Plugin entry point config (KICAD_PLUGIN_ env prefix)
-│   ├── server.py          # Plugin MCP server setup
+│   ├── server.py          # MCP server — registers all 94 tools
 │   └── __main__.py        # CLI entry point: python -m kicad_mcp_plugin
 ├── kicad_plugin/
 │   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
@@ -617,23 +575,13 @@ Installs to:
 - **Board switching**: `open_kicad` polls `get_active_project` for up to 10 s after launching pcbnew with a new board. If the board hasn't finished loading it returns `"bridge": "pending"` — call `open_kicad` again in a few seconds. If switching still fails, open the board manually in the PCB editor and retry.
 - **Bridge reinstall required after source updates**: The installed bridge (`3rdparty/plugins/kicad_mcp_bridge/__init__.py`) is a snapshot. Re-run the install script and restart pcbnew after any bridge source changes.
 
-### Backend Not Available
+### Subsystem Not Available
 
-Use `get_backend_info` MCP tool to see which backends are active. Install missing dependencies:
+Use `get_backend_info` MCP tool to see the routing status. Common fixes:
 
-- Plugin: Run `install_bridge.ps1` (Windows) or `install_bridge.sh` (Linux/macOS), restart pcbnew, then use `python -m kicad_mcp_plugin`
-- IPC: Requires KiCad to be running
-- SWIG: activate the venv then `pip install kicad-mcp[ipc]`
-- CLI: Install KiCad and ensure `kicad-cli` is in PATH
-- File: Always available (pure Python)
-
-### Linux IPC Project Discovery
-
-Some Linux KiCad IPC builds (for example KiCad 9.0.7) do not implement the `GetOpenDocuments` handler. In that case:
-
-- `get_active_project` still returns project information using `kicad.get_board().document.project`
-- `get_text_variables` / `set_text_variables` also fall back to the active board document's project object
-- `open_documents` may include only the active PCB document when schematic/project document enumeration is not available
+- **Bridge unreachable**: Run `install_bridge.ps1` (Windows) or `install_bridge.sh` (Linux/macOS), restart pcbnew, call `open_kicad`
+- **kicad-cli not found**: Install KiCad and ensure `kicad-cli` is in PATH, or set `KICAD_MCP_KICAD_CLI_PATH`
+- **Schematic/library ops always available**: these use the pure Python file backend and require no running KiCad instance
 
 ### Auto-Routing Not Working
 

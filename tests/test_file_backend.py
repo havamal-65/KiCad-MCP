@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -318,3 +320,72 @@ def test_diff_board_detects_moved_component(tmp_path: Path):
     delta = math.sqrt(dx * dx + dy * dy)
 
     assert delta > 0.01  # should be ~56.6 mm
+
+
+# ---------------------------------------------------------------------------
+# assign_net — multi-rectangle thermal-pad contract
+# ---------------------------------------------------------------------------
+
+# Footprint U1 has pad "19" defined three times (matches the pattern of
+# real ESP32-C3-WROOM-02 thermal/exposed pad rendered as multiple SMD rects).
+# The contract: assign_net("U1", "19", "GND") must update ALL three.
+MULTI_RECT_PAD_PCB = textwrap.dedent("""\
+    (kicad_pcb
+      (version 20231231)
+      (generator "pcbnew")
+      (net 0 "")
+      (net 1 "GND")
+      (footprint "RF_Module:ESP32-C3-WROOM-02" (layer "F.Cu") (at 50 50)
+        (property "Reference" "U1" (at 0 0 0) (layer "F.Fab"))
+        (property "Value" "ESP32-C3-WROOM-02" (at 0 0 0) (layer "F.Fab"))
+        (pad "1" smd roundrect (at -10 0) (size 1 1) (layers "F.Cu") (net 0 ""))
+        (pad "19" smd rect (at 0 -2) (size 2 2) (layers "F.Cu"))
+        (pad "19" smd rect (at 0 0) (size 2 2) (layers "F.Cu"))
+        (pad "19" smd rect (at 0 2) (size 2 2) (layers "F.Cu"))
+      )
+    )
+""")
+
+
+@pytest.fixture
+def tmp_board_multi_rect_pad(tmp_path: Path) -> Path:
+    f = tmp_path / "esp32_board.kicad_pcb"
+    f.write_text(MULTI_RECT_PAD_PCB, encoding="utf-8")
+    return f
+
+
+def test_assign_net_updates_all_pads_with_same_number(tmp_board_multi_rect_pad: Path):
+    """Footprints with multi-rect thermal pads must have every (pad "N" ...)
+    block updated, not just the first. This locks in the file-backend
+    contract that the bridge handler in kicad_mcp_bridge.py is required to
+    match. Regressions here would re-introduce the ESP32-C3-WROOM-02
+    false-positive 'shorting' DRC reports."""
+    ops = FileBoardOps()
+    result = ops.assign_net(tmp_board_multi_rect_pad, "U1", "19", "GND")
+
+    assert result["pads_updated"] == 3
+
+    content = tmp_board_multi_rect_pad.read_text(encoding="utf-8")
+    # Three pad-19 blocks. The file contains 4 occurrences of (net 1 "GND")
+    # in total: the top-level (net 1 "GND") netinfo declaration, plus one
+    # per pad-19 rect. Before the multi-rect fix, only one pad would be
+    # updated and the count would be 2.
+    assert content.count('(pad "19"') == 3
+    assert content.count('(net 1 "GND")') == 4
+
+    # Pad-1 must NOT be retargeted to GND. Walk balanced parens manually so
+    # we don't trip on the nested (at ...) / (size ...) sub-expressions.
+    pad1_start = content.find('(pad "1"')
+    assert pad1_start != -1
+    depth = 0
+    pad1_end = pad1_start
+    for i in range(pad1_start, len(content)):
+        if content[i] == "(":
+            depth += 1
+        elif content[i] == ")":
+            depth -= 1
+            if depth == 0:
+                pad1_end = i + 1
+                break
+    pad1_block = content[pad1_start:pad1_end]
+    assert '(net 1 "GND")' not in pad1_block

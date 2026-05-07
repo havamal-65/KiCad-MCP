@@ -579,13 +579,29 @@ def _handle_assign_net(path: str, reference: str, pad: str, net: str) -> dict[st
             netinfo = pcbnew.NETINFO_ITEM(board, net)
             board.Add(netinfo)
         for fp in board.GetFootprints():
-            if fp.GetReference() == reference:
-                for p in fp.Pads():
-                    if p.GetNumber() == pad:
-                        p.SetNet(netinfo)
-                        _save_and_refresh(board)
-                        return {"status": "ok", "reference": reference, "pad": pad, "net": net}
+            if fp.GetReference() != reference:
+                continue
+            # Update ALL pads with this number. Footprints like
+            # ESP32-C3-WROOM-02 define multiple physical pads for a single
+            # logical pad number (thermal/exposed pad rendered as a rect
+            # array); only assigning the first leaves the rest unassigned
+            # and DRC reports false-positive shorts. Matches the
+            # FileBoardOps.assign_net contract.
+            pads_updated = 0
+            for p in fp.Pads():
+                if p.GetNumber() == pad:
+                    p.SetNet(netinfo)
+                    pads_updated += 1
+            if pads_updated == 0:
                 raise ValueError(f"Pad {pad!r} not found on {reference!r}")
+            _save_and_refresh(board)
+            return {
+                "status": "ok",
+                "reference": reference,
+                "pad": pad,
+                "net": net,
+                "pads_updated": pads_updated,
+            }
         raise ValueError(f"Component {reference!r} not found on board")
     return _run_on_main_thread(_do)
 

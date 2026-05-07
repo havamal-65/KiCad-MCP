@@ -731,9 +731,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             return _fail("add_board_outline", str(exc))
 
         # ── Step 4: auto_place ───────────────────────────────────────────────
-        # FileBoardOps bypass is intentional — same pattern as set_board_design_rules.
         try:
-            ap_result = FileBoardOps().auto_place(
+            ap_result = backend.get_board_modify_ops().auto_place(
                 pcb_p, x1, y1, board_width_mm, board_height_mm, 1.5
             )
             pipeline_steps.append({

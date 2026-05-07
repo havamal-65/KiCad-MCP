@@ -18,11 +18,12 @@ def _board_with_footprints(*footprints: dict) -> str:
     """Build a minimal .kicad_pcb with footprints that have courtyard rectangles.
 
     Each footprint dict has:
-      ref:    reference designator (str)
-      at_x:   board X position (float)
-      at_y:   board Y position (float)
-      w:      courtyard half-width in mm (footprint-relative)
-      h:      courtyard half-height in mm (footprint-relative)
+      ref:      reference designator (str)
+      at_x:     board X position (float)
+      at_y:     board Y position (float)
+      w:        courtyard half-width in mm (footprint-relative)
+      h:        courtyard half-height in mm (footprint-relative)
+      rotation: optional rotation in degrees (default 0)
     """
     lines = [
         "(kicad_pcb",
@@ -36,8 +37,10 @@ def _board_with_footprints(*footprints: dict) -> str:
         at_y = fp["at_y"]
         w = fp["w"]
         h = fp["h"]
+        rotation = fp.get("rotation", 0)
+        at_clause = f"{at_x} {at_y} {rotation}" if rotation else f"{at_x} {at_y}"
         lines += [
-            f'  (footprint "Device:R" (layer "F.Cu") (at {at_x} {at_y})',
+            f'  (footprint "Device:R" (layer "F.Cu") (at {at_clause})',
             f'    (property "Reference" "{ref}" (at 0 0 0) (layer "F.Fab"))',
             f'    (fp_rect (start {-w} {-h}) (end {w} {h}) (layer "F.CrtYd") (width 0.05))',
             "  )",
@@ -165,3 +168,27 @@ def test_result_keys_present(non_overlapping_board: Path):
     assert "overlap_count" in result
     assert "footprints_checked" in result
     assert "overlaps" in result
+
+
+# ---------------------------------------------------------------------------
+# Rotation — 45° components
+# ---------------------------------------------------------------------------
+
+def test_courtyard_45_degree_rotation_detected(tmp_path: Path):
+    # R1: small square at (10, 12)  → AABB (9.5..10.5, 11.5..12.5)
+    # R2: thin long rectangle (w=3, h=0.2) at (10, 10), rotated 45°
+    #   - Without rotation applied (old bug): AABB (7..13, 9.8..10.2) — y-gap of 1.3 mm, NO overlap
+    #   - With rotation applied (correct):    AABB (7.74..12.26, 7.74..12.26) — overlaps R1's y range
+    content = _board_with_footprints(
+        {"ref": "R1", "at_x": 10.0, "at_y": 12.0, "w": 0.5, "h": 0.5},
+        {"ref": "R2", "at_x": 10.0, "at_y": 10.0, "w": 3.0, "h": 0.2, "rotation": 45},
+    )
+    board = tmp_path / "rotated.kicad_pcb"
+    board.write_text(content, encoding="utf-8")
+    result = _call_tool(board)
+    assert result["status"] == "success"
+    assert result["passed"] is False, (
+        "Expected overlap to be detected for a 45°-rotated component whose "
+        "rotated bounding box reaches R1, but passed=True (rotation not applied)"
+    )
+    assert result["overlap_count"] >= 1

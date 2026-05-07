@@ -255,7 +255,7 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
                 bi += 1
 
             if cyd_xs and cyd_ys:
-                if abs(rotation_deg % 90) < 0.01 and abs(rotation_deg) > 0.01:
+                if abs(rotation_deg) > 0.01:
                     rad = _math.radians(rotation_deg)
                     cos_r, sin_r = _math.cos(rad), _math.sin(rad)
                     cyd_xs, cyd_ys = (

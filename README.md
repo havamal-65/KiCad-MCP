@@ -361,7 +361,7 @@ These tools provide automated PCB trace routing capabilities:
 - `run_freerouter`: Execute FreeRouting auto-router on a DSN file
 - `clean_board_for_routing`: Remove keepouts and problematic tracks before routing
 - `autoroute`: Complete pipeline (clean → export → route → import)
-- `clear_routes`: Remove all routed tracks and vias from a board file, preserving footprint placement, nets, and the board outline. Writes a `.clear_routes_backup.kicad_pcb` file before modifying. Use this to re-place and re-route without manual file surgery. If the plugin bridge is active, reloads the board in KiCad automatically.
+- `clear_routes`: Remove all routed tracks and vias from a board, preserving footprint placement, nets, and the board outline. When the plugin bridge is active, mutates pcbnew's live in-memory board so the file and bridge cache stay in sync — subsequent `autoroute` calls see the cleared state and tracks do not compound across iterations. Falls back to direct file editing when the bridge is unreachable. Writes a `.clear_routes_backup.kicad_pcb` file before modifying.
 
 > **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without FreeRouting or Java.
 
@@ -410,19 +410,13 @@ pip install -e .[dev]
 
 ### Run Tests
 
-Unit tests (no KiCad installation required):
+Unit tests (no KiCad installation required — mocks `_tcp_call`, `is_kicad_running`, and footprint loaders):
 
 ```bash
-pytest
+pytest --tb=short -q
 ```
 
-Integration tests (exercises MCP tools against real KiCad files in a temp directory):
-
-```bash
-python tests/integration/run_integration_tests.py
-```
-
-The integration test creates a complete KiCad project from scratch using MCP tools, exercises every tool, and prints a PASS / SKIP / FAIL summary. FreeRouting tools auto-detect the JAR from `~/.kicad-mcp/freerouting/`; all 5 export tools require `kicad-cli` and are gracefully skipped if not found.
+The suite covers tool logic, file backend behavior, bridge dispatch (mocked), and routing helpers. End-to-end behavior against a live `pcbnew` (e.g. confirming that `clear_routes` empties the bridge's in-memory cache) is exercised manually against the example projects in `examples/` rather than as automated CI.
 
 ### Code Quality
 
@@ -454,10 +448,8 @@ KiCad-MCP/
 ├── kicad_plugin/
 │   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
 │   └── install_bridge.ps1   # PowerShell installer (Windows, PowerShell 7+)
-├── examples/
-│   ├── air_quality_sensor/  # Complete worked example (schematic build script)
-│   ├── wearable_aqs/        # Wearable AQS (full schematic + routed PCB, E2E verified)
-│   └── usb_c_power_breakout_20260406_try3/  # USB-C breakout (pcb_pipeline E2E, plugin backend)
+├── tests/                 # pytest suite (mocked _tcp_call — no live KiCad needed)
+├── examples/              # Local-only worked builds (gitignored — see Examples section)
 ├── run_plugin.ps1         # Windows launcher for kicad_mcp_plugin (auto-creates venv)
 ├── run_plugin.sh          # macOS/Linux launcher for kicad_mcp_plugin
 ├── pyproject.toml         # Project metadata
@@ -475,53 +467,22 @@ KiCad-MCP/
 
 ## Examples
 
-### Air Quality Sensor (end-to-end test)
+The `examples/` directory is **gitignored** — it's a workspace for locally-built test boards rather than canonical reference designs that ship with the repo. Builds are produced by running `/build-pcb [description]` (or by calling the MCP tools directly) against a fresh project directory under `examples/`.
 
-`examples/air_quality_sensor/` contains a complete worked example that builds a real schematic from scratch using only the file backend — no KiCad installation required.
+A typical build leaves behind:
 
-**BOM**: ATtiny85-20S (MCU) · SCD41 (CO₂/temp/humidity) · SGP41 (VOC/NOx) · AMS1117-3.3 (LDO) · 2× 4.7 kΩ pullups · 6× decoupling caps · power connector · I2C debug header
+- `<project>.kicad_pro`, `<project>.kicad_sch`, `<project>.kicad_pcb`
+- `output/` containing exported gerbers, drill files, BOM, pick-and-place, and PDFs
+- `output/known_issues.md` — any DRC exceptions, dangling tracks, or silk overlaps that were reviewed and accepted before fab
 
-**What it exercises**:
-- `create_schematic` — create a new KiCad 8+ schematic
-- `add_component` — place all 14 components (including symbols from a custom `.kicad_sym`)
-- `get_symbol_pin_positions` — query exact pin coordinates (resolves `extends` chains automatically)
-- `add_power_symbol` — annotate power rails (+5V, +3V3, GND) at each power pin
-- `add_label` — apply SDA / SCL net labels
-- `add_no_connect` — mark unused pins
+To reproduce an end-to-end build yourself:
 
 ```bash
-python examples/air_quality_sensor/build_schematic.py
+# In Claude Code with KiCad open and the bridge installed
+/build-pcb air quality sensor with BME680 and ESP32-C3
 ```
 
-The script also demonstrates how to inject a custom symbol library into the file backend's search path, making the SCD41 and SGP41 symbols (not in the standard KiCad library) available to all MCP tools.
-
-### Wearable Air Quality Sensor (complete routed PCB)
-
-`examples/wearable_aqs/` contains a complete KiCad project with schematic, routed PCB, and exported manufacturing files.
-
-**BOM**: ESP32-C3-WROOM-02 (WiFi/BLE MCU) · SCD41 (CO₂/temp/humidity) · SGP41 (VOC/NOx) · AMS1117-3.3 (LDO regulator) · USB-C connector · JST battery connector · decoupling capacitors
-
-**Board**: 60 × 50 mm, 2-layer, JLCPCB rules, 231 tracks, DRC 0 errors
-
-**What it demonstrates**:
-- Full `pcb_pipeline` workflow (schematic → auto-place → autoroute → DRC)
-- `set_board_design_rules` with `"fab_jlcpcb"` preset written to `.kicad_pro`
-- `auto_place` geometry-driven bin-packing with ESP32 courtyard parsed from `fp_line` segments
-- `autoroute` via FreeRouting — complete routing in under 10 seconds
-- `export_gerbers`, `export_drill`, `export_bom` — manufacturing-ready output in `manufacturing/`
-
-### USB-C Power Breakout (plugin backend E2E)
-
-`examples/usb_c_power_breakout_20260406_try3/` contains a complete board created end-to-end via the plugin entry point, with the `kicad_mcp_bridge` providing live `pcbnew` access throughout.
-
-**BOM**: USB-C connector · AMS1117-3.3 LDO · decoupling capacitors · protection diode · status LED
-
-**Board**: ~40 × 25 mm, 2-layer, 6 footprints, 6 nets, copper routed, DRC clean
-
-**What it demonstrates**:
-- `pcb_pipeline` end-to-end via the plugin backend (`pcbnew` TCP bridge for all board ops)
-- `drc_passed: true` on a fully plugin-driven board
-- BOM export via `export_bom`
+The skill enforces the seven-phase workflow described above (Environment & Requirements → Schematic Capture → Verification → Setup & Placement → Routing → DRC → Manufacturing Outputs) and pauses for confirmation between phases.
 
 ## Troubleshooting
 

@@ -35,6 +35,39 @@ logger = get_logger("tools.routing")
 # Implementation helpers — plain Python functions callable from autoroute
 # ---------------------------------------------------------------------------
 
+def _impl_clear_routes(
+    path: str,
+    backup: bool,
+    backend: BackendProtocol,
+    change_log: ChangeLog,
+) -> str:
+    """Bridge-first route clearing with file-backend fallback.
+
+    Tries the live in-memory bridge path so the bridge cache stays in sync with
+    disk. Falls back to FileBoardOps when the bridge is unreachable.
+    """
+    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
+    p = validate_kicad_path(path, ".kicad_pcb")
+    try:
+        result = backend.get_board_modify_ops().clear_routes(p, backup=backup)
+    except BridgeTemporarilyUnavailableError:
+        result = FileBoardOps().clear_routes(p, backup=backup)
+
+    change_log.record(
+        "clear_routes",
+        {
+            "path": path,
+            "tracks_removed": result.get("tracks_removed", 0),
+            "vias_removed": result.get("vias_removed", 0),
+        },
+        file_modified=path,
+        backup_path=result.get("backup_path"),
+    )
+    return json.dumps(result, indent=2)
+
+
 def _impl_run_freerouter(
     dsn_path: str,
     output: str,
@@ -584,9 +617,10 @@ def register_tools(
     def clear_routes(path: str, backup: bool = True) -> str:
         """Remove all routed tracks and vias from a board, preserving component placement.
 
-        Strips every (segment ...) and (via ...) block from the .kicad_pcb file
-        so the board can be re-placed and re-routed without manual file surgery.
-        If the plugin bridge is active, reloads the board so KiCad reflects the change.
+        When the plugin bridge is active, mutates pcbnew's live in-memory board so
+        the file and bridge cache stay in sync — subsequent autoroute calls see the
+        cleared state, no stale tracks compound on re-routing. Falls back to direct
+        file editing when the bridge is unreachable (i.e. pcbnew not running).
 
         This is the correct tool to use when placement needs to be redone after routing
         has already started. Use clear_routes + auto_place instead of routing over bad
@@ -599,29 +633,7 @@ def register_tools(
         Returns:
             JSON with tracks_removed, vias_removed, and backup_path.
         """
-        from kicad_mcp.backends.file_backend import FileBoardOps
-
-        p = validate_kicad_path(path, ".kicad_pcb")
-        result = FileBoardOps().clear_routes(p, backup=backup)
-
-        # Reload the in-memory board so KiCad's PCB editor reflects the change
-        if result.get("status") == "success":
-            try:
-                backend.reload_board(p)
-            except Exception:
-                pass  # reload is best-effort; file is already written
-
-        change_log.record(
-            "clear_routes",
-            {
-                "path": path,
-                "tracks_removed": result.get("tracks_removed", 0),
-                "vias_removed": result.get("vias_removed", 0),
-            },
-            file_modified=path,
-            backup_path=result.get("backup_path"),
-        )
-        return json.dumps(result, indent=2)
+        return _impl_clear_routes(path, backup, backend, change_log)
 
     @mcp.tool()
     def autoroute(

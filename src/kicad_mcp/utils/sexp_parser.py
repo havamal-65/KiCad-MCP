@@ -27,9 +27,21 @@ def parse_sexp_file(path: Path) -> list[Any]:
         content = path.read_text(encoding="utf-8")
     except OSError as e:
         raise InvalidFileFormatError(f"Cannot read file: {e}")
+    return parse_sexp_content(content, source=str(path))
 
+
+def parse_sexp_content(content: str, source: str = "<string>") -> list[Any]:
+    """Parse already-loaded S-expression text into a nested list structure.
+
+    Lets callers avoid a second disk read when they already hold the file
+    contents (bulk operations that mutate the same string they parse).
+
+    Args:
+        content: The raw S-expression text.
+        source: Optional descriptor used in error messages (e.g. a path).
+    """
     if not content.strip().startswith("("):
-        raise InvalidFileFormatError(f"Not a valid S-expression file: {path}")
+        raise InvalidFileFormatError(f"Not a valid S-expression file: {source}")
 
     try:
         import sexpdata

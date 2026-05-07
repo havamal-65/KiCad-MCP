@@ -252,6 +252,43 @@ class SchematicOps(ABC):
         """Generate a netlist from the schematic."""
         raise NotImplementedError("This backend does not support netlist generation")
 
+    def add_components_bulk(
+        self, path: Path, components: list[dict],
+    ) -> dict[str, Any]:
+        """Add multiple components in a single read/write cycle.
+
+        components: list of dicts matching add_component's parameters
+                    (lib_id, reference, value, x, y, optional rotation,
+                    mirror, footprint, properties).
+        Returns {"placed": [...], "failed": [...]}.
+        """
+        raise NotImplementedError("This backend does not support add_components_bulk")
+
+    def add_power_symbols_bulk(
+        self, path: Path, symbols: list[dict],
+    ) -> dict[str, Any]:
+        """Add multiple power symbols in a single read/write cycle.
+
+        symbols: list of dicts with keys: name, x, y, optional rotation.
+        Returns {"placed": [...], "failed": [...]}. #PWR references are
+        auto-incremented across the batch.
+        """
+        raise NotImplementedError("This backend does not support add_power_symbols_bulk")
+
+    def connect_pins_bulk(
+        self, path: Path, pins: list[str], net: str,
+        stub_length: float = 2.54,
+    ) -> dict[str, Any]:
+        """Connect multiple pins to a single named net via stubs and labels.
+
+        pins: list of "REFERENCE.PIN_NUMBER" strings (e.g. "U1.5", "R3.2").
+        net: net name applied to all pins.
+        stub_length: stub wire length in mm. 0 places the label directly at
+                     the pin (no wire).
+        Returns {"connected": [...], "failed": [...]}.
+        """
+        raise NotImplementedError("This backend does not support connect_pins_bulk")
+
 
 class ExportOps(ABC):
     """Abstract interface for export operations."""

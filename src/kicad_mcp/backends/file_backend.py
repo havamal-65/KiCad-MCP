@@ -29,6 +29,7 @@ from kicad_mcp.utils.sexp_parser import (
     find_no_connect_block_by_position,
     find_symbol_block_by_reference,
     find_wire_block_by_endpoints,
+    parse_sexp_content,
     parse_sexp_file,
     remove_sexp_block,
 )
@@ -1865,24 +1866,22 @@ class FileSchematicOps(SchematicOps):
             "message": f"Annotated {len(replacements)} reference(s)",
         }
 
-    def add_component(
-        self, path: Path, lib_id: str, reference: str, value: str,
-        x: float, y: float, rotation: float = 0.0,
-        mirror: str | None = None, footprint: str = "",
-        properties: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        import uuid
-        symbol_uuid = str(uuid.uuid4())
+    @staticmethod
+    def _build_symbol_block(
+        lib_id: str, reference: str, value: str,
+        x: float, y: float, rotation: float,
+        mirror: str | None, footprint: str,
+        properties: dict[str, str] | None,
+        symbol_uuid: str, sch_uuid: str,
+    ) -> str:
+        """Build the (symbol ...) s-expression block for a regular component.
 
-        # Build at clause
+        Pure formatting helper — does no file I/O, no library caching, no UUID
+        generation. Caller supplies the symbol UUID and schematic UUID.
+        """
         at_clause = f"(at {x} {y} {rotation})"
+        mirror_clause = f"\n    (mirror {mirror})" if mirror in ("x", "y") else ""
 
-        # Build mirror clause
-        mirror_clause = ""
-        if mirror in ("x", "y"):
-            mirror_clause = f"\n    (mirror {mirror})"
-
-        # Build properties
         prop_lines = (
             f'    (property "Reference" "{reference}" (at {x} {y - 2} 0)\n'
             f'      (effects (font (size 1.27 1.27)))\n'
@@ -1891,14 +1890,12 @@ class FileSchematicOps(SchematicOps):
             f'      (effects (font (size 1.27 1.27)))\n'
             f'    )\n'
         )
-
         if footprint:
             prop_lines += (
                 f'    (property "Footprint" "{footprint}" (at {x} {y + 4} 0)\n'
                 f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
                 f'    )\n'
             )
-
         if properties:
             offset = 6
             for prop_name, prop_val in properties.items():
@@ -1909,11 +1906,7 @@ class FileSchematicOps(SchematicOps):
                 )
                 offset += 2
 
-        content = path.read_text(encoding="utf-8")
-        content = self._ensure_lib_symbol_cached(content, lib_id, schematic_path=path)
-        sch_uuid = self._find_schematic_uuid(content)
-
-        sym_sexp = (
+        return (
             f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit 1)\n'
             f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
@@ -1926,6 +1919,24 @@ class FileSchematicOps(SchematicOps):
             f'      )\n'
             f'    )\n'
             f'  )\n'
+        )
+
+    def add_component(
+        self, path: Path, lib_id: str, reference: str, value: str,
+        x: float, y: float, rotation: float = 0.0,
+        mirror: str | None = None, footprint: str = "",
+        properties: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        import uuid
+        symbol_uuid = str(uuid.uuid4())
+
+        content = path.read_text(encoding="utf-8")
+        content = self._ensure_lib_symbol_cached(content, lib_id, schematic_path=path)
+        sch_uuid = self._find_schematic_uuid(content)
+
+        sym_sexp = self._build_symbol_block(
+            lib_id, reference, value, x, y, rotation,
+            mirror, footprint, properties, symbol_uuid, sch_uuid,
         )
 
         insert_pos = self._find_insertion_point(content)
@@ -2013,6 +2024,37 @@ class FileSchematicOps(SchematicOps):
             "uuid": nc_uuid,
         }
 
+    @staticmethod
+    def _build_power_symbol_block(
+        name: str, x: float, y: float, rotation: float,
+        pwr_ref: str, symbol_uuid: str, sch_uuid: str,
+    ) -> str:
+        """Build the (symbol ...) s-expression block for a power symbol.
+
+        Pure formatting helper — caller supplies the auto-incremented #PWR
+        reference, the symbol UUID, and the schematic UUID.
+        """
+        lib_id = f"power:{name}"
+        return (
+            f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation}) (unit 1)\n'
+            f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
+            f'    (uuid "{symbol_uuid}")\n'
+            f'    (property "Reference" "{pwr_ref}" (at {x} {y - 2} 0)\n'
+            f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
+            f'    )\n'
+            f'    (property "Value" "{name}" (at {x} {y + 2} 0)\n'
+            f'      (effects (font (size 1.27 1.27)))\n'
+            f'    )\n'
+            f'    (instances\n'
+            f'      (project ""\n'
+            f'        (path "/{sch_uuid}"\n'
+            f'          (reference "{pwr_ref}") (unit 1)\n'
+            f'        )\n'
+            f'      )\n'
+            f'    )\n'
+            f'  )\n'
+        )
+
     def add_power_symbol(
         self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
     ) -> dict[str, Any]:
@@ -2031,24 +2073,8 @@ class FileSchematicOps(SchematicOps):
 
         sch_uuid = self._find_schematic_uuid(content)
 
-        sym_sexp = (
-            f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rotation}) (unit 1)\n'
-            f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
-            f'    (uuid "{symbol_uuid}")\n'
-            f'    (property "Reference" "{pwr_ref}" (at {x} {y - 2} 0)\n'
-            f'      (effects (font (size 1.27 1.27)) (hide yes))\n'
-            f'    )\n'
-            f'    (property "Value" "{name}" (at {x} {y + 2} 0)\n'
-            f'      (effects (font (size 1.27 1.27)))\n'
-            f'    )\n'
-            f'    (instances\n'
-            f'      (project ""\n'
-            f'        (path "/{sch_uuid}"\n'
-            f'          (reference "{pwr_ref}") (unit 1)\n'
-            f'        )\n'
-            f'      )\n'
-            f'    )\n'
-            f'  )\n'
+        sym_sexp = self._build_power_symbol_block(
+            name, x, y, rotation, pwr_ref, symbol_uuid, sch_uuid,
         )
 
         insert_pos = self._find_insertion_point(content)
@@ -2082,6 +2108,276 @@ class FileSchematicOps(SchematicOps):
             "position": {"x": x, "y": y},
             "uuid": jn_uuid,
         }
+
+    # ------------------------------------------------------------------
+    # Bulk operations — collapse N round-trips and N file reads into 1
+    # ------------------------------------------------------------------
+
+    def add_components_bulk(
+        self, path: Path, components: list[dict],
+    ) -> dict[str, Any]:
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+
+        # Cache each unique lib_id once. Components whose lib_id can't be
+        # resolved are marked failed by index; the batch continues.
+        unique_lib_ids: list[str] = []
+        seen_lib_ids: set[str] = set()
+        for c in components:
+            lid = c.get("lib_id", "")
+            if lid and lid not in seen_lib_ids:
+                seen_lib_ids.add(lid)
+                unique_lib_ids.append(lid)
+
+        failed_lib_ids: dict[str, str] = {}
+        for lid in unique_lib_ids:
+            try:
+                content = self._ensure_lib_symbol_cached(content, lid, schematic_path=path)
+            except Exception as exc:
+                failed_lib_ids[lid] = str(exc)
+
+        sch_uuid = self._find_schematic_uuid(content)
+
+        placed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        blocks: list[str] = []
+
+        for i, c in enumerate(components):
+            try:
+                lib_id = c.get("lib_id", "")
+                reference = c.get("reference", "")
+                value = c.get("value", "")
+                x = float(c.get("x", 0.0))
+                y = float(c.get("y", 0.0))
+                rotation = float(c.get("rotation", 0.0))
+                mirror = c.get("mirror")
+                footprint = c.get("footprint", "")
+                properties = c.get("properties")
+
+                if not lib_id or not reference:
+                    failed.append({
+                        "index": i, "reference": reference,
+                        "reason": "missing lib_id or reference",
+                    })
+                    continue
+
+                if lib_id in failed_lib_ids:
+                    failed.append({
+                        "index": i, "reference": reference,
+                        "reason": f"lib_id '{lib_id}' could not be cached: {failed_lib_ids[lib_id]}",
+                    })
+                    continue
+
+                symbol_uuid = str(_uuid.uuid4())
+                blocks.append(self._build_symbol_block(
+                    lib_id, reference, value, x, y, rotation,
+                    mirror, footprint, properties, symbol_uuid, sch_uuid,
+                ))
+                placed.append({
+                    "reference": reference,
+                    "lib_id": lib_id,
+                    "uuid": symbol_uuid,
+                    "position": {"x": x, "y": y},
+                })
+            except Exception as exc:
+                failed.append({
+                    "index": i, "reference": c.get("reference", ""),
+                    "reason": str(exc),
+                })
+
+        if blocks:
+            insert_pos = self._find_insertion_point(content)
+            content = content[:insert_pos] + "".join(blocks) + content[insert_pos:]
+            path.write_text(content, encoding="utf-8")
+
+        return {"placed": placed, "failed": failed}
+
+    def add_power_symbols_bulk(
+        self, path: Path, symbols: list[dict],
+    ) -> dict[str, Any]:
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+
+        # Cache each unique power lib_id once.
+        unique_names: list[str] = []
+        seen_names: set[str] = set()
+        for s in symbols:
+            name = s.get("name", "")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                unique_names.append(name)
+
+        failed_names: dict[str, str] = {}
+        for name in unique_names:
+            try:
+                content = self._ensure_lib_symbol_cached(
+                    content, f"power:{name}", schematic_path=path,
+                )
+            except Exception as exc:
+                failed_names[name] = str(exc)
+
+        sch_uuid = self._find_schematic_uuid(content)
+
+        # Single scan for current max #PWR number across the whole file.
+        pwr_refs = re.findall(r'"#PWR(\d+)"', content)
+        next_num = max((int(n) for n in pwr_refs), default=0) + 1
+
+        placed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        blocks: list[str] = []
+
+        for i, s in enumerate(symbols):
+            try:
+                name = s.get("name", "")
+                x = float(s.get("x", 0.0))
+                y = float(s.get("y", 0.0))
+                rotation = float(s.get("rotation", 0.0))
+
+                if not name:
+                    failed.append({"index": i, "reason": "missing name"})
+                    continue
+                if name in failed_names:
+                    failed.append({
+                        "index": i, "name": name,
+                        "reason": f"power:{name} could not be cached: {failed_names[name]}",
+                    })
+                    continue
+
+                pwr_ref = f"#PWR{next_num:03d}"
+                next_num += 1
+                symbol_uuid = str(_uuid.uuid4())
+
+                blocks.append(self._build_power_symbol_block(
+                    name, x, y, rotation, pwr_ref, symbol_uuid, sch_uuid,
+                ))
+                placed.append({
+                    "name": name,
+                    "reference": pwr_ref,
+                    "lib_id": f"power:{name}",
+                    "uuid": symbol_uuid,
+                    "position": {"x": x, "y": y},
+                })
+            except Exception as exc:
+                failed.append({
+                    "index": i, "name": s.get("name", ""), "reason": str(exc),
+                })
+
+        if blocks:
+            insert_pos = self._find_insertion_point(content)
+            content = content[:insert_pos] + "".join(blocks) + content[insert_pos:]
+            path.write_text(content, encoding="utf-8")
+
+        return {"placed": placed, "failed": failed}
+
+    # Pin reference grammar: matches validate_reference + a pin atom.
+    # Uses pin numbers only in v1 (pin names like "U1.SDA" not yet supported).
+    _PIN_REF_RE = re.compile(r"^(#?[A-Za-z][A-Za-z0-9]*\d+[A-Za-z]?)\.(\w+)$")
+
+    def connect_pins_bulk(
+        self, path: Path, pins: list[str], net: str,
+        stub_length: float = 2.54,
+    ) -> dict[str, Any]:
+        import uuid as _uuid
+
+        from kicad_mcp.utils.validation import validate_net_name
+        validate_net_name(net)
+
+        content = path.read_text(encoding="utf-8")
+        tree = parse_sexp_content(content, source=str(path))
+
+        # Cache pin-position lookups per unique reference.
+        ref_cache: dict[str, dict[str, Any]] = {}
+
+        def _get_ref_info(ref: str) -> dict[str, Any]:
+            if ref not in ref_cache:
+                ref_cache[ref] = self._resolve_pin_positions(tree, ref, path)
+            return ref_cache[ref]
+
+        connected: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        blocks: list[str] = []
+
+        for pin_str in pins:
+            m = self._PIN_REF_RE.match(pin_str.strip()) if isinstance(pin_str, str) else None
+            if m is None:
+                failed.append({"pin": pin_str, "reason": "invalid pin reference; expected 'REF.PIN'"})
+                continue
+
+            reference, pin_number = m.group(1), m.group(2)
+            info = _get_ref_info(reference)
+
+            if "error" in info:
+                failed.append({"pin": pin_str, "reason": info["error"]})
+                continue
+
+            pin_positions = info.get("pin_positions", {})
+            pin_pos = pin_positions.get(pin_number)
+            if pin_pos is None:
+                failed.append({
+                    "pin": pin_str,
+                    "reason": f"pin '{pin_number}' not found on '{reference}'",
+                })
+                continue
+
+            sx = float(info["position"]["x"])
+            sy = float(info["position"]["y"])
+            px = float(pin_pos["x"])
+            py = float(pin_pos["y"])
+
+            if stub_length > 0:
+                dx_raw = px - sx
+                dy_raw = py - sy
+                # Snap stub direction to whichever cardinal axis dominates.
+                # If pin is exactly at symbol center (rare), default to +X.
+                if abs(dx_raw) >= abs(dy_raw):
+                    dx = 1.0 if dx_raw >= 0 else -1.0
+                    dy = 0.0
+                else:
+                    dx = 0.0
+                    dy = 1.0 if dy_raw >= 0 else -1.0
+                end_x = round(px + dx * stub_length, 4)
+                end_y = round(py + dy * stub_length, 4)
+            else:
+                end_x = px
+                end_y = py
+
+            label_uuid = str(_uuid.uuid4())
+            wire_uuid: str | None = None
+
+            if stub_length > 0:
+                wire_uuid = str(_uuid.uuid4())
+                blocks.append(
+                    f'  (wire (pts (xy {px} {py}) (xy {end_x} {end_y}))\n'
+                    f'    (stroke (width 0) (type default))\n'
+                    f'    (uuid "{wire_uuid}")\n'
+                    f'  )\n'
+                )
+
+            blocks.append(
+                f'  (label "{net}" (at {end_x} {end_y} 0)\n'
+                f'    (effects (font (size 1.27 1.27)))\n'
+                f'    (uuid "{label_uuid}")\n'
+                f'  )\n'
+            )
+
+            connected.append({
+                "pin": pin_str,
+                "reference": reference,
+                "pin_number": pin_number,
+                "x": end_x,
+                "y": end_y,
+                "label_uuid": label_uuid,
+                "wire_uuid": wire_uuid,
+            })
+
+        if blocks:
+            insert_pos = self._find_insertion_point(content)
+            content = content[:insert_pos] + "".join(blocks) + content[insert_pos:]
+            path.write_text(content, encoding="utf-8")
+
+        return {"connected": connected, "failed": failed, "net": net}
 
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
@@ -2232,9 +2528,19 @@ class FileSchematicOps(SchematicOps):
     def get_symbol_pin_positions(
         self, path: Path, reference: str,
     ) -> dict[str, Any]:
-        import math
-
         tree = parse_sexp_file(path)
+        return self._resolve_pin_positions(tree, reference, path)
+
+    def _resolve_pin_positions(
+        self, tree: list, reference: str, path: Path,
+    ) -> dict[str, Any]:
+        """Resolve absolute pin coordinates for a placed symbol.
+
+        Operates on an already-parsed tree (output of parse_sexp_file) so bulk
+        callers can reuse one parse across many references. ``path`` is used
+        only as a fallback hint for project-level sym-lib-table resolution.
+        """
+        import math
 
         # 1. Find the symbol instance by reference
         sym_node = None

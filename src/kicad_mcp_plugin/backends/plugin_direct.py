@@ -14,6 +14,7 @@ Library ops          → FileBackend
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -249,18 +250,27 @@ class PluginDirectBackend(BackendProtocol):
             raise
 
     def get_text_variables(self, project_path: Any) -> dict[str, Any]:
-        return {
-            "status": "unavailable",
-            "reason": "text variables not yet supported via plugin bridge",
-        }
+        try:
+            pro = json.loads(Path(project_path).read_text(encoding="utf-8"))
+            return {"status": "success", "variables": pro.get("text_variables", {})}
+        except FileNotFoundError:
+            return {"status": "error", "message": f"Project file not found: {project_path}"}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
 
     def set_text_variables(
         self, project_path: Any, variables: dict[str, str]
     ) -> dict[str, Any]:
-        return {
-            "status": "unavailable",
-            "reason": "text variables not yet supported via plugin bridge",
-        }
+        try:
+            p = Path(project_path)
+            pro = json.loads(p.read_text(encoding="utf-8"))
+            pro["text_variables"] = variables
+            p.write_text(json.dumps(pro, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            return {"status": "success", "variables": variables, "count": len(variables)}
+        except FileNotFoundError:
+            return {"status": "error", "message": f"Project file not found: {project_path}"}
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
 
     # ------------------------------------------------------------------
     # Capability / status

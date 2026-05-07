@@ -7,7 +7,7 @@ single file write regardless of input size.
 
 from __future__ import annotations
 
-import textwrap
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -155,6 +155,41 @@ def sch_with_existing_pwr(tmp_path: Path) -> Path:
     return _make_schematic(
         tmp_path, POWER_VCC_LIB_SYMBOL, instances=EXISTING_PWR007_INSTANCE,
     )
+
+
+def _resistor_instance(ref: str, x: float, y: float, value: str = "10k") -> str:
+    """Build a placed Test:R instance with property labels at the canonical
+    offsets used by FileSchematicOps.add_component (label y = symbol y ± 2)."""
+    sym_uuid = f"{hash(ref) & 0xFFFFFFFF:08x}-1234-5678-9abc-{hash(ref) & 0xFFFFFFFFFFFF:012x}"
+    return (
+        f'  (symbol (lib_id "Test:R") (at {x} {y} 0) (unit 1)\n'
+        f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
+        f'    (uuid "{sym_uuid}")\n'
+        f'    (property "Reference" "{ref}" (at {x} {y - 2} 0)\n'
+        f'      (effects (font (size 1.27 1.27)))\n'
+        f'    )\n'
+        f'    (property "Value" "{value}" (at {x} {y + 2} 0)\n'
+        f'      (effects (font (size 1.27 1.27)))\n'
+        f'    )\n'
+        f'    (instances\n'
+        f'      (project ""\n'
+        f'        (path "/11111111-1111-1111-1111-111111111111"\n'
+        f'          (reference "{ref}") (unit 1)\n'
+        f'        )\n'
+        f'      )\n'
+        f'    )\n'
+        f'  )\n'
+    )
+
+
+@pytest.fixture
+def sch_with_three_resistors(tmp_path: Path) -> Path:
+    instances = (
+        _resistor_instance("R1", 100.0, 50.0, "10k")
+        + _resistor_instance("R2", 110.0, 50.0, "5k")
+        + _resistor_instance("R3", 120.0, 50.0, "1k")
+    )
+    return _make_schematic(tmp_path, TEST_R_LIB_SYMBOL, instances=instances)
 
 
 @pytest.fixture
@@ -385,3 +420,162 @@ def test_connect_pins_writes_in_one_pass(sch_with_r1: Path):
     # Architectural contract: one read, one write, regardless of pin count.
     assert counts["reads"] == 1
     assert counts["writes"] == 1
+
+
+# ---------------------------------------------------------------------------
+# add_no_connects_bulk
+# ---------------------------------------------------------------------------
+
+def test_add_no_connects_bulk_writes_in_one_pass(sch_with_device_r: Path):
+    ops = FileSchematicOps()
+    points = [{"x": 100.0 + i * 5, "y": 50.0} for i in range(4)]
+
+    read_p, write_p, counts = _count_io_on(sch_with_device_r)
+    with read_p, write_p:
+        result = ops.add_no_connects_bulk(sch_with_device_r, points)
+
+    assert counts["reads"] == 1
+    assert counts["writes"] == 1
+    assert len(result["placed"]) == 4
+    assert result["failed"] == []
+
+    content = sch_with_device_r.read_text(encoding="utf-8")
+    assert content.count("(no_connect (at ") == 4
+
+
+def test_add_no_connects_bulk_partial_success(sch_with_device_r: Path):
+    ops = FileSchematicOps()
+    points = [
+        {"x": 100.0, "y": 50.0},
+        {"x": "not_a_number", "y": 50.0},  # invalid
+        {"x": 110.0, "y": 50.0},
+    ]
+    result = ops.add_no_connects_bulk(sch_with_device_r, points)
+
+    assert len(result["placed"]) == 2
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["index"] == 1
+
+
+def test_add_no_connects_bulk_empty_list(sch_with_device_r: Path):
+    ops = FileSchematicOps()
+    read_p, write_p, counts = _count_io_on(sch_with_device_r)
+    with read_p, write_p:
+        result = ops.add_no_connects_bulk(sch_with_device_r, [])
+
+    assert counts["reads"] == 1
+    assert counts["writes"] == 0
+    assert result == {"placed": [], "failed": []}
+
+
+# ---------------------------------------------------------------------------
+# move_components_bulk
+# ---------------------------------------------------------------------------
+
+def test_move_components_bulk_repositions_each(sch_with_three_resistors: Path):
+    ops = FileSchematicOps()
+    moves = [
+        {"reference": "R1", "x": 200.0, "y": 100.0},
+        {"reference": "R2", "x": 210.0, "y": 100.0, "rotation": 90.0},
+        {"reference": "R3", "x": 220.0, "y": 100.0},
+    ]
+    result = ops.move_components_bulk(sch_with_three_resistors, moves)
+
+    assert result["failed"] == []
+    assert len(result["moved"]) == 3
+    by_ref = {m["reference"]: m for m in result["moved"]}
+    assert by_ref["R1"]["position"] == {"x": 200.0, "y": 100.0}
+    assert by_ref["R2"]["rotation"] == 90.0
+
+    content = sch_with_three_resistors.read_text(encoding="utf-8")
+    # R1 symbol-level (at ...) reflects the new position.
+    assert "(at 200.0 100.0 0" in content
+    assert "(at 210.0 100.0 90.0" in content
+    assert "(at 220.0 100.0 0" in content
+
+
+def test_move_components_bulk_writes_in_one_pass(sch_with_three_resistors: Path):
+    ops = FileSchematicOps()
+    moves = [
+        {"reference": "R1", "x": 200.0, "y": 100.0},
+        {"reference": "R2", "x": 210.0, "y": 100.0},
+        {"reference": "R3", "x": 220.0, "y": 100.0},
+    ]
+    read_p, write_p, counts = _count_io_on(sch_with_three_resistors)
+    with read_p, write_p:
+        ops.move_components_bulk(sch_with_three_resistors, moves)
+
+    assert counts["reads"] == 1
+    assert counts["writes"] == 1
+
+
+def test_move_components_bulk_partial_success(sch_with_three_resistors: Path):
+    ops = FileSchematicOps()
+    moves = [
+        {"reference": "R1", "x": 200.0, "y": 100.0},
+        {"reference": "X9", "x": 210.0, "y": 100.0},  # not in schematic
+        {"reference": "R3", "x": 220.0, "y": 100.0},
+    ]
+    result = ops.move_components_bulk(sch_with_three_resistors, moves)
+
+    moved_refs = {m["reference"] for m in result["moved"]}
+    assert moved_refs == {"R1", "R3"}
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["reference"] == "X9"
+
+
+def test_move_components_bulk_all_fail_skips_write(sch_with_three_resistors: Path):
+    """If every move fails (e.g. all references missing), no file write happens."""
+    ops = FileSchematicOps()
+    moves = [
+        {"reference": "X1", "x": 200.0, "y": 100.0},
+        {"reference": "X2", "x": 210.0, "y": 100.0},
+        {"reference": "X3", "x": 220.0, "y": 100.0},
+    ]
+    read_p, write_p, counts = _count_io_on(sch_with_three_resistors)
+    with read_p, write_p:
+        result = ops.move_components_bulk(sch_with_three_resistors, moves)
+
+    assert counts["reads"] == 1
+    assert counts["writes"] == 0
+    assert result["moved"] == []
+    assert len(result["failed"]) == 3
+
+
+def test_move_components_bulk_failure_reason_includes_reference(sch_with_three_resistors: Path):
+    """The per-item reason must be self-contained — include the reference name."""
+    ops = FileSchematicOps()
+    result = ops.move_components_bulk(
+        sch_with_three_resistors,
+        [{"reference": "X9", "x": 10.0, "y": 10.0}],
+    )
+    assert len(result["failed"]) == 1
+    entry = result["failed"][0]
+    assert entry["reference"] == "X9"
+    # The reason string mentions X9, not just a generic "symbol not found".
+    assert "X9" in entry["reason"]
+
+
+def test_move_components_bulk_preserves_property_layout(sch_with_three_resistors: Path):
+    """Property labels must shift by the same delta as the symbol body."""
+    ops = FileSchematicOps()
+    # R1 was at (100, 50). Move to (200, 100) → delta (100, 50).
+    # Original property labels were at (100, 48) and (100, 52);
+    # they should now be at (200, 98) and (200, 102).
+    ops.move_components_bulk(
+        sch_with_three_resistors,
+        [{"reference": "R1", "x": 200.0, "y": 100.0}],
+    )
+
+    content = sch_with_three_resistors.read_text(encoding="utf-8")
+    # Locate R1's symbol block to scope assertions away from R2/R3.
+    r1_match = re.search(
+        r'\(symbol\s+\(lib_id\s+"Test:R"\)\s+\(at\s+200\.0\s+100\.0[^)]*\).*?Reference"\s+"R1".*?Value"\s+"10k".*?\n  \)\n',
+        content, re.DOTALL,
+    )
+    assert r1_match is not None, "R1 block not found at new position"
+    r1_block = r1_match.group(0)
+    # Reference label was 2 above the symbol → still 2 above.
+    assert "(at 200.0 98.0 0)" in r1_block
+    # Value label was 2 below → still 2 below.
+    assert "(at 200.0 102.0 0)" in r1_block

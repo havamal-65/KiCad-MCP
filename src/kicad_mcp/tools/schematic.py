@@ -1,4 +1,4 @@
-"""Schematic tools - 20 tools."""
+"""Schematic tools - 22 tools."""
 
 from __future__ import annotations
 
@@ -545,6 +545,95 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             "connect_pins",
             {"path": path, "net": net, "count": len(pins), "pins": pins[:10],
              "stub_length": stub_length},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_no_connects(path: str, points: list[dict]) -> str:
+        """Mark multiple unused pins with no-connect (X) markers in one call.
+
+        Each entry: {"x": float, "y": float}. Place each marker exactly on
+        the pin endpoint coordinate (use get_symbol_pin_positions to look
+        up coords). Replaces N × add_no_connect calls with 1 — single
+        file read/write regardless of marker count.
+
+        Returns:
+            JSON {"status": "success", "placed": [...], "failed": [...]}.
+            placed entries: {position: {x, y}, uuid}.
+            failed entries: {index, reason}.
+            Per-item failures don't abort the batch.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.add_no_connects_bulk(p, points)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Bulk no-connect placement not supported by current backend.",
+            })
+
+        points_summary = [
+            {"x": pt.get("x"), "y": pt.get("y")}
+            for pt in points if isinstance(pt, dict)
+        ][:10]
+        change_log.record(
+            "add_no_connects",
+            {"path": path, "count": len(points), "points": points_summary},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def move_components(path: str, moves: list[dict]) -> str:
+        """Move multiple schematic components in one call.
+
+        Each entry: {"reference": str, "x": float, "y": float,
+                     "rotation": float | None (optional)}.
+        Property labels (Reference, Value, Footprint, etc.) shift by the
+        same delta so they stay aligned with the symbol body.
+
+        Reads/writes the .kicad_sch file once regardless of move count.
+        Use this instead of looping move_schematic_component when applying
+        a placement plan with multiple repositions.
+
+        Note: moving a component does NOT update wires/labels at the old
+        pin positions. After repositioning, re-run connect_pins or
+        manually patch wires that were tied to the old coords.
+
+        Returns:
+            JSON {"status": "success", "moved": [...], "failed": [...]}.
+            moved entries: {reference, position: {x, y}, rotation}.
+            failed entries: {index, reference, reason}.
+            Per-component failures don't abort the batch.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        for m in moves:
+            ref = m.get("reference") if isinstance(m, dict) else None
+            if isinstance(ref, str) and ref:
+                validate_reference(ref)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.move_components_bulk(p, moves)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Bulk component move not supported by current backend.",
+            })
+
+        refs_summary = [
+            m.get("reference", "") for m in moves if isinstance(m, dict)
+        ][:10]
+        change_log.record(
+            "move_components",
+            {"path": path, "count": len(moves), "references": refs_summary},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )

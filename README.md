@@ -10,7 +10,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 - **94 MCP Tools** across 9 categories:
   - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference, plan capture and retrieval, **startup gate checklist**
-  - 📐 **Schematic Operations** (24 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, bulk component / power-symbol / pin-net operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
+  - 📐 **Schematic Operations** (26 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
   - 🔌 **PCB Board Operations** (15 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with utilization reporting), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
@@ -272,7 +272,7 @@ python -m kicad_mcp_plugin
 - `read_project_plan`: Read back the saved project plan for a given project directory
 - `get_startup_checklist`: Run a six-item PASS/FAIL gate before any board operation: KiCad running · bridge reachable · bridge version · PCB editor open · kicad-cli on PATH · active project loaded. Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
 
-### Schematic Operations (24 tools)
+### Schematic Operations (26 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
 - `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
 - `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
@@ -280,6 +280,7 @@ python -m kicad_mcp_plugin
 - `add_wire`: Draw wire connections between two points
 - `add_label`: Add net labels (net, global, hierarchical)
 - `add_no_connect`: Add no-connect (X) markers to unused pins
+- `add_no_connects`: **Bulk** — mark N unused pins in one call.
 - `add_power_symbol`: Add power symbols (+3V3, GND, VCC, etc.) with auto-incrementing references
 - `add_power_symbols`: **Bulk** — place N power symbols in one call; #PWR refs auto-incremented across the batch.
 - `connect_pins`: **Bulk** — net N pins together with one call by emitting stub-and-label connectivity. Replaces the `add_wire + add_label` × N pattern (~6 calls per net) with one call.
@@ -288,6 +289,7 @@ python -m kicad_mcp_plugin
 - `remove_wire`: Remove a wire segment by its endpoint coordinates
 - `remove_no_connect`: Remove a no-connect marker by its position
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
+- `move_components`: **Bulk** — reposition N components in one call (single file read/write).
 - `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
 - `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol; resolves `extends` chains so symbols like ATtiny85-20S and AMS1117-3.3 work correctly
 - `get_pin_net`: Get the net name connected to a specific pin of a symbol

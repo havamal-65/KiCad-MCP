@@ -289,6 +289,28 @@ class SchematicOps(ABC):
         """
         raise NotImplementedError("This backend does not support connect_pins_bulk")
 
+    def add_no_connects_bulk(
+        self, path: Path, points: list[dict],
+    ) -> dict[str, Any]:
+        """Add multiple no-connect markers in a single read/write cycle.
+
+        points: list of {"x": float, "y": float}.
+        Returns {"placed": [...], "failed": [...]}.
+        """
+        raise NotImplementedError("This backend does not support add_no_connects_bulk")
+
+    def move_components_bulk(
+        self, path: Path, moves: list[dict],
+    ) -> dict[str, Any]:
+        """Move multiple symbols in a single read/write cycle.
+
+        moves: list of {"reference": str, "x": float, "y": float,
+                        "rotation": float | None (optional)}.
+        Returns {"moved": [...], "failed": [...]}. Property labels shift
+        with the symbol body (same as the per-item move).
+        """
+        raise NotImplementedError("This backend does not support move_components_bulk")
+
 
 class ExportOps(ABC):
     """Abstract interface for export operations."""

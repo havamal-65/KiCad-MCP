@@ -1,4 +1,4 @@
-"""Schematic tools - 17 tools."""
+"""Schematic tools - 20 tools."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
-from kicad_mcp.utils.validation import validate_kicad_path, validate_reference, validate_writable_path
+from kicad_mcp.utils.validation import (
+    validate_kicad_path,
+    validate_net_name,
+    validate_reference,
+    validate_writable_path,
+)
 
 logger = get_logger("tools.schematic")
 
@@ -394,6 +399,152 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         change_log.record(
             "add_power_symbol",
             {"path": path, "name": name, "x": x, "y": y, "rotation": rotation},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_components(path: str, components: list[dict]) -> str:
+        """Add multiple component symbols in a single call. Prefer over looping add_component.
+
+        Each list entry is a dict with the same fields as add_component:
+            lib_id (required, e.g. 'Device:R')
+            reference (required, e.g. 'R1')
+            value (e.g. '10k')
+            x, y (mm, required)
+            rotation (degrees, default 0.0)
+            mirror ('x' or 'y', optional)
+            footprint (e.g. 'Resistor_SMD:R_0402_1005Metric', optional)
+            properties (dict[str, str], optional)
+
+        Reads the schematic file once, caches every unique lib_id once, builds
+        all symbol blocks in memory, and writes once — collapsing N round-trips
+        and N file reads into 1.
+
+        Per-item failures (missing fields, unresolvable lib_id) do NOT abort the
+        batch — successful entries still get placed.
+
+        Returns:
+            JSON {"status": "success", "placed": [...], "failed": [...]}.
+            placed entries: {reference, lib_id, uuid, position}.
+            failed entries: {index, reference, reason}.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        for c in components:
+            ref = c.get("reference") if isinstance(c, dict) else None
+            if isinstance(ref, str) and ref:
+                validate_reference(ref)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.add_components_bulk(p, components)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Bulk component placement not supported by current backend.",
+            })
+
+        refs_summary = [
+            c.get("reference", "") for c in components if isinstance(c, dict)
+        ][:10]
+        change_log.record(
+            "add_components",
+            {"path": path, "count": len(components), "references": refs_summary},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def add_power_symbols(path: str, symbols: list[dict]) -> str:
+        """Add multiple power symbols in a single call. Prefer over looping add_power_symbol.
+
+        Each list entry is a dict with:
+            name (required, e.g. 'VCC', '+3V3', 'GND')
+            x, y (mm, required)
+            rotation (degrees, default 0.0)
+
+        Reads the schematic once, caches each unique 'power:<name>' lib symbol
+        once, scans existing #PWR refs once to determine the next number, and
+        writes once. References are auto-incremented sequentially across the
+        batch (resuming from the current max in the file).
+
+        Returns:
+            JSON {"status": "success", "placed": [...], "failed": [...]}.
+            placed entries: {name, reference (#PWRxxx), lib_id, uuid, position}.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.add_power_symbols_bulk(p, symbols)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Bulk power symbol placement not supported by current backend.",
+            })
+
+        names_summary = [
+            s.get("name", "") for s in symbols if isinstance(s, dict)
+        ][:10]
+        change_log.record(
+            "add_power_symbols",
+            {"path": path, "count": len(symbols), "names": names_summary},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def connect_pins(
+        path: str, pins: list[str], net: str, stub_length: float = 2.54,
+    ) -> str:
+        """Connect multiple pins to one named net in a single call.
+
+        For each pin in `pins` (format: 'REFERENCE.PIN_NUMBER', e.g. 'U1.5'),
+        places a short stub wire ending in a net label. All pins receive the
+        same net name and are therefore electrically connected. Replaces the
+        per-pin add_wire + add_label pattern (~6 calls per net) with one call.
+
+        Args:
+            path: Path to .kicad_sch file.
+            pins: List of 'REFERENCE.PIN' strings, e.g. ['U1.5', 'R3.2', 'C1.1'].
+                  Pin numbers only in v1 (pin names not yet supported).
+            net: Net name applied to all pins (validated against KiCad grammar).
+            stub_length: Stub wire length in mm. Default 2.54 (one grid unit).
+                         Set to 0 to place the label directly at the pin
+                         (no stub wire). 0 is always electrically valid and
+                         avoids the cardinal-snap heuristic for unusual layouts.
+
+        The schematic must NOT be open in eeschema while this runs — eeschema
+        does not auto-reload after file writes, and you'll see stale content.
+
+        Returns:
+            JSON {"status": "success", "connected": [...], "failed": [...]}.
+            connected entries: {pin, reference, pin_number, x, y,
+                                label_uuid, wire_uuid (null if stub_length=0)}.
+            failed entries: {pin, reason}.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_net_name(net)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.connect_pins_bulk(p, pins, net, stub_length=stub_length)
+        except NotImplementedError:
+            return json.dumps({
+                "status": "error",
+                "message": "Bulk pin connection not supported by current backend.",
+            })
+
+        change_log.record(
+            "connect_pins",
+            {"path": path, "net": net, "count": len(pins), "pins": pins[:10],
+             "stub_length": stub_length},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )

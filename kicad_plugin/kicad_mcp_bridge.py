@@ -691,6 +691,49 @@ def _handle_save_board(path: str) -> dict[str, Any]:
     return _run_on_main_thread(_do)
 
 
+def _handle_clear_routes(path: str, backup: bool = True) -> dict[str, Any]:
+    """Remove all tracks and vias from the live in-memory board, then save+refresh.
+
+    Mutates the same BOARD object pcbnew has open, so file and cache stay in
+    sync. Eliminates the desync that occurred when clear_routes wrote to disk
+    while the bridge kept its own track list.
+    """
+    def _do():
+        import pcbnew
+        import shutil
+        board = _get_open_board(path)
+        filename = board.GetFileName()
+
+        backup_path = None
+        if backup and filename:
+            # Save current state to disk first so the backup matches the
+            # pre-clear in-memory state, then copy.
+            board.Save(filename)
+            backup_file = filename[:-len(".kicad_pcb")] + ".clear_routes_backup.kicad_pcb" \
+                if filename.endswith(".kicad_pcb") else filename + ".clear_routes_backup"
+            shutil.copy2(filename, backup_file)
+            backup_path = backup_file
+
+        tracks_removed = 0
+        vias_removed = 0
+        # Snapshot to a list — board.Remove() during iteration is unsafe
+        for item in list(board.GetTracks()):
+            if isinstance(item, pcbnew.PCB_VIA):
+                vias_removed += 1
+            else:
+                tracks_removed += 1
+            board.Remove(item)
+
+        _save_and_refresh(board)
+        return {
+            "status": "success",
+            "tracks_removed": tracks_removed,
+            "vias_removed": vias_removed,
+            "backup_path": backup_path,
+        }
+    return _run_on_main_thread(_do)
+
+
 def _handle_export_dsn(path: str, dsn_path: str) -> dict[str, Any]:
     """Export the live in-memory board to a Specctra DSN file.
 
@@ -795,6 +838,9 @@ _DISPATCH = {
     ),
     "refill_zones":       lambda req: _handle_refill_zones(req["path"]),
     "save_board":         lambda req: _handle_save_board(req["path"]),
+    "clear_routes":       lambda req: _handle_clear_routes(
+        req["path"], req.get("backup", True),
+    ),
     "reload_board":       lambda req: _handle_reload_board(req["path"]),
     "add_board_outline":  lambda req: _handle_add_board_outline(
         req["path"], req["x"], req["y"], req["width"], req["height"],

@@ -1,6 +1,6 @@
 # KiCad MCP — Development Roadmap
 
-*Last updated: 2026-05-02 (Phase 3 audit — 3.2–3.4 and all of Phase 4 confirmed pre-existing)*
+*Last updated: 2026-05-07 (clear_routes reworked to dispatch through the bridge — 2.5 and 3.4)*
 
 ---
 
@@ -74,7 +74,9 @@ File-based checks that catch common issues before sync: missing footprints, dupl
 Parses all `(footprint ...)` blocks from the .kicad_pcb file, applies `(at x y rotation)` transforms, and runs O(n²) AABB intersection across all courtyard rectangles. Reports each pair with `overlap_x_mm`, `overlap_y_mm`, and a `suggested_move_mm` to resolve the conflict.
 
 ### 2.5 `clear_routes` — non-destructive rip-up
-Strips all `(segment ...)` and `(via ...)` blocks from the .kicad_pcb file while preserving footprint placement, nets, and the board outline. Writes a `.clear_routes_backup.kicad_pcb` before modifying. When the plugin bridge is active, reloads the board in KiCad automatically.
+Removes all tracks and vias while preserving footprint placement, nets, and the board outline. Writes a `.clear_routes_backup.kicad_pcb` before modifying.
+
+Initial implementation (2026-04-12) was file-only and called `reload_board` to refresh the bridge's view. Reworked 2026-05-07 to dispatch through the bridge when active: `_handle_clear_routes` snapshots `board.GetTracks()`, calls `board.Remove()` per item, then `_save_and_refresh()` so file and in-memory cache mutate together. Falls back to the original file-walking path when the bridge is unreachable. Eliminates the "track count compounds across iterations" desync that occurred when the bridge cache fell out of sync with disk after a file-only clear.
 
 ### 2.6 Tool and pipeline enhancements
 - **`suggest_footprints`**: each suggestion now includes `width_mm`, `height_mm`, `area_mm2` from the courtyard bounds.
@@ -120,7 +122,9 @@ Roadmap entry was stale — implementation was already in place before this spri
 ---
 
 ### 3.4 `PluginDirectBackend` — `reload_board` is a no-op after `import_ses`
-**Status**: Done (pre-existing). `_handle_reload_board` in `kicad_mcp_bridge.py:734` already calls `board.Load(filename)` with a fallback to `wx.CallAfter(pcbnew.Refresh)` if `Load` fails. Roadmap entry was stale — implementation was already in place before this sprint.
+**Status**: Partially done. `_handle_reload_board` in `kicad_mcp_bridge.py:734` calls `board.Load(filename)` with a fallback to `wx.CallAfter(pcbnew.Refresh)` if `Load` fails.
+
+Caveat (discovered 2026-05-06): on KiCad 9 the `board.Load(filename)` call raises in the bridge's embedded Python and the handler silently falls through to the GUI-only `Refresh()`, which does not rebuild pcbnew's in-memory track cache. After `import_ses` this is harmless because the bridge handler already mutated the in-memory board directly (`pcbnew.ImportSpecctraSES(board, ...)` then `_save_and_refresh`), so the post-import `reload_board` call is effectively redundant. The same fallback was the source of the `clear_routes` desync — fixed for that path in 2.5 (2026-05-07) by routing the operation through the bridge handler instead of relying on reload. Generic post-disk-write reload remains an open issue for any future code path that relies on it; the working convention is "always mutate the live board, never write-then-reload."
 
 ---
 
@@ -233,7 +237,7 @@ and `--dry-run`. Works on Windows, macOS, and Linux.
 | `mypy` type coverage incomplete | `src/` (all modules) | Medium — CI runs informational only (`continue-on-error: true`); enforce strict mode as a future phase |
 | ~~`definitions.py` type annotation `backend: CompositeBackend`~~ | ~~`src/kicad_mcp/resources/definitions.py:16`~~ | **FIXED** 2026-05-02 (3.6) |
 | ~~`kicad_mcp.__main__` legacy entry point~~ | ~~`src/kicad_mcp/__main__.py`~~ | **FIXED** 2026-05-02 |
-| ~~`reload_board` uses `Refresh()` not `LoadBoard`~~ | ~~`kicad_mcp_bridge.py`~~ | **FIXED** (pre-existing) |
+| `reload_board` falls through to `Refresh()` on KiCad 9 — does not rebuild track cache | `kicad_mcp_bridge.py:_handle_reload_board` | Low — only callers (`import_ses`, ex-`clear_routes`) already mutate the live board, so the reload is redundant. Documented in 3.4 above. |
 | ~~`auto_place` uses file-based bounds (not pcbnew native)~~ | ~~`tools/board.py`, `file_backend.py`~~ | **FIXED** (pre-existing) |
 | ~~Linux pcbnew path detection incomplete~~ | ~~`backends/subprocess_backend.py`~~ | **MOOT** — file deleted in 3.6 |
 | ~~Bridge wx bare-name bug + SetDrill rename~~ | ~~`kicad_mcp_bridge.py`~~ | **FIXED** 2026-05-01 |

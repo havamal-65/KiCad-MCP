@@ -204,6 +204,9 @@ class PluginBoardOps(BoardOps):
     def save_board(self, path: Path) -> dict[str, Any]:
         return self._call("save_board", path)
 
+    def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
+        return self._call("clear_routes", path, backup=backup)
+
     def reload_board(self, path: Path) -> dict[str, Any]:
         return self._call("reload_board", path)
 

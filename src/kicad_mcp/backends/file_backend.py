@@ -2379,6 +2379,140 @@ class FileSchematicOps(SchematicOps):
 
         return {"connected": connected, "failed": failed, "net": net}
 
+    def add_no_connects_bulk(
+        self, path: Path, points: list[dict],
+    ) -> dict[str, Any]:
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+
+        placed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        blocks: list[str] = []
+
+        for i, pt in enumerate(points):
+            try:
+                if not isinstance(pt, dict):
+                    raise TypeError("entry must be a dict with x,y")
+                x = float(pt["x"])
+                y = float(pt["y"])
+                nc_uuid = str(_uuid.uuid4())
+                blocks.append(
+                    f'  (no_connect (at {x} {y}) (uuid "{nc_uuid}"))\n'
+                )
+                placed.append({
+                    "position": {"x": x, "y": y},
+                    "uuid": nc_uuid,
+                })
+            except Exception as exc:
+                failed.append({"index": i, "reason": str(exc)})
+
+        if blocks:
+            insert_pos = self._find_insertion_point(content)
+            content = content[:insert_pos] + "".join(blocks) + content[insert_pos:]
+            path.write_text(content, encoding="utf-8")
+
+        return {"placed": placed, "failed": failed}
+
+    def move_components_bulk(
+        self, path: Path, moves: list[dict],
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+
+        moved: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        any_change = False
+
+        for i, m in enumerate(moves):
+            ref = m.get("reference", "") if isinstance(m, dict) else ""
+            try:
+                if not isinstance(m, dict):
+                    raise TypeError("entry must be a dict with reference,x,y")
+                if not ref:
+                    raise ValueError("missing reference")
+                x = float(m["x"])
+                y = float(m["y"])
+                rotation = m.get("rotation")
+                if rotation is not None:
+                    rotation = float(rotation)
+
+                location = find_symbol_block_by_reference(content, ref)
+                if location is None:
+                    failed.append({
+                        "index": i, "reference": ref,
+                        "reason": f"symbol '{ref}' not found",
+                    })
+                    continue
+                start, end = location
+                block = content[start:end + 1]
+
+                new_block, _, _, new_rot = self._rewrite_symbol_at(
+                    block, x, y, rotation,
+                )
+                content = content[:start] + new_block + content[end + 1:]
+                any_change = True
+
+                moved.append({
+                    "reference": ref,
+                    "position": {"x": x, "y": y},
+                    "rotation": new_rot,
+                })
+            except Exception as exc:
+                # Make the per-item reason self-contained by attaching the
+                # reference if the underlying message doesn't already.
+                reason = str(exc)
+                if ref and ref not in reason:
+                    reason = f"symbol '{ref}': {reason}"
+                failed.append({"index": i, "reference": ref, "reason": reason})
+
+        if any_change:
+            path.write_text(content, encoding="utf-8")
+
+        return {"moved": moved, "failed": failed}
+
+    @staticmethod
+    def _rewrite_symbol_at(
+        block: str, x: float, y: float, rotation: float | None,
+    ) -> tuple[str, float, float, float]:
+        """Rewrite a (symbol ...) block to a new (x, y, rotation).
+
+        Updates the symbol-level (at ...) clause and shifts every property
+        (at ...) clause by the same delta so labels stay aligned with the
+        body. Pure string transform — no file I/O.
+
+        Returns (new_block, old_x, old_y, new_rot). Raises ValueError if
+        the block has no symbol-level (at ...) clause.
+        """
+        at_match = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)', block)
+        if at_match is None:
+            raise ValueError("symbol block has no (at ...) clause")
+
+        old_x = float(at_match.group(1))
+        old_y = float(at_match.group(2))
+        old_rot = float(at_match.group(3)) if at_match.group(3) else 0.0
+        new_rot = rotation if rotation is not None else old_rot
+
+        dx = x - old_x
+        dy = y - old_y
+
+        new_at = f"(at {x} {y} {new_rot})"
+        new_block = block[:at_match.start()] + new_at + block[at_match.end():]
+
+        # Shift all property (at ...) positions by the same delta.
+        # Process from end to start so earlier match indices stay valid.
+        prop_at_pattern = re.compile(
+            r'(\(property\s+"[^"]*"\s+"[^"]*"\s+)\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)'
+        )
+        matches = list(prop_at_pattern.finditer(new_block))
+        for m in reversed(matches):
+            px = float(m.group(2)) + dx
+            py = float(m.group(3)) + dy
+            p_rot = m.group(4) if m.group(4) else "0"
+            replacement = f"{m.group(1)}(at {px} {py} {p_rot})"
+            new_block = new_block[:m.start()] + replacement + new_block[m.end():]
+
+        return new_block, old_x, old_y, new_rot
+
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
@@ -2390,36 +2524,10 @@ class FileSchematicOps(SchematicOps):
         start, end = location
         block = content[start:end + 1]
 
-        # Parse the symbol-level (at old_x old_y old_rot) — first occurrence
-        at_match = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)', block)
-        if at_match is None:
-            raise ValueError(f"Symbol '{reference}' has no (at ...) clause")
-
-        old_x = float(at_match.group(1))
-        old_y = float(at_match.group(2))
-        old_rot = float(at_match.group(3)) if at_match.group(3) else 0.0
-        new_rot = rotation if rotation is not None else old_rot
-
-        dx = x - old_x
-        dy = y - old_y
-
-        # Replace the symbol-level (at ...) with new values
-        new_at = f"(at {x} {y} {new_rot})"
-        new_block = block[:at_match.start()] + new_at + block[at_match.end():]
-
-        # Shift all property (at ...) positions by the same delta.
-        # Properties look like: (property "Name" "Value" (at px py angle) ...)
-        # We need to update each one. Process from end to start to preserve indices.
-        prop_at_pattern = re.compile(
-            r'(\(property\s+"[^"]*"\s+"[^"]*"\s+)\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)'
-        )
-        matches = list(prop_at_pattern.finditer(new_block))
-        for m in reversed(matches):
-            px = float(m.group(2)) + dx
-            py = float(m.group(3)) + dy
-            p_rot = m.group(4) if m.group(4) else "0"
-            replacement = f"{m.group(1)}(at {px} {py} {p_rot})"
-            new_block = new_block[:m.start()] + replacement + new_block[m.end():]
+        try:
+            new_block, _, _, new_rot = self._rewrite_symbol_at(block, x, y, rotation)
+        except ValueError as exc:
+            raise ValueError(f"Symbol '{reference}' has no (at ...) clause") from exc
 
         content = content[:start] + new_block + content[end + 1:]
         path.write_text(content, encoding="utf-8")

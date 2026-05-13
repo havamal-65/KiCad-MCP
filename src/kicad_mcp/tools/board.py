@@ -140,6 +140,75 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def place_at_edge(
+        path: str,
+        reference: str,
+        edge: str,
+        offset_mm: float = 2.0,
+    ) -> str:
+        """Anchor an edge-facing connector at the named board edge, facing outward.
+
+        Reads the connector's local-frame mating face (via the same detection
+        the placement-quality gate uses), computes the rotation that makes
+        that face point outward at the requested edge, and positions the
+        footprint so its courtyard sits offset_mm inside the Edge.Cuts
+        outline. The footprint is centered along the edge by default.
+
+        Use this in /build-pcb Phase 4b to anchor connectors before
+        auto_place runs. The footprints anchored here should be passed to
+        auto_place via its anchors parameter so bulk placement doesn't
+        disturb them.
+
+        Args:
+            path: Path to .kicad_pcb file.
+            reference: Reference designator of the connector to place (e.g. J1).
+            edge: One of "north", "south", "east", "west".
+            offset_mm: Clearance from courtyard to Edge.Cuts (default 2.0).
+
+        Returns:
+            JSON with target position {x, y, rotation} and the mating-face
+            evidence used to compute it. The footprint has been moved in place.
+        """
+        from kicad_mcp.tools.drc import compute_edge_placement
+
+        p = validate_kicad_path(path, ".kicad_pcb")
+        validate_reference(reference)
+
+        plan = compute_edge_placement(p, reference, edge, offset_mm)
+        if plan["status"] != "success":
+            return json.dumps(plan)
+
+        backup = create_backup(p)
+        ops = backend.get_board_modify_ops()
+        result = ops.move_component(
+            p, reference, plan["target_x"], plan["target_y"], plan["target_rotation"]
+        )
+        change_log.record(
+            "place_at_edge",
+            {
+                "path": path,
+                "reference": reference,
+                "edge": edge,
+                "x": plan["target_x"],
+                "y": plan["target_y"],
+                "rotation": plan["target_rotation"],
+            },
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({
+            "status": "success",
+            "reference": reference,
+            "edge": edge,
+            "target_x": round(plan["target_x"], 4),
+            "target_y": round(plan["target_y"], 4),
+            "target_rotation": plan["target_rotation"],
+            "local_mating_face": plan["local_mating_face"],
+            "evidence": plan["evidence"],
+            **result,
+        }, indent=2)
+
+    @mcp.tool()
     def add_track(
         path: str,
         start_x: float,
@@ -400,6 +469,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         board_width: float = 100.0,
         board_height: float = 80.0,
         clearance_mm: float = 1.5,
+        anchors: list[str] | None = None,
     ) -> str:
         """Automatically place all board components using geometry-driven bin-packing.
 
@@ -411,6 +481,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         This replaces trial-and-error manual placement and eliminates courtyard
         overlap violations.
 
+        Use the anchors parameter to keep specific refs in place — typically
+        connectors that place_at_edge has already anchored at the board edge.
+        Anchored refs are skipped during bulk placement but their courtyards
+        are not considered as obstacles (a known simplification — pass them
+        a generous clearance_mm if bulk placement crowds the edges).
+
         Args:
             path: Path to .kicad_pcb file.
             board_x: Left edge of the placement area in mm (default 3.0).
@@ -418,6 +494,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             board_width: Width of the placement area in mm (default 100.0).
             board_height: Height of the placement area in mm (default 80.0).
             clearance_mm: Minimum courtyard-to-courtyard gap in mm (default 0.5).
+            anchors: Optional list of refs whose positions must not be modified
+                (e.g. ["J1", "J2", "J3"] for connectors placed by place_at_edge).
 
         Returns:
             JSON with components_placed, rows, total_area_mm2, and any warnings.
@@ -434,7 +512,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             }, indent=2)
 
         backup = create_backup(p)
-        result = board_ops.auto_place(p, board_x, board_y, board_width, board_height, clearance_mm)
+        result = board_ops.auto_place(
+            p, board_x, board_y, board_width, board_height, clearance_mm,
+            anchors=anchors,
+        )
 
         for placement in result.get("placements", []):
             change_log.record(
@@ -768,6 +849,42 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 )
         except Exception as exc:
             return _fail("courtyard_overlaps", str(exc))
+
+        # ── Step 4c: connector orientation gate (Phase 6.1.4) ────────────────
+        # autoroute will refuse to start if this validation hasn't passed for
+        # the current board state. Run it now so the pipeline either passes
+        # cleanly or fails here with actionable remediation.
+        try:
+            from kicad_mcp.tools.drc import run_validate_connector_orientations
+            orient_result = run_validate_connector_orientations(pcb_p)
+            pipeline_steps.append({
+                "step": "connector_orientations",
+                "status": "success",
+                "passed": orient_result["passed"],
+                "checked": orient_result["checked"],
+                "violation_count": len(orient_result["violations"]),
+                "violations": orient_result["violations"],
+                "indeterminate": orient_result["indeterminate"],
+            })
+            if not orient_result["passed"]:
+                v_brief = [
+                    {
+                        "ref": v.get("ref"),
+                        "suggested_edge": v.get("suggested_edge"),
+                        "suggested_rotation": v.get("suggested_rotation"),
+                    }
+                    for v in orient_result["violations"]
+                    if "ref" in v
+                ][:5]
+                return _fail(
+                    "connector_orientations",
+                    f"{len(orient_result['violations'])} connector(s) face inward. "
+                    "Call place_at_edge(path, ref, suggested_edge) for each, "
+                    "then retry pcb_pipeline. "
+                    f"First violations: {v_brief}",
+                )
+        except Exception as exc:
+            return _fail("connector_orientations", str(exc))
 
         # ── Step 5: autoroute ────────────────────────────────────────────────
         # DSN/SES route via BOARD_ROUTE capability (plugin bridge if active,

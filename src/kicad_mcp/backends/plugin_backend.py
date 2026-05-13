@@ -220,11 +220,13 @@ class PluginBoardOps(BoardOps):
     def auto_place(
         self, path: Path, board_x: float, board_y: float,
         board_width: float, board_height: float, clearance_mm: float = 1.5,
+        anchors: list[str] | None = None,
     ) -> dict[str, Any]:
         return self._call("auto_place", path,
                           board_x=board_x, board_y=board_y,
                           board_width=board_width, board_height=board_height,
-                          clearance_mm=clearance_mm)
+                          clearance_mm=clearance_mm,
+                          anchors=anchors or [])
 
     def place_components_bulk(
         self, path: Path, components: list[dict],

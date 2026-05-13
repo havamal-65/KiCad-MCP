@@ -21,6 +21,91 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.schematic")
 
 
+def _inject_footprint_sheet_path(pcb_path: Path, reference: str, sheet_path: str) -> None:
+    """Add a ``(path "<sheet_path>")`` clause to a placed footprint block.
+
+    The clause is inserted right after the footprint's ``(uuid "...")`` line
+    (matching KiCad's native sync output position). Idempotent — if the
+    footprint already has a (path ...) clause, it is overwritten. Phase 6.3.3.
+    """
+    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+
+    content = pcb_path.read_text(encoding="utf-8")
+    located = find_footprint_block_by_reference(content, reference)
+    if located is None:
+        raise ValueError(f"footprint {reference} not found in {pcb_path}")
+    start, end = located
+    block = content[start : end + 1]
+
+    import re as _re
+    if _re.search(r'\(path\s+"[^"]*"\)', block):
+        new_block = _re.sub(
+            r'\(path\s+"[^"]*"\)',
+            f'(path "{sheet_path}")',
+            block,
+            count=1,
+        )
+    else:
+        # Insert after the (uuid "...") line. Match KiCad's tabbed indentation.
+        new_block = _re.sub(
+            r'(\(uuid\s+"[^"]+"\)\n)',
+            rf'\1\t\t(path "{sheet_path}")\n',
+            block,
+            count=1,
+        )
+        if new_block == block:
+            raise ValueError(
+                f"could not find (uuid ...) anchor in footprint {reference}"
+            )
+
+    pcb_path.write_text(content[:start] + new_block + content[end + 1:], encoding="utf-8")
+
+
+def _inject_footprint_property(
+    pcb_path: Path, reference: str, prop_name: str, prop_value: str,
+) -> None:
+    """Add (or update) a ``(property NAME VALUE ...)`` clause on a placed footprint.
+
+    Idempotent — if the property already exists with a different value, it's
+    overwritten. Used by sync to attach PlacementIntent-derived metadata
+    (e.g. ClusterId) onto placed footprints so downstream tools like
+    auto_place can read it. Phase 6.3.2 + 6.3.3.
+    """
+    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+
+    content = pcb_path.read_text(encoding="utf-8")
+    located = find_footprint_block_by_reference(content, reference)
+    if located is None:
+        raise ValueError(f"footprint {reference} not found in {pcb_path}")
+    start, end = located
+    block = content[start : end + 1]
+
+    import re as _re
+    prop_pattern = _re.compile(
+        rf'\(property\s+"{_re.escape(prop_name)}"\s+"[^"]*"[^)]*\)'
+    )
+    if prop_pattern.search(block):
+        new_block = prop_pattern.sub(
+            f'(property "{prop_name}" "{prop_value}")',
+            block,
+            count=1,
+        )
+    else:
+        # Insert after the (uuid "...") line. Match KiCad's tabbed indentation.
+        new_block = _re.sub(
+            r'(\(uuid\s+"[^"]+"\)\n)',
+            rf'\1\t\t(property "{prop_name}" "{prop_value}")\n',
+            block,
+            count=1,
+        )
+        if new_block == block:
+            raise ValueError(
+                f"could not find (uuid ...) anchor in footprint {reference}"
+            )
+
+    pcb_path.write_text(content[:start] + new_block + content[end + 1:], encoding="utf-8")
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register schematic tools on the MCP server."""
 
@@ -1126,6 +1211,81 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                         if place_x > 200.0:
                             place_x = 50.0
                             place_y += place_step
+
+                        # Phase 6.3.3 — propagate the schematic sheet path
+                        # onto the placed footprint so auto_place can cluster
+                        # components by their schematic hierarchy.
+                        sheet_path = sym.get("sheet_path", "")
+                        if sheet_path:
+                            try:
+                                _inject_footprint_sheet_path(pcb_p, ref, sheet_path)
+                            except Exception as inj_exc:
+                                warnings.append({
+                                    "type": "sheet_path_inject_failed",
+                                    "reference": ref,
+                                    "sheet_path": sheet_path,
+                                    "message": str(inj_exc),
+                                })
+
+                        # PlacementIntent (Phase 6.3.2): schematic-driven anchor
+                        # at a named board edge. Requires Edge.Cuts to exist —
+                        # surface as a deferred action otherwise.
+                        intent = (sym.get("properties") or {}).get("PlacementIntent", "")
+                        if intent.startswith("cluster:"):
+                            # Phase 6.3.2 + 6.3.3 — cluster:NAME overrides the
+                            # natural sheet_path clustering. Inject a ClusterId
+                            # property; auto_place reads it as the grouping key.
+                            cluster_name = intent.split(":", 1)[1].strip()
+                            try:
+                                _inject_footprint_property(
+                                    pcb_p, ref, "ClusterId", cluster_name,
+                                )
+                                actions.append({
+                                    "type": "cluster_assigned",
+                                    "reference": ref,
+                                    "cluster": cluster_name,
+                                    "source": "PlacementIntent",
+                                })
+                            except Exception as inj_exc:
+                                warnings.append({
+                                    "type": "cluster_inject_failed",
+                                    "reference": ref,
+                                    "cluster": cluster_name,
+                                    "message": str(inj_exc),
+                                })
+                        if intent.startswith("edge:"):
+                            edge_name = intent.split(":", 1)[1].strip().lower()
+                            from kicad_mcp.tools.drc import compute_edge_placement
+                            plan = compute_edge_placement(pcb_p, ref, edge_name)
+                            if plan["status"] == "success":
+                                try:
+                                    board_modify_ops.move_component(
+                                        pcb_p, ref,
+                                        plan["target_x"], plan["target_y"],
+                                        plan["target_rotation"],
+                                    )
+                                    actions.append({
+                                        "type": "anchored_at_edge",
+                                        "reference": ref,
+                                        "edge": edge_name,
+                                        "rotation": plan["target_rotation"],
+                                        "source": "PlacementIntent",
+                                    })
+                                except Exception as anchor_exc:
+                                    warnings.append({
+                                        "type": "anchor_failed",
+                                        "reference": ref,
+                                        "edge": edge_name,
+                                        "message": str(anchor_exc),
+                                    })
+                            else:
+                                # Deferred — typically no Edge.Cuts outline yet
+                                warnings.append({
+                                    "type": "placement_intent_deferred",
+                                    "reference": ref,
+                                    "intent": intent,
+                                    "message": plan["message"],
+                                })
                     except Exception as exc:
                         warnings.append({
                             "type": "place_failed",

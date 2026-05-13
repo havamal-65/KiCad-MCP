@@ -667,6 +667,42 @@ def register_tools(
         ses = p.parent / "freerouting.ses"
         report: dict = {"status": "success", "steps": []}
 
+        # Step 0: Connector-orientation gate (Phase 6.1.4).
+        # autoroute refuses to start if validate_connector_orientations has not
+        # been run against the current board state, or its most recent result
+        # was a failure. This closes the "routes around inward-facing connector"
+        # bug at the tool level rather than relying on skill discipline.
+        from kicad_mcp.utils.validation_cache import get_validation
+        cached = get_validation(p, "validate_connector_orientations")
+        if cached is None or not cached.get("passed"):
+            report["status"] = "error"
+            if cached is None:
+                report["message"] = (
+                    "autoroute refuses to start: validate_connector_orientations "
+                    "has not been run on the current board state. "
+                    "Call mcp__kicad__validate_connector_orientations(path) first."
+                )
+            else:
+                report["message"] = (
+                    "autoroute refuses to start: validate_connector_orientations "
+                    "reports placement violations. Resolve them with "
+                    "mcp__kicad__place_at_edge(...) for each violating ref, "
+                    "then re-run mcp__kicad__validate_connector_orientations."
+                )
+                report["violations"] = cached.get("violations", [])
+            report["steps"].append({
+                "step": "connector_orientation_gate",
+                "status": "error",
+                "cache_hit": cached is not None,
+                "violations": (cached.get("violations") if cached else None),
+            })
+            return json.dumps(report, indent=2)
+        report["steps"].append({
+            "step": "connector_orientation_gate",
+            "status": "success",
+            "checked": cached.get("checked", 0),
+        })
+
         # Step 1: Clean board (optional)
         if clean_board:
             result_json = _impl_clean_board_for_routing(

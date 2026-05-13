@@ -908,6 +908,7 @@ class FileBoardOps(BoardOps):
         board_x: float = 3.0, board_y: float = 3.0,
         board_width: float = 100.0, board_height: float = 80.0,
         clearance_mm: float = 0.5,
+        anchors: list[str] | None = None,
     ) -> dict[str, Any]:
         """Place all components using geometry-driven bin-packing.
 
@@ -926,6 +927,10 @@ class FileBoardOps(BoardOps):
             board_width: Width of placement area in mm.
             board_height: Height of placement area in mm.
             clearance_mm: Minimum courtyard-to-courtyard gap in mm.
+            anchors: Optional list of reference designators to skip — their
+                positions are not modified. Use this after place_at_edge has
+                anchored connectors at specific edges so bulk placement
+                doesn't disturb them.
 
         Returns:
             Dict with components_placed, rows, total_area_mm2, placements, warnings.
@@ -940,6 +945,7 @@ class FileBoardOps(BoardOps):
                 "warnings": [],
             }
 
+        anchor_set: set[str] = set(anchors or [])
         warnings: list[str] = []
         placements: list[dict] = []
         comp_dims: list[dict] = []
@@ -947,6 +953,9 @@ class FileBoardOps(BoardOps):
         for comp in components:
             ref = comp.get("reference", "")
             fp = comp.get("footprint", "")
+            if ref in anchor_set:
+                # Skip anchored refs entirely — caller has already placed them
+                continue
             if not ref or not fp:
                 warnings.append(f"Skipping {ref or '?'}: no footprint assigned")
                 continue
@@ -955,15 +964,48 @@ class FileBoardOps(BoardOps):
             if kicad_mod is None:
                 warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
                 w, h = 5.0, 5.0
+                xmin, ymin = -2.5, -2.5
             else:
                 bounds = _parse_footprint_bounds(kicad_mod)
                 w = bounds["width_mm"] if bounds["width_mm"] > 0 else 5.0
                 h = bounds["height_mm"] if bounds["height_mm"] > 0 else 5.0
+                # Courtyard offset from anchor: place ANCHOR so courtyard's top-left
+                # lands at the cursor. Without this, asymmetric courtyards (e.g.
+                # a connector with anchor at pin 1, or a module with antenna keepout
+                # extending above the pad area) overlap their row neighbours.
+                cy_box = bounds["courtyard"] or {"xmin": -w / 2, "ymin": -h / 2}
+                xmin = cy_box["xmin"]
+                ymin = cy_box["ymin"]
 
-            comp_dims.append({"reference": ref, "footprint": fp, "w": w, "h": h})
+            # ClusterId (PlacementIntent-driven) overrides sheet_path when set.
+            cluster_key = comp.get("cluster_id") or comp.get("sheet_path") or ""
+            comp_dims.append({
+                "reference": ref, "footprint": fp,
+                "w": w, "h": h, "xmin": xmin, "ymin": ymin,
+                "cluster_key": cluster_key,
+            })
 
-        # Sort largest footprints first so big modules aren't squeezed out by passives
-        comp_dims.sort(key=lambda c: c["w"] * c["h"], reverse=True)
+        # Phase 6.3.3 — cluster components by schematic hierarchy (or by
+        # explicit ClusterId override) so circuit blocks land near each other.
+        # Within a cluster, the existing largest-first sort is preserved (so
+        # test_auto_place_geometry's Bug 4a guard still holds). Clusters
+        # themselves are ordered by total area descending so the biggest
+        # subsystem (typically the MCU + decoupling) places first.
+        # When every component shares the same (or no) cluster key — a flat
+        # schematic with no overrides — this collapses to a single
+        # largest-first sort identical to pre-6.3.3 behavior.
+        from collections import defaultdict
+        clusters: dict[str, list[dict]] = defaultdict(list)
+        for c in comp_dims:
+            clusters[c["cluster_key"]].append(c)
+        for g in clusters.values():
+            g.sort(key=lambda c: c["w"] * c["h"], reverse=True)
+        ordered_clusters = sorted(
+            clusters.items(),
+            key=lambda kv: sum(c["w"] * c["h"] for c in kv[1]),
+            reverse=True,
+        )
+        comp_dims = [c for _, group in ordered_clusters for c in group]
 
         if not comp_dims:
             return {
@@ -996,12 +1038,13 @@ class FileBoardOps(BoardOps):
                     f"placed at ({cursor_x:.2f}, {cursor_y:.2f})"
                 )
 
-            cx = round(cursor_x + w / 2, 4)
-            cy = round(cursor_y + h / 2, 4)
+            # Place the anchor so the courtyard's top-left aligns with (cursor_x, cursor_y).
+            ox = round(cursor_x - item["xmin"], 4)
+            oy = round(cursor_y - item["ymin"], 4)
 
             try:
-                self.move_component(path, item["reference"], cx, cy, rotation=0.0)
-                placements.append({"reference": item["reference"], "x": cx, "y": cy})
+                self.move_component(path, item["reference"], ox, oy, rotation=0.0)
+                placements.append({"reference": item["reference"], "x": ox, "y": oy})
             except Exception as e:
                 warnings.append(f"{item['reference']}: move failed — {e}")
 
@@ -3921,11 +3964,20 @@ def _parse_footprint(node: list) -> dict[str, Any] | None:
                 comp["rotation"] = float(child[3])
         elif tag == "layer":
             comp["layer"] = child[1]
+        elif tag == "path" and isinstance(child[1], str):
+            # KiCad's native sheet-path link: (path "/root-uuid[/sheet-uuid...]")
+            # — same UUID prefix = same hierarchical sheet. Used by auto_place
+            # to cluster components from the same sheet (Phase 6.3.3).
+            comp["sheet_path"] = child[1]
         elif tag == "property" and len(child) >= 3:
             if child[1] == "Reference":
                 comp["reference"] = child[2]
             elif child[1] == "Value":
                 comp["value"] = child[2]
+            elif child[1] == "ClusterId":
+                # PlacementIntent: cluster:NAME from the schematic, injected
+                # by sync_schematic_to_pcb. Overrides sheet_path for grouping.
+                comp["cluster_id"] = child[2]
         elif tag == "fp_text" and len(child) >= 3:
             if child[1] == "reference":
                 comp["reference"] = child[2]
@@ -4007,9 +4059,22 @@ def _parse_sheet_node(node: list) -> dict[str, Any] | None:
 
 
 def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
+    """Parse a placed symbol node into a flat dict.
+
+    Reference, Value, and Footprint stay as named top-level fields for
+    back-compatibility with existing callers. Every other (property NAME VALUE ...)
+    block — including custom properties like PlacementIntent — lands under a
+    ``properties`` dict keyed by property name.
+
+    The schematic hierarchy path is extracted from the (instances ...) block
+    and surfaced as ``sheet_path``. For flat schematics, every symbol shares
+    the same path. For hierarchical schematics, the path encodes which sheet
+    the symbol instance lives in — auto_place uses this for clustering.
+    """
     if len(node) < 2:
         return None
     sym: dict[str, Any] = {}
+    properties: dict[str, str] = {}
     for child in node[1:]:
         if not isinstance(child, list) or len(child) < 2:
             continue
@@ -4020,12 +4085,37 @@ def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
         elif tag == "at" and len(child) >= 3:
             sym["position"] = {"x": float(child[1]), "y": float(child[2])}
         elif tag == "property" and len(child) >= 3:
-            if child[1] == "Reference":
-                sym["reference"] = child[2]
-            elif child[1] == "Value":
-                sym["value"] = child[2]
-            elif child[1] == "Footprint":
-                sym["footprint"] = child[2]
+            name = child[1]
+            value = child[2] if isinstance(child[2], str) else str(child[2])
+            if name == "Reference":
+                sym["reference"] = value
+            elif name == "Value":
+                sym["value"] = value
+            elif name == "Footprint":
+                sym["footprint"] = value
+            # All properties (including the three above) also captured in
+            # the `properties` dict so callers can read PlacementIntent etc.
+            properties[name] = value
+        elif tag == "instances":
+            # (instances (project "..." (path "/uuid[/uuid...]" (reference "..." (unit N)))))
+            # Walk down to find the first (path "...") string.
+            for inst_child in child[1:]:
+                if not isinstance(inst_child, list) or len(inst_child) < 2:
+                    continue
+                if inst_child[0] == "project":
+                    for proj_child in inst_child[1:]:
+                        if (
+                            isinstance(proj_child, list)
+                            and len(proj_child) >= 2
+                            and proj_child[0] == "path"
+                            and isinstance(proj_child[1], str)
+                        ):
+                            sym["sheet_path"] = proj_child[1]
+                            break
+                    if "sheet_path" in sym:
+                        break
+    if properties:
+        sym["properties"] = properties
     return sym if sym else None
 
 

@@ -111,6 +111,7 @@ class BoardOps(ABC):
     def auto_place(
         self, path: Path, board_x: float, board_y: float,
         board_width: float, board_height: float, clearance_mm: float = 1.5,
+        anchors: list[str] | None = None,
     ) -> dict[str, Any]:
         """Place all components using geometry-driven bin-packing."""
         raise NotImplementedError("This backend does not support auto_place")

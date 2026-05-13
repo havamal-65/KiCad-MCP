@@ -654,16 +654,23 @@ def _handle_add_board_outline(
 def _handle_auto_place(
     path: str, board_x: float, board_y: float,
     board_width: float, board_height: float, clearance_mm: float = 1.5,
+    anchors: list | None = None,
 ) -> dict[str, Any]:
+    anchor_set = set(anchors or [])
+
     def _do():
         import pcbnew
         board = _get_open_board(path)
         fps = []
         for fp in board.GetFootprints():
+            ref = fp.GetReference()
+            if ref in anchor_set:
+                # Skip anchored refs — their positions are caller-managed
+                continue
             bbox = fp.GetBoundingBox(False, False)
             fps.append({
                 "fp": fp,
-                "ref": fp.GetReference(),
+                "ref": ref,
                 "w": pcbnew.ToMM(bbox.GetWidth()),
                 "h": pcbnew.ToMM(bbox.GetHeight()),
             })
@@ -679,18 +686,28 @@ def _handle_auto_place(
         right = board_x + board_width - clearance_mm
         bottom = board_y + board_height - clearance_mm
         for item in fps:
-            w = item["w"] + clearance_mm
-            h = item["h"] + clearance_mm
-            if cx + w > right:
+            fp = item["fp"]
+            w_mm = item["w"]
+            h_mm = item["h"]
+            if cx + w_mm > right and cx > board_x + clearance_mm:
                 cx = board_x + clearance_mm
                 cy += row_h + clearance_mm
                 row_h = 0.0
-            if cy + h > bottom:
+            if cy + h_mm > bottom:
                 warnings.append(f"{item['ref']}: no space")
                 continue
-            item["fp"].SetPosition(pcbnew.VECTOR2I(_mm(cx + item["w"] / 2), _mm(cy + item["h"] / 2)))
-            cx += w
-            row_h = max(row_h, h)
+            # Account for offset between anchor and bbox top-left so the bbox
+            # (which includes courtyard graphics, keepout zones, and pads) lands
+            # at (cx, cy). pcbnew's GetBoundingBox(False, False) excludes only text.
+            bbox = fp.GetBoundingBox(False, False)
+            cur_pos = fp.GetPosition()
+            offset_x_iu = bbox.GetX() - cur_pos.x
+            offset_y_iu = bbox.GetY() - cur_pos.y
+            new_x_iu = _mm(cx) - offset_x_iu
+            new_y_iu = _mm(cy) - offset_y_iu
+            fp.SetPosition(pcbnew.VECTOR2I(new_x_iu, new_y_iu))
+            cx += w_mm + clearance_mm
+            row_h = max(row_h, h_mm)
             placed.append(item["ref"])
         _save_and_refresh(board)
         return {"placed": placed, "warnings": warnings, "count": len(placed)}
@@ -865,6 +882,7 @@ _DISPATCH = {
     "auto_place":         lambda req: _handle_auto_place(
         req["path"], req["board_x"], req["board_y"],
         req["board_width"], req["board_height"], req.get("clearance_mm", 1.5),
+        req.get("anchors", None),
     ),
     "export_dsn":         lambda req: _handle_export_dsn(req["path"], req["dsn_path"]),
     "import_ses":         lambda req: _handle_import_ses(req["path"], req["ses_path"]),

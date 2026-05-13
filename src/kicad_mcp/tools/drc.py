@@ -299,6 +299,827 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Edge-facing connector detection (Phase 6.1.1)
+# ---------------------------------------------------------------------------
+
+# Substrings that indicate a connector with an external mating face. Matched
+# case-sensitively against the footprint's full lib_id (Library:Name).
+_EDGE_NAME_TOKENS: tuple[str, ...] = (
+    "Horizontal",
+    "_Receptacle_",
+    "Connector_USB",
+    "Connector_Audio",
+    "Connector_JST",
+    "Connector_BarrelJack",
+    "Connector_RJ",
+    "Connector_HDMI",
+    "Connector_Coaxial",
+)
+
+
+def _classify_footprint_local_face(local_x: float, local_y: float) -> str:
+    """Return the dominant compass direction of (local_x, local_y) in local frame.
+
+    Returns one of "+x", "-x", "+y", "-y". Used to derive mating face from a
+    "PCB edge" marker's position relative to the footprint origin.
+    """
+    if abs(local_x) >= abs(local_y):
+        return "+x" if local_x >= 0 else "-x"
+    return "+y" if local_y >= 0 else "-y"
+
+
+def _scan_footprint_for_edge_marker(block: str) -> tuple[float, float] | None:
+    """Find a (fp_text user "PCB edge" ... (layer "Dwgs.User")) inside a footprint block.
+
+    Returns the (local_x, local_y) of the marker's (at ...) clause, or None if
+    no marker is present. The marker is the high-confidence signal placed by
+    KiCad library maintainers on horizontal/receptacle connector footprints.
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)')
+
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token != "fp_text":
+            i += 1
+            continue
+        end_idx = _walk_balanced_parens(block, i)
+        if end_idx is None:
+            i += 1
+            continue
+        sub_block = block[i : end_idx + 1]
+        if '"PCB edge"' in sub_block and '"Dwgs.User"' in sub_block:
+            at_m = at_pat.search(sub_block)
+            if at_m:
+                return (float(at_m.group(1)), float(at_m.group(2)))
+        i = end_idx + 1
+    return None
+
+
+def _scan_footprint_courtyard_center(block: str) -> tuple[float, float] | None:
+    """Centroid of the F.CrtYd rectangle (or fp_line extents) in local frame."""
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    coord_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
+
+    xs: list[float] = []
+    ys: list[float] = []
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token not in ("fp_rect", "fp_line"):
+            i += 1
+            continue
+        end_idx = _walk_balanced_parens(block, i)
+        if end_idx is None:
+            i += 1
+            continue
+        sub = block[i : end_idx + 1]
+        if '"F.CrtYd"' in sub or '"B.CrtYd"' in sub:
+            for m in coord_pat.finditer(sub):
+                xs.append(float(m.group(1)))
+                ys.append(float(m.group(2)))
+        i = end_idx + 1
+    if not xs:
+        return None
+    return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+
+
+def _scan_footprint_pad_centroid(block: str) -> tuple[float, float] | None:
+    """Compute the centroid of pads inside a footprint block (footprint-local frame).
+
+    Returns None if no pads were found. Used by the name-heuristic fallback
+    to infer the mating-face direction: see `_scan_footprint_courtyard_center`
+    above — the mating face is the direction from pad centroid toward the
+    courtyard center (which sits in the body of the connector, where the
+    cable inserts).
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    pad_at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)')
+
+    xs: list[float] = []
+    ys: list[float] = []
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token != "pad":
+            i += 1
+            continue
+        end_idx = _walk_balanced_parens(block, i)
+        if end_idx is None:
+            i += 1
+            continue
+        sub_block = block[i : end_idx + 1]
+        # Skip non-plated through-holes (mounting holes) — they don't anchor the cable
+        if "np_thru_hole" in sub_block:
+            i = end_idx + 1
+            continue
+        at_m = pad_at_pat.search(sub_block)
+        if at_m:
+            xs.append(float(at_m.group(1)))
+            ys.append(float(at_m.group(2)))
+        i = end_idx + 1
+
+    if not xs:
+        return None
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _scan_footprint_silk_direction(block: str) -> tuple[str, float] | None:
+    """Infer mating-face direction from the *centroid* of F.SilkS segments.
+
+    Horizontal connectors typically have their body silkscreen extending
+    asymmetrically in one direction from the footprint origin (pin 1).
+    The silk centroid lies along that direction — and that direction is
+    where the cable inserts. This works for both USB-C receptacles
+    (body extends toward -y from pads, mating face -y) and JST horizontal
+    connectors (body extends toward +y from pins, mating face +y).
+
+    Returns ``(face, magnitude_mm)`` or ``None`` if silk is too symmetric
+    around the origin to give a clear signal (magnitude < 0.5 mm).
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    coord_pat = re.compile(r'\(start\s+([-\d.]+)\s+([-\d.]+)\)\s*\(end\s+([-\d.]+)\s+([-\d.]+)\)')
+
+    segments: list[tuple[float, float, float, float]] = []
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token != "fp_line":
+            i += 1
+            continue
+        end_idx = _walk_balanced_parens(block, i)
+        if end_idx is None:
+            i += 1
+            continue
+        sub = block[i : end_idx + 1]
+        if '"F.SilkS"' in sub:
+            m = coord_pat.search(sub)
+            if m:
+                segments.append((
+                    float(m.group(1)), float(m.group(2)),
+                    float(m.group(3)), float(m.group(4)),
+                ))
+        i = end_idx + 1
+
+    if not segments:
+        return None
+
+    # Length-weighted centroid of silk segments (each segment is treated as a
+    # straight line with weight equal to its length).
+    total_len = 0.0
+    sx_acc = 0.0
+    sy_acc = 0.0
+    for x1, y1, x2, y2 in segments:
+        length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+        midx = (x1 + x2) / 2.0
+        midy = (y1 + y2) / 2.0
+        sx_acc += midx * length
+        sy_acc += midy * length
+        total_len += length
+
+    if total_len <= 0.0:
+        return None
+    cx = sx_acc / total_len
+    cy = sy_acc / total_len
+    magnitude = (cx * cx + cy * cy) ** 0.5
+    if magnitude < 0.5:
+        return None  # silk too symmetric to give a clear signal
+    return (_classify_footprint_local_face(cx, cy), magnitude)
+
+
+def _name_matches_edge_connector(lib_id: str) -> str | None:
+    """Return the first _EDGE_NAME_TOKENS substring matched in lib_id, or None."""
+    for token in _EDGE_NAME_TOKENS:
+        if token in lib_id:
+            return token
+    return None
+
+
+def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
+    """Detect footprints that need outward-facing edge placement.
+
+    Scans every (footprint ...) block in pcb_path and classifies each
+    based on multiple signals (highest-confidence first):
+
+      1. (fp_text user "PCB edge" ... (layer "Dwgs.User")) — definitive
+         marker placed by KiCad library maintainers on horizontal /
+         receptacle footprints. The marker's (at lx ly) gives the
+         mating-face direction in footprint-local frame.
+
+      2. Footprint name heuristic — lib_id substring match against
+         "Horizontal", "_Receptacle_", "Connector_USB",
+         "Connector_Audio", "Connector_JST", "Connector_BarrelJack",
+         "Connector_RJ", "Connector_HDMI", "Connector_Coaxial". When
+         matched, mating face is inferred from the pad-cluster centroid:
+         the cable enters opposite the pad cluster.
+
+      3. (attr through_hole exclude_from_pos_files) combined with a
+         J/P reference is a confidence-bump for hand-solder cable
+         connectors that don't have the marker.
+
+    Returns ``mating_face`` in the footprint's LOCAL coordinate frame. The
+    placed footprint's outer ``(at x y rotation)`` must be applied by callers
+    (e.g. validate_connector_orientations) to get the board-frame direction.
+
+    Returns:
+        ``{"connectors": [{ref, footprint, mating_face, confidence, evidence}],
+           "checked_count": <int>}``
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    content = pcb_path.read_text(encoding="utf-8")
+
+    fp_header_pat = re.compile(r'\(footprint\s+"([^"]+)"')
+    ref_pat = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
+    fp_ref_pat = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
+    attr_pat = re.compile(r"\(attr\s+([^\)]+)\)")
+
+    connectors: list[dict[str, Any]] = []
+    checked = 0
+
+    i = 0
+    n = len(content)
+    while i < n:
+        if content[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and content[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = content[i + 1 : j]
+
+        if token != "footprint":
+            i += 1
+            continue
+
+        end_idx = _walk_balanced_parens(content, i)
+        if end_idx is None:
+            i += 1
+            continue
+
+        block = content[i : end_idx + 1]
+        i = end_idx + 1
+
+        header_m = fp_header_pat.match(block)
+        lib_id = header_m.group(1) if header_m else ""
+
+        ref_m = ref_pat.search(block) or fp_ref_pat.search(block)
+        ref = ref_m.group(1) if ref_m else None
+        if not ref or ref.startswith("#"):
+            continue
+
+        checked += 1
+
+        # ---- Signal 1: "PCB edge" marker (high confidence) -----------------
+        marker_pos = _scan_footprint_for_edge_marker(block)
+        if marker_pos is not None:
+            face = _classify_footprint_local_face(*marker_pos)
+            connectors.append({
+                "ref": ref,
+                "footprint": lib_id,
+                "mating_face": face,
+                "confidence": "high",
+                "evidence": (
+                    f"Dwgs.User 'PCB edge' marker at "
+                    f"({marker_pos[0]:.2f}, {marker_pos[1]:.2f})"
+                ),
+            })
+            continue
+
+        # ---- Signal 2: silk centroid direction (high confidence) -----------
+        # If the lib_id matches a known edge-connector pattern, infer the
+        # mating face from the asymmetric extension of the silk geometry.
+        # The cable inserts in the direction the connector body extends.
+        matched_token = _name_matches_edge_connector(lib_id)
+        if matched_token is None:
+            continue
+        silk = _scan_footprint_silk_direction(block)
+        if silk is not None:
+            face, magnitude = silk
+            connectors.append({
+                "ref": ref,
+                "footprint": lib_id,
+                "mating_face": face,
+                "confidence": "high",
+                "evidence": (
+                    f"F.SilkS centroid offset {magnitude:.2f} mm toward {face} "
+                    f"(name match '{matched_token}')"
+                ),
+            })
+            continue
+
+        # Derive mating face from courtyard-vs-pad geometry: the connector
+        # body extends in the direction the cable inserts, so the courtyard
+        # center sits in the body. The mating face direction is the vector
+        # from the pad centroid toward the courtyard center.
+        pad_centroid = _scan_footprint_pad_centroid(block)
+        cy_center = _scan_footprint_courtyard_center(block)
+        if pad_centroid is not None and cy_center is not None:
+            dx = cy_center[0] - pad_centroid[0]
+            dy = cy_center[1] - pad_centroid[1]
+            if abs(dx) > 0.05 or abs(dy) > 0.05:
+                mating_face = _classify_footprint_local_face(dx, dy)
+                evidence = (
+                    f"name match '{matched_token}'; pad centroid "
+                    f"({pad_centroid[0]:.2f}, {pad_centroid[1]:.2f}) → "
+                    f"courtyard center ({cy_center[0]:.2f}, {cy_center[1]:.2f})"
+                )
+            else:
+                mating_face = None
+                evidence = (
+                    f"name match '{matched_token}'; pad centroid coincident "
+                    "with courtyard center (symmetric body) — manual review needed"
+                )
+        elif pad_centroid is not None and (
+            abs(pad_centroid[0]) > 0.01 or abs(pad_centroid[1]) > 0.01
+        ):
+            # Fallback when no courtyard available: use opposite-of-pads
+            pad_face = _classify_footprint_local_face(*pad_centroid)
+            opposite = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+            mating_face = opposite[pad_face]
+            evidence = (
+                f"name match '{matched_token}'; pad centroid at "
+                f"({pad_centroid[0]:.2f}, {pad_centroid[1]:.2f}) "
+                "(no courtyard — using opposite-of-pads fallback)"
+            )
+        else:
+            mating_face = None
+            evidence = f"name match '{matched_token}'; pad centroid unavailable"
+
+        # ---- Signal 3: attr flag bump --------------------------------------
+        confidence = "medium"
+        attr_m = attr_pat.search(block)
+        if attr_m and "exclude_from_pos_files" in attr_m.group(1):
+            if ref[:1] in ("J", "P"):
+                evidence += "; attr 'exclude_from_pos_files' confirms hand-solder cable"
+
+        connectors.append({
+            "ref": ref,
+            "footprint": lib_id,
+            "mating_face": mating_face,
+            "confidence": confidence,
+            "evidence": evidence,
+        })
+
+    return {
+        "connectors": connectors,
+        "checked_count": checked,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Connector-orientation validation (Phase 6.1.2)
+# ---------------------------------------------------------------------------
+
+_FACE_VECTORS: dict[str, tuple[float, float]] = {
+    "+x": (1.0, 0.0),
+    "-x": (-1.0, 0.0),
+    "+y": (0.0, 1.0),
+    "-y": (0.0, -1.0),
+}
+
+# Outward normal of each board edge in board-frame coordinates.
+# Note: KiCad's Y axis points DOWNWARD on screen — north (top) is ymin.
+_EDGE_OUTWARD_FACE: dict[str, str] = {
+    "north": "-y",
+    "south": "+y",
+    "east": "+x",
+    "west": "-x",
+}
+
+# Angular tolerance (degrees) between the board-frame mating face and the
+# outward normal of the closest edge for the orientation to count as correct.
+_ORIENTATION_TOLERANCE_DEG: float = 30.0
+
+
+def _rotate_vec(vx: float, vy: float, deg: float) -> tuple[float, float]:
+    import math as _math
+
+    rad = _math.radians(deg)
+    cos_r = _math.cos(rad)
+    sin_r = _math.sin(rad)
+    return (vx * cos_r - vy * sin_r, vx * sin_r + vy * cos_r)
+
+
+def _vec_to_face(vx: float, vy: float) -> str:
+    if abs(vx) >= abs(vy):
+        return "+x" if vx >= 0 else "-x"
+    return "+y" if vy >= 0 else "-y"
+
+
+def _angle_deg(vx: float, vy: float) -> float:
+    import math as _math
+    return _math.degrees(_math.atan2(vy, vx))
+
+
+def _angle_diff(a: float, b: float) -> float:
+    """Smallest signed difference between angles *a* and *b*, in degrees."""
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def _parse_board_bbox(content: str) -> tuple[float, float, float, float] | None:
+    """Compute the Edge.Cuts bounding box from gr_rect / gr_line graphics.
+
+    Returns (xmin, ymin, xmax, ymax) or None if no Edge.Cuts geometry was found.
+    Handles both rectangular outlines (gr_rect) and polygonal outlines made of
+    gr_line segments.
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    coord_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
+
+    xs: list[float] = []
+    ys: list[float] = []
+
+    i = 0
+    n = len(content)
+    while i < n:
+        if content[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and content[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = content[i + 1 : j]
+        if token in ("gr_rect", "gr_line", "gr_arc"):
+            end_idx = _walk_balanced_parens(content, i)
+            if end_idx is None:
+                i += 1
+                continue
+            block = content[i : end_idx + 1]
+            if '"Edge.Cuts"' in block:
+                for m in coord_pat.finditer(block):
+                    xs.append(float(m.group(1)))
+                    ys.append(float(m.group(2)))
+            i = end_idx + 1
+            continue
+        # Skip footprint blocks — their inner fp_line/fp_rect are not the outline.
+        if token == "footprint":
+            end_idx = _walk_balanced_parens(content, i)
+            if end_idx is None:
+                i += 1
+                continue
+            i = end_idx + 1
+            continue
+        i += 1
+
+    if not xs or not ys:
+        return None
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _edge_distances(
+    origin_x: float, origin_y: float,
+    xmin: float, ymin: float, xmax: float, ymax: float,
+) -> dict[str, float]:
+    return {
+        "north": origin_y - ymin,
+        "south": ymax - origin_y,
+        "east": xmax - origin_x,
+        "west": origin_x - xmin,
+    }
+
+
+def _closest_edge(
+    origin_x: float, origin_y: float,
+    xmin: float, ymin: float, xmax: float, ymax: float,
+) -> str:
+    """Return one of "north"/"south"/"east"/"west" — the edge closest to origin."""
+    distances = _edge_distances(origin_x, origin_y, xmin, ymin, xmax, ymax)
+    return min(distances.items(), key=lambda kv: (kv[1], ["north", "south", "east", "west"].index(kv[0])))[0]
+
+
+def _acceptable_edges(
+    origin_x: float, origin_y: float,
+    xmin: float, ymin: float, xmax: float, ymax: float,
+    tolerance_mm: float = 2.0,
+) -> list[str]:
+    """Return all edges within ``tolerance_mm`` of the closest one.
+
+    Corner-placed connectors are nearly equidistant from two edges — a user
+    might intend either. Accept both so the validator doesn't punish a 0.5 mm
+    difference in distance with a 90° rotation suggestion.
+    """
+    distances = _edge_distances(origin_x, origin_y, xmin, ymin, xmax, ymax)
+    closest = min(distances.values())
+    return [e for e, d in distances.items() if d <= closest + tolerance_mm]
+
+
+def _suggested_rotation_for_edge(local_face: str, edge: str) -> float:
+    """Rotation (deg, 0-360) that would place local_face pointing outward at edge."""
+    lx, ly = _FACE_VECTORS[local_face]
+    local_angle = _angle_deg(lx, ly)
+    outward = _EDGE_OUTWARD_FACE[edge]
+    ox, oy = _FACE_VECTORS[outward]
+    outward_angle = _angle_deg(ox, oy)
+    required = (outward_angle - local_angle) % 360.0
+    # Normalize to the nearest 90° step — KiCad footprint rotations are typically cardinal.
+    snapped = round(required / 90.0) * 90.0 % 360.0
+    return float(snapped)
+
+
+def _get_footprint_placement(content: str, ref: str) -> tuple[float, float, float] | None:
+    """Find a placed footprint's outer (at x y rotation). Returns (x, y, rot)."""
+    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+
+    located = find_footprint_block_by_reference(content, ref)
+    if located is None:
+        return None
+    start, end = located
+    block = content[start : end + 1]
+    # The outer (at ...) is the first one after the (footprint "name" (layer ...))
+    # — earlier than any (property ... (at ...)) blocks. Look for it before the
+    # first property block.
+    first_prop = block.find("(property")
+    head = block[: first_prop] if first_prop != -1 else block
+    at_m = re.search(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)', head)
+    if not at_m:
+        return None
+    x = float(at_m.group(1))
+    y = float(at_m.group(2))
+    rot = float(at_m.group(3)) if at_m.group(3) else 0.0
+    return (x, y, rot)
+
+
+def compute_edge_placement(
+    pcb_path: Path, reference: str, edge: str, offset_mm: float = 2.0,
+) -> dict[str, Any]:
+    """Compute (target_x, target_y, target_rotation) for anchoring a connector at an edge.
+
+    Pure geometry — does NOT mutate the board file. Used by both the
+    ``place_at_edge`` tool and ``sync_schematic_to_pcb`` (which reads
+    ``PlacementIntent`` properties from schematic symbols).
+
+    Returns either::
+
+        {"status": "success", "target_x": float, "target_y": float,
+         "target_rotation": float, "local_mating_face": str, "evidence": str}
+
+    or::
+
+        {"status": "error", "message": "...detailed reason..."}
+    """
+    from kicad_mcp.backends.file_backend import _parse_footprint_bounds
+    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+
+    if edge not in _EDGE_OUTWARD_FACE:
+        return {
+            "status": "error",
+            "message": f"edge must be one of {list(_EDGE_OUTWARD_FACE)}; got {edge!r}",
+        }
+
+    content = pcb_path.read_text(encoding="utf-8")
+
+    bbox = _parse_board_bbox(content)
+    if bbox is None:
+        return {
+            "status": "error",
+            "message": "No Edge.Cuts geometry — add a board outline before placing at an edge.",
+        }
+    board_xmin, board_ymin, board_xmax, board_ymax = bbox
+
+    identify = run_identify_edge_facing_connectors(pcb_path)
+    connector = next(
+        (c for c in identify["connectors"] if c["ref"] == reference),
+        None,
+    )
+    if connector is None:
+        return {
+            "status": "error",
+            "message": (
+                f"{reference} is not detected as an edge-facing connector. "
+                "Either it isn't a connector, or its footprint lacks "
+                "the 'PCB edge' marker and doesn't match the name heuristic."
+            ),
+        }
+    local_face = connector["mating_face"]
+    if local_face is None:
+        return {
+            "status": "error",
+            "message": (
+                f"{reference} mating face is indeterminate ({connector['evidence']})."
+            ),
+        }
+
+    located = find_footprint_block_by_reference(content, reference)
+    if located is None:
+        return {
+            "status": "error",
+            "message": f"footprint {reference} not found in board file",
+        }
+    start, end = located
+    block = content[start : end + 1]
+    bounds = _parse_footprint_bounds(block)
+    courtyard = bounds.get("courtyard")
+    if courtyard is None:
+        return {
+            "status": "error",
+            "message": (
+                f"{reference} has no courtyard fp_rect on F.CrtYd — "
+                "cannot compute clearance offset."
+            ),
+        }
+
+    target_rotation = _suggested_rotation_for_edge(local_face, edge)
+
+    corners = [
+        (courtyard["xmin"], courtyard["ymin"]),
+        (courtyard["xmin"], courtyard["ymax"]),
+        (courtyard["xmax"], courtyard["ymin"]),
+        (courtyard["xmax"], courtyard["ymax"]),
+    ]
+    rotated = [_rotate_vec(cx, cy, target_rotation) for cx, cy in corners]
+    r_xmin = min(rx for rx, _ in rotated)
+    r_ymin = min(ry for _, ry in rotated)
+    r_xmax = max(rx for rx, _ in rotated)
+    r_ymax = max(ry for _, ry in rotated)
+
+    if edge == "north":
+        target_x = (board_xmin + board_xmax) / 2.0 - (r_xmin + r_xmax) / 2.0
+        target_y = board_ymin + offset_mm - r_ymin
+    elif edge == "south":
+        target_x = (board_xmin + board_xmax) / 2.0 - (r_xmin + r_xmax) / 2.0
+        target_y = board_ymax - offset_mm - r_ymax
+    elif edge == "east":
+        target_x = board_xmax - offset_mm - r_xmax
+        target_y = (board_ymin + board_ymax) / 2.0 - (r_ymin + r_ymax) / 2.0
+    else:  # west
+        target_x = board_xmin + offset_mm - r_xmin
+        target_y = (board_ymin + board_ymax) / 2.0 - (r_ymin + r_ymax) / 2.0
+
+    return {
+        "status": "success",
+        "target_x": target_x,
+        "target_y": target_y,
+        "target_rotation": target_rotation,
+        "local_mating_face": local_face,
+        "evidence": connector["evidence"],
+    }
+
+
+def run_validate_connector_orientations(pcb_path: Path) -> dict[str, Any]:
+    """Verify every edge-facing connector points outward at its closest board edge.
+
+    For each connector returned by :func:`run_identify_edge_facing_connectors`:
+
+      1. Look up the placed footprint's ``(at x y rotation)`` in the board file.
+      2. Rotate the local-frame ``mating_face`` vector by that rotation to get
+         the board-frame face direction.
+      3. Find the closest edge (north/south/east/west) by distance from the
+         footprint origin to each edge of the Edge.Cuts bounding box.
+      4. Check whether the board-frame face direction is within
+         ±30° of the outward normal of that edge.
+
+    Connectors with ``mating_face = None`` (medium-confidence detections that
+    couldn't resolve a face direction) are reported as ``indeterminate`` and
+    do not count as either pass or fail — the model is expected to inspect
+    them manually.
+
+    Side effect: writes the result to the board's sidecar validation cache so
+    that downstream gates (e.g. ``autoroute``) can confirm a prior pass
+    applies to the current board state.
+
+    Returns:
+        ``{"passed": bool, "checked": int, "violations": [...], "indeterminate": [...]}``
+        ``passed=True`` when no edge-facing connectors were detected
+        (empty-board case) — a board with no connectors must not be blocked
+        by this gate.
+    """
+    from kicad_mcp.utils.validation_cache import record_validation
+
+    content = pcb_path.read_text(encoding="utf-8")
+    bbox = _parse_board_bbox(content)
+    identify = run_identify_edge_facing_connectors(pcb_path)
+    connectors = identify["connectors"]
+
+    if not connectors:
+        result = {
+            "passed": True,
+            "checked": 0,
+            "violations": [],
+            "indeterminate": [],
+        }
+        record_validation(pcb_path, "validate_connector_orientations", result)
+        return result
+
+    if bbox is None:
+        # Can't determine edges without an outline. Surface as a blocking
+        # violation rather than a silent pass — the user needs to add an
+        # Edge.Cuts outline before this gate has meaning.
+        result = {
+            "passed": False,
+            "checked": len(connectors),
+            "violations": [{
+                "type": "no_board_outline",
+                "detail": "No Edge.Cuts geometry found — add a board outline before validating connector orientations.",
+            }],
+            "indeterminate": [],
+        }
+        record_validation(pcb_path, "validate_connector_orientations", result)
+        return result
+
+    xmin, ymin, xmax, ymax = bbox
+    violations: list[dict[str, Any]] = []
+    indeterminate: list[dict[str, Any]] = []
+
+    for c in connectors:
+        ref = c["ref"]
+        local_face = c.get("mating_face")
+        if local_face is None:
+            indeterminate.append({
+                "ref": ref,
+                "footprint": c["footprint"],
+                "reason": "mating_face could not be determined — manual review required",
+                "evidence": c.get("evidence", ""),
+            })
+            continue
+
+        placement = _get_footprint_placement(content, ref)
+        if placement is None:
+            indeterminate.append({
+                "ref": ref,
+                "footprint": c["footprint"],
+                "reason": "footprint placement (at ...) could not be parsed",
+            })
+            continue
+
+        ox, oy, rot = placement
+        lvx, lvy = _FACE_VECTORS[local_face]
+        bvx, bvy = _rotate_vec(lvx, lvy, rot)
+        board_face = _vec_to_face(bvx, bvy)
+
+        # Corner placements are ambiguous — accept any edge within 2 mm of the
+        # closest. If the connector faces ANY acceptable edge, pass.
+        acceptable = _acceptable_edges(ox, oy, xmin, ymin, xmax, ymax, tolerance_mm=2.0)
+        best_diff: float | None = None
+        best_edge: str = acceptable[0]
+        for edge_candidate in acceptable:
+            outward = _EDGE_OUTWARD_FACE[edge_candidate]
+            ex, ey = _FACE_VECTORS[outward]
+            diff = _angle_diff(_angle_deg(bvx, bvy), _angle_deg(ex, ey))
+            if best_diff is None or abs(diff) < abs(best_diff):
+                best_diff = diff
+                best_edge = edge_candidate
+
+        if best_diff is not None and abs(best_diff) <= _ORIENTATION_TOLERANCE_DEG:
+            continue
+
+        violations.append({
+            "ref": ref,
+            "footprint": c["footprint"],
+            "current_face": local_face,
+            "current_face_in_board_frame": board_face,
+            "closest_edge": best_edge,
+            "acceptable_edges": acceptable,
+            "suggested_edge": best_edge,
+            "suggested_rotation": _suggested_rotation_for_edge(local_face, best_edge),
+            "angle_off_deg": round(best_diff if best_diff is not None else 0.0, 1),
+        })
+
+    result = {
+        "passed": len(violations) == 0,
+        "checked": len(connectors),
+        "violations": violations,
+        "indeterminate": indeterminate,
+    }
+    record_validation(pcb_path, "validate_connector_orientations", result)
+    return result
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register DRC/ERC tools on the MCP server."""
 
@@ -472,11 +1293,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             }, indent=2)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_svg = Path(tmp_dir) / "validate_check.svg"
             try:
                 proc = subprocess.run(
-                    [str(cli), "sch", "export", "--format", "svg",
-                     "--output", str(tmp_svg), str(p)],
+                    [str(cli), "sch", "export", "svg",
+                     "--output", str(tmp_dir), str(p)],
                     capture_output=True, text=True, timeout=30,
                 )
             except subprocess.TimeoutExpired:
@@ -599,6 +1419,72 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         p = validate_kicad_path(path, ".kicad_pcb")
         result = run_check_courtyard_overlaps(p)
         change_log.record("check_courtyard_overlaps", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def identify_edge_facing_connectors(path: str) -> str:
+        """Detect connectors that need outward-facing placement at a board edge.
+
+        Scans every footprint in the .kicad_pcb file and classifies each as
+        edge-facing or not, based on:
+          1. Definitive 'PCB edge' marker on the Dwgs.User layer (high confidence)
+          2. Footprint name heuristic — Horizontal, _Receptacle_, Connector_USB,
+             Connector_Audio, Connector_JST, Connector_BarrelJack, etc. (medium)
+
+        Returns the mating-face direction in the footprint's local frame.
+        The placed footprint's outer (at x y rotation) must be applied by
+        the caller to convert to board frame — that's what
+        validate_connector_orientations does.
+
+        Use this as the survey step in /build-pcb Phase 4a — every detected
+        ref needs a planned edge assignment before Phase 4b anchoring.
+
+        Args:
+            path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON with list of edge-facing connectors and their local-frame
+            mating face direction (+x, -x, +y, -y), with confidence and
+            evidence describing which detection signal fired.
+        """
+        p = validate_kicad_path(path, ".kicad_pcb")
+        result = run_identify_edge_facing_connectors(p)
+        change_log.record("identify_edge_facing_connectors", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def validate_connector_orientations(path: str) -> str:
+        """Placement-quality gate: every edge-facing connector points outward.
+
+        For each connector returned by identify_edge_facing_connectors, applies
+        the placed footprint's rotation to its local-frame mating face and
+        checks whether the resulting board-frame direction is within ±30° of
+        pointing outward at the nearest board edge.
+
+        Connectors whose mating face could not be determined (medium-confidence
+        name-matches without a usable pad centroid) are reported under
+        'indeterminate' rather than failing the gate — the model should
+        review them manually.
+
+        Side effect: the result is written to <board>.validation_cache.json so
+        that autoroute can refuse to start when the most recent orientation
+        validation failed for the current board state.
+
+        The model MUST NOT call autoroute if passed is false. With Phase 6.1.4
+        in place, autoroute itself will refuse — but reading this first lets
+        the model surface specific remediation (which refs to rotate).
+
+        Args:
+            path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON with passed bool, checked count, violations list (each with
+            ref, current_face_in_board_frame, closest_edge, suggested_rotation,
+            angle_off_deg), and indeterminate list (refs needing manual review).
+        """
+        p = validate_kicad_path(path, ".kicad_pcb")
+        result = run_validate_connector_orientations(p)
+        change_log.record("validate_connector_orientations", {"path": path})
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()

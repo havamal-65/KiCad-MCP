@@ -8,13 +8,13 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **94 MCP Tools** across 9 categories:
+- **102 MCP Tools** across 9 categories:
   - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference, plan capture and retrieval, **startup gate checklist**
-  - 📐 **Schematic Operations** (26 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync
-  - 🔌 **PCB Board Operations** (15 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with utilization reporting), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**
+  - 📐 **Schematic Operations** (26 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
+  - 🔌 **PCB Board Operations** (16 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
-  - ✅ **Design Rule Checks** (8 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **pre-sync schematic completeness check**, **fast courtyard overlap check**
+  - ✅ **Design Rule Checks** (10 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **pre-sync schematic completeness check**, **fast courtyard overlap check**, **detect edge-facing connectors** (USB-C, JST, audio jacks, etc.), **validate connector orientations** with autoroute hash-gate that refuses to route over inward-facing connectors
   - 📤 **Export Operations** (7 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models**
   - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clear all routes for re-placement**
   - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
@@ -81,14 +81,18 @@ industry practice with seven gated phases and a report + user confirmation betwe
 | 1 | Environment & Requirements | `get_startup_checklist.ready_for_pcb` |
 | 2 | Schematic Capture | All components placed, ≥1 net |
 | 3 | Schematic Verification | `validate_schematic_for_pcb.ready_for_pcb_sync`, ERC clean |
-| 4 | PCB Setup & Placement | `check_courtyard_overlaps.passed` |
+| 4a | Sync & Survey | every ref from `identify_edge_facing_connectors` has a planned edge |
+| 4b | Anchor Connectors | `validate_connector_orientations.passed` after `place_at_edge` for each |
+| 4c | Bulk Placement | every non-anchored ref placed; anchors passed via `auto_place(anchors=[...])` |
+| 4d | Overlap Check | `check_courtyard_overlaps.passed` |
+| 4e | Final Orientation Re-check | `validate_connector_orientations.passed` (autoroute refuses if not) |
 | 5 | Routing | Zero unrouted connections |
 | 6 | Design Verification | `run_drc.passed` |
 | 7 | Manufacturing Outputs | All six export files generated |
 
 After each phase Claude prints a `## Phase N Report` block and pauses for your
-confirmation before continuing. Hard gates prevent routing over courtyard overlaps or
-syncing a schematic with blocking issues.
+confirmation before continuing. Hard gates prevent routing over courtyard overlaps,
+routing past inward-facing connectors, or syncing a schematic with blocking issues.
 
 ---
 
@@ -296,15 +300,16 @@ python -m kicad_mcp_plugin
 - `get_net_connections`: Get all connections (pins, labels, wires) on a named net
 - `get_sheet_hierarchy`: Get the hierarchical sheet tree from a root schematic
 - `compare_schematic_pcb`: Detect mismatches between schematic and PCB (missing components, footprint/value differences)
-- `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values, sync pin nets to pad net assignments)
+- `sync_schematic_to_pcb`: Synchronize schematic components to the PCB (auto-place missing, update values, sync pin nets to pad net assignments). Reads each symbol's `PlacementIntent` custom property: `edge:north|south|east|west` anchors the corresponding footprint at that edge with correct outward rotation (skipped with a warning if no Edge.Cuts outline yet); `cluster:NAME` attaches a `ClusterId` to the footprint so `auto_place` keeps that subsystem geometrically grouped. Sheet hierarchy from `.kicad_sch` is propagated to placed footprints as a `(path "/UUID/...")` clause so `auto_place` clusters by schematic block automatically.
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (15 tools)
+### PCB Board Operations (16 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
 - `move_component`: Move an existing component to a new position
+- `place_at_edge`: Anchor an edge-facing connector at the named board edge (`north` / `south` / `east` / `west`) with the correct outward rotation and a configurable courtyard-clearance offset. Reads the connector's local-frame mating face (via the same detection `validate_connector_orientations` uses) and computes the rotation that makes it point outward. Use in `/build-pcb` Phase 4b before `auto_place(anchors=[...])`.
 - `add_track`: Add a copper track segment
 - `add_via`: Add a via (through-hole, blind, or buried)
 - `add_board_outline`: Add or replace the Edge.Cuts board outline with a rectangle at the specified origin and size. When called via `pcb_pipeline`, the board is automatically centered at the KiCad canvas origin (0, 0) so it always appears in the middle of the work area.
@@ -313,9 +318,9 @@ python -m kicad_mcp_plugin
 - `refill_zones`: Refill all copper pour zones on a board
 - `get_stackup`: Get the layer stackup definition for a board
 - `set_board_design_rules`: Write manufacturing-enforceable design rules into the `.kicad_pro` `net_settings.classes` Default entry. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
-- `auto_place`: Geometry-driven bin-packing placement. Reads the courtyard extents for every footprint, sorts by component class (connectors → ICs → discretes → transistors → LEDs → others), and packs components into rows with a guaranteed courtyard-to-courtyard gap ≥ `clearance_mm`. Returns `utilization_pct` (courtyard area / board area) and warns when >70%.
+- `auto_place`: Geometry-driven bin-packing placement. Reads the courtyard extents for every footprint, sorts by component class (connectors → ICs → discretes → transistors → LEDs → others), and packs components into rows with a guaranteed courtyard-to-courtyard gap ≥ `clearance_mm`. Returns `utilization_pct` (courtyard area / board area) and warns when >70%. Accepts an optional `anchors=[ref,...]` list — those refs are skipped so `place_at_edge`'s work survives bulk placement. Groups components by schematic sheet path (or explicit `PlacementIntent: cluster:NAME`) so circuit blocks land near each other.
 - `diff_board`: Detect changes between two PCB board snapshots. Compares component positions and track counts between two `.kicad_pcb` files. Returns `added_components`, `removed_components`, `moved_components`, and `track_delta`. Useful for confirming `autoroute` added tracks or `auto_place` moved all components.
-- `pcb_pipeline`: Full schematic-to-routed-PCB pipeline in a single call. Step 0 runs a mandatory pre-flight gate (startup checklist + `validate_schematic_for_pcb` + board-size estimate); Steps 1–6: `sync_schematic_to_pcb` → `set_board_design_rules` → add Edge.Cuts outline (centered at origin) → `auto_place` → **courtyard overlap check** (fails pipeline if overlaps present) → `autoroute` → `run_drc`. Pipeline aborts with a clear error if any gate fails.
+- `pcb_pipeline`: Full schematic-to-routed-PCB pipeline in a single call. Step 0 runs a mandatory pre-flight gate (startup checklist + `validate_schematic_for_pcb` + board-size estimate); Steps 1–6: `sync_schematic_to_pcb` → `set_board_design_rules` → add Edge.Cuts outline (centered at origin) → `auto_place` → **courtyard overlap check** (fails pipeline if overlaps present) → **connector orientation check** (fails if any edge-facing connector points inward) → `autoroute` → `run_drc`. Pipeline aborts with a clear error if any gate fails.
 
 ### Library Search (8 tools)
 - `search_symbols`: Search for schematic symbols across installed libraries
@@ -338,7 +343,7 @@ python -m kicad_mcp_plugin
 - `import_footprint`: Copy a footprint from one .pretty directory to another
 - `register_project_library`: Register a library in a project's sym-lib-table or fp-lib-table
 
-### Design Rule Checks (8 tools)
+### Design Rule Checks (10 tools)
 - `run_drc`: Run Design Rule Check on a PCB board
 - `run_erc`: Run Electrical Rules Check on a schematic
 - `validate_schematic`: File-based electrical rules validation (no kicad-cli required)
@@ -347,6 +352,8 @@ python -m kicad_mcp_plugin
 - `get_board_design_rules`: Get the design rules configured for a board
 - `validate_schematic_for_pcb`: Pre-sync completeness check (no kicad-cli required). Verifies every component has a Footprint, references are unique, PWR_FLAG symbols cover power nets, no component sits at (0, 0), net count is non-zero, and optionally runs full ERC if kicad-cli is available. Returns `ready_for_pcb_sync` bool and a `blocking_issues` list. **Must pass before calling `sync_schematic_to_pcb`.**
 - `check_courtyard_overlaps`: Fast file-based courtyard AABB intersection check (milliseconds, no kicad-cli). Returns `passed` bool and a list of overlapping component pairs with `overlap_x_mm`, `overlap_y_mm`, and `suggested_move_mm`. **Must pass before calling `autoroute`.**
+- `identify_edge_facing_connectors`: Detect connectors that need outward-facing placement at a board edge (USB-C, JST PH/XH, audio jacks, barrel jacks, RJ45, HDMI, etc.). Uses three signals, highest confidence first: KiCad library's `Dwgs.User` "PCB edge" marker, F.SilkS centroid asymmetry, and footprint-name heuristics. Returns each ref's `mating_face` in footprint-local frame plus `confidence` and `evidence`. Use this as Phase 4a's survey step in `/build-pcb`.
+- `validate_connector_orientations`: Placement-quality gate for edge-facing connectors. For each ref from `identify_edge_facing_connectors`, applies the placed rotation to the mating-face vector, checks it points toward the closest board edge within ±30°, and accepts any of multiple equidistant edges within 2 mm (corner-placement tolerance). Returns `passed` bool, `violations` (with `suggested_edge` and `suggested_rotation`), and `indeterminate` (refs needing manual review). **Side effect**: writes the result to `<board>.validation_cache.json` so `autoroute` can refuse to run when this most-recent check is missing or failed for the current board hash. **Must pass before calling `autoroute`.**
 
 ### Export Operations (7 tools)
 - `export_gerbers`: Export Gerber manufacturing files from a PCB board
@@ -448,7 +455,7 @@ KiCad-MCP/
 │   ├── backends/
 │   │   └── plugin_direct.py  # PluginDirectBackend — explicit routing, no fallbacks
 │   ├── config.py          # Plugin entry point config (KICAD_PLUGIN_ env prefix)
-│   ├── server.py          # MCP server — registers all 94 tools
+│   ├── server.py          # MCP server — registers all 102 tools
 │   └── __main__.py        # CLI entry point: python -m kicad_mcp_plugin
 ├── kicad_plugin/
 │   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
@@ -493,7 +500,7 @@ The skill enforces the seven-phase workflow described above (Environment & Requi
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 88 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 96 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 

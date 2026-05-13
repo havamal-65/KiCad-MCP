@@ -203,28 +203,39 @@ def find_kicad_executable() -> Path | None:
 
 
 def _check_kicad_process() -> bool:
-    """Perform the actual subprocess check for a running KiCad GUI process."""
+    """Perform the actual subprocess check for a running KiCad GUI process.
+
+    Matches the project manager (kicad) and the standalone editors (pcbnew,
+    eeschema). The bridge runs inside whichever process the user has open, so
+    any of these counts as "KiCad running" for startup-gate purposes.
+    """
     import subprocess
 
     platform = get_platform()
     try:
         if platform == "windows":
             flags = subprocess.CREATE_NO_WINDOW
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq kicad.exe", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                creationflags=flags,
-            )
-            return "kicad.exe" in result.stdout.lower()
+            for name in ("kicad.exe", "pcbnew.exe", "eeschema.exe"):
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    creationflags=flags,
+                )
+                if name.lower() in result.stdout.lower():
+                    return True
+            return False
         else:
-            result = subprocess.run(
-                ["pgrep", "-x", "kicad"],
-                capture_output=True,
-                timeout=5,
-            )
-            return result.returncode == 0
+            for name in ("kicad", "pcbnew", "eeschema"):
+                result = subprocess.run(
+                    ["pgrep", "-x", name],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+            return False
     except Exception as e:
         logger.debug("KiCad process check failed: %s", e)
         return False

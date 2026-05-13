@@ -82,6 +82,50 @@ def test_kicad_not_running():
     assert any("KiCad" in action for action in result["required_actions"])
 
 
+# ---------------------------------------------------------------------------
+# _check_kicad_process — broadened to detect pcbnew/eeschema standalone editors
+# ---------------------------------------------------------------------------
+
+def test_check_kicad_process_detects_pcbnew_only(monkeypatch):
+    """Standalone PCB editor (pcbnew.exe) should count as 'KiCad running'.
+
+    Previously _check_kicad_process only matched kicad.exe (project manager),
+    producing a false FAIL when the user had only the PCB editor open.
+    """
+    import subprocess as sp
+    from kicad_mcp.utils import platform_helper
+
+    # Pretend we're on Windows so the kicad.exe / pcbnew.exe / eeschema.exe path runs
+    monkeypatch.setattr(platform_helper, "get_platform", lambda: "windows")
+    # Avoid a CREATE_NO_WINDOW AttributeError on non-Windows test runners
+    monkeypatch.setattr(sp, "CREATE_NO_WINDOW", 0, raising=False)
+
+    def fake_run(cmd, *a, **kw):
+        # tasklist /FI IMAGENAME eq <name> /NH
+        name = cmd[2].split("eq ", 1)[1].strip()
+        if name == "pcbnew.exe":
+            return sp.CompletedProcess(cmd, 0, stdout="pcbnew.exe   1234 Console\n", stderr="")
+        # All other names: empty output, simulating not running
+        return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert platform_helper._check_kicad_process() is True
+
+
+def test_check_kicad_process_returns_false_when_no_kicad_processes(monkeypatch):
+    import subprocess as sp
+    from kicad_mcp.utils import platform_helper
+
+    monkeypatch.setattr(platform_helper, "get_platform", lambda: "windows")
+    monkeypatch.setattr(sp, "CREATE_NO_WINDOW", 0, raising=False)
+
+    def fake_run(cmd, *a, **kw):
+        return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert platform_helper._check_kicad_process() is False
+
+
 def test_bridge_not_reachable():
     result = _run(bridge_error=ConnectionRefusedError("refused"))
     assert result["ready_for_pcb"] is False

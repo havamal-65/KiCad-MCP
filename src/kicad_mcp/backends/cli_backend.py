@@ -167,9 +167,8 @@ class CLIExportOps(ExportOps):
                 str(path),
             ]
             if layers:
-                for layer in layers:
-                    args.insert(-1, "--layers")
-                    args.insert(-1, layer)
+                args.insert(-1, "--layers")
+                args.insert(-1, ",".join(layers))
 
         result = self._run(args)
         return {

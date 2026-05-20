@@ -30,6 +30,8 @@ htmlcov/
 # KiCad MCP
 .kicad_mcp_backups/
 *.jsonl
+# ChangeLog runtime artifact (written by tests/tools; never a source file)
+changes.json
 
 # Examples (local testing only)
 examples/

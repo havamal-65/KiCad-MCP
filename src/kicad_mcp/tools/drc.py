@@ -450,77 +450,6 @@ def _scan_footprint_pad_centroid(block: str) -> tuple[float, float] | None:
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
-def _scan_footprint_silk_direction(block: str) -> tuple[str, float] | None:
-    """Infer mating-face direction from the *centroid* of F.SilkS segments.
-
-    Horizontal connectors typically have their body silkscreen extending
-    asymmetrically in one direction from the footprint origin (pin 1).
-    The silk centroid lies along that direction — and that direction is
-    where the cable inserts. This works for both USB-C receptacles
-    (body extends toward -y from pads, mating face -y) and JST horizontal
-    connectors (body extends toward +y from pins, mating face +y).
-
-    Returns ``(face, magnitude_mm)`` or ``None`` if silk is too symmetric
-    around the origin to give a clear signal (magnitude < 0.5 mm).
-    """
-    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
-
-    coord_pat = re.compile(r'\(start\s+([-\d.]+)\s+([-\d.]+)\)\s*\(end\s+([-\d.]+)\s+([-\d.]+)\)')
-
-    segments: list[tuple[float, float, float, float]] = []
-    i = 0
-    n = len(block)
-    while i < n:
-        if block[i] != "(":
-            i += 1
-            continue
-        j = i + 1
-        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
-            j += 1
-        token = block[i + 1 : j]
-        if token != "fp_line":
-            i += 1
-            continue
-        end_idx = _walk_balanced_parens(block, i)
-        if end_idx is None:
-            i += 1
-            continue
-        sub = block[i : end_idx + 1]
-        if '"F.SilkS"' in sub:
-            m = coord_pat.search(sub)
-            if m:
-                segments.append((
-                    float(m.group(1)), float(m.group(2)),
-                    float(m.group(3)), float(m.group(4)),
-                ))
-        i = end_idx + 1
-
-    if not segments:
-        return None
-
-    # Length-weighted centroid of silk segments (each segment is treated as a
-    # straight line with weight equal to its length).
-    total_len = 0.0
-    sx_acc = 0.0
-    sy_acc = 0.0
-    for x1, y1, x2, y2 in segments:
-        length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
-        midx = (x1 + x2) / 2.0
-        midy = (y1 + y2) / 2.0
-        sx_acc += midx * length
-        sy_acc += midy * length
-        total_len += length
-
-    if total_len <= 0.0:
-        return None
-    cx = sx_acc / total_len
-    cy = sy_acc / total_len
-    magnitude = (cx * cx + cy * cy) ** 0.5
-    if magnitude < 0.5:
-        return None  # silk too symmetric to give a clear signal
-    return (_classify_footprint_local_face(cx, cy), magnitude)
-
-
 def _name_matches_edge_connector(lib_id: str) -> str | None:
     """Return the first _EDGE_NAME_TOKENS substring matched in lib_id, or None."""
     for token in _EDGE_NAME_TOKENS:
@@ -620,32 +549,25 @@ def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
             })
             continue
 
-        # ---- Signal 2: silk centroid direction (high confidence) -----------
+        # ---- Signal 2: pad-vs-courtyard geometry (medium confidence) -------
         # If the lib_id matches a known edge-connector pattern, infer the
-        # mating face from the asymmetric extension of the silk geometry.
-        # The cable inserts in the direction the connector body extends.
+        # mating face from the connector's pad-to-body geometry. The body
+        # extends from the pad cluster toward the cable opening — so the
+        # vector from the pad centroid toward the courtyard center points
+        # at the mating face. This is reliable for both USB-C horizontal
+        # SMD (pads at back, body extends to mating face) and JST horizontal
+        # (pins near one end, body extends to cable opening at the other).
+        #
+        # An earlier revision used the absolute F.SilkS centroid, but that
+        # signal is computed in the footprint's origin frame — and KiCad's
+        # USB-C SMD footprints have the origin near the body center while
+        # the silk wraps the back shell only. The silk centroid then pointed
+        # opposite the mating face, flipping the rotation gate 180° and
+        # silently passing inward-facing receptacles. Pad-vs-courtyard is
+        # invariant to where the origin sits and is the load-bearing signal.
         matched_token = _name_matches_edge_connector(lib_id)
         if matched_token is None:
             continue
-        silk = _scan_footprint_silk_direction(block)
-        if silk is not None:
-            face, magnitude = silk
-            connectors.append({
-                "ref": ref,
-                "footprint": lib_id,
-                "mating_face": face,
-                "confidence": "high",
-                "evidence": (
-                    f"F.SilkS centroid offset {magnitude:.2f} mm toward {face} "
-                    f"(name match '{matched_token}')"
-                ),
-            })
-            continue
-
-        # Derive mating face from courtyard-vs-pad geometry: the connector
-        # body extends in the direction the cable inserts, so the courtyard
-        # center sits in the body. The mating face direction is the vector
-        # from the pad centroid toward the courtyard center.
         pad_centroid = _scan_footprint_pad_centroid(block)
         cy_center = _scan_footprint_courtyard_center(block)
         if pad_centroid is not None and cy_center is not None:

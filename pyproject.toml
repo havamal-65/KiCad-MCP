@@ -49,6 +49,9 @@ packages = ["src/kicad_mcp", "src/kicad_mcp_plugin"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: requires real KiCad pcbnew + bridge (set KICAD_INTEGRATION=1)",
+]
 
 [tool.ruff]
 target-version = "py310"

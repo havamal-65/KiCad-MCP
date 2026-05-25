@@ -56,6 +56,32 @@ jobs:
           echo "::error::bridge did not become ready within 60s"
           exit 1
 
+      - name: diagnose-bridge-failure
+        if: failure()
+        run: |
+          set +e
+          echo "===== ps for pcbnew/xvfb ====="
+          ps -ef | grep -E "pcbnew|xvfb" | grep -v grep || echo "  (no processes)"
+          echo
+          echo "===== /tmp/pcbnew.stderr (first 100 lines) ====="
+          head -n 100 /tmp/pcbnew.stderr 2>&1 || echo "  (file missing)"
+          echo
+          echo "===== ~/.local/share/kicad tree ====="
+          find ~/.local/share/kicad -maxdepth 4 2>&1 || echo "  (dir missing)"
+          echo
+          echo "===== bridge_startup.log ====="
+          cat ~/.local/share/kicad/9.0/3rdparty/plugins/kicad_mcp_bridge/bridge_startup.log 2>&1 || echo "  (log missing — bridge module never imported)"
+          echo
+          echo "===== pcbnew.json ====="
+          cat ~/.config/kicad/9.0/pcbnew.json 2>&1 || echo "  (pcbnew.json missing)"
+          echo
+          echo "===== port 9760 listeners ====="
+          ss -ltnp 2>&1 | grep 9760 || echo "  (nothing on port 9760)"
+          echo
+          echo "===== which kicad / pcbnew ====="
+          which pcbnew kicad xvfb-run 2>&1
+          pcbnew --version 2>&1 | head -3 || true
+
       - name: run-tests
         env:
           KICAD_INTEGRATION: "1"

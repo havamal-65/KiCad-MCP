@@ -38,6 +38,21 @@ jobs:
           pip install -e ".[dev]"
           kicad-mcp install-bridge --kicad-version 9.0
 
+          # apt-pcbnew 9.0.9 on Ubuntu 24.04 does NOT scan user-level
+          # ~/.local/share/kicad/9.0/scripting/plugins/ at startup
+          # (verified across runs 26420924848, 26423077912, 26423328179,
+          # 26424024433 -- bridge_startup.log never written from there).
+          # Try the system plugin dir alongside; it sits next to KiCad's
+          # bundled kicad_pyshell which pcbnew DOES load on startup, so
+          # the same loader should pick this up.
+          # chown the dir to the runner so the bridge can write its log.
+          sudo mkdir -p /usr/share/kicad/scripting/plugins/kicad_mcp_bridge
+          sudo cp kicad_plugin/kicad_mcp_bridge.py \
+                  /usr/share/kicad/scripting/plugins/kicad_mcp_bridge/__init__.py
+          sudo chown -R runner:runner \
+                  /usr/share/kicad/scripting/plugins/kicad_mcp_bridge
+          ls -la /usr/share/kicad/scripting/plugins/kicad_mcp_bridge/
+
       - name: launch-pcbnew
         run: |
           cp tests/integration/fixtures/blank_board.kicad_pcb /tmp/test_board.kicad_pcb
@@ -79,8 +94,8 @@ jobs:
             fi
           done
           echo
-          echo "===== bridge_startup.log (search anywhere) ====="
-          logs=$(find ~/.local/share/kicad -name bridge_startup.log 2>/dev/null)
+          echo "===== bridge_startup.log (search user + system) ====="
+          logs=$(find ~/.local/share/kicad /usr/share/kicad -name bridge_startup.log 2>/dev/null)
           if [ -z "$logs" ]; then
             echo "  (log not found anywhere — bridge module never imported)"
           else
@@ -137,4 +152,5 @@ jobs:
             /tmp/pcbnew.stderr
             /home/runner/.local/share/kicad/9.0/scripting/plugins/kicad_mcp_bridge/bridge_startup.log
             /home/runner/.local/share/kicad/9.0/3rdparty/plugins/kicad_mcp_bridge/bridge_startup.log
+            /usr/share/kicad/scripting/plugins/kicad_mcp_bridge/bridge_startup.log
           if-no-files-found: warn

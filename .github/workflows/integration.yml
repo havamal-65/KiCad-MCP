@@ -110,11 +110,8 @@ jobs:
           echo "===== which kicad / pcbnew ====="
           which pcbnew kicad xvfb-run 2>&1
           echo
-          echo "===== pcbnew --help (does it accept a --script arg?) ====="
-          xvfb-run -a pcbnew --help 2>&1 | head -50 || true
-          echo
           echo "===== standalone python pcbnew import ====="
-          python3 -c "import pcbnew; print('OK', pcbnew.GetBuildVersion())" 2>&1 || echo "  (standalone import failed)"
+          timeout 10 python3 -c "import pcbnew; print('OK', pcbnew.GetBuildVersion())" 2>&1 || echo "  (standalone import failed or timed out)"
           echo
           echo "===== installed kicad packages ====="
           dpkg -l 2>/dev/null | grep -iE "kicad|pcbnew" || apt list --installed 2>/dev/null | grep -i kicad

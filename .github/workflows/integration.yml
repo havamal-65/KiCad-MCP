@@ -1,0 +1,73 @@
+name: Integration Tests
+
+# Linux/xvfb integration tests against real KiCad pcbnew + bridge.
+# Informational at launch — failing runs do not block merge (the job is
+# kept off the branch-protection required-checks list, not via
+# continue-on-error which would hide signal). Promote to required after
+# >=5 consecutive green runs spanning >=1 calendar week.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration:
+    name: pytest tests/integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: install-kicad
+        run: |
+          sudo add-apt-repository --yes ppa:kicad/kicad-9.0-releases
+          sudo apt-get update
+          sudo apt-get install --install-recommends -y kicad xvfb
+
+      - name: install-bridge
+        run: |
+          pip install -e ".[dev]"
+          kicad-mcp install-bridge --kicad-version 9.0
+
+      - name: launch-pcbnew
+        run: |
+          cp tests/integration/fixtures/blank_board.kicad_pcb /tmp/test_board.kicad_pcb
+          xvfb-run -a pcbnew /tmp/test_board.kicad_pcb > /tmp/pcbnew.stderr 2>&1 &
+          echo $! > /tmp/pcbnew.pid
+
+      - name: wait-for-bridge
+        run: |
+          for i in $(seq 1 60); do
+            if python -c "import socket; s=socket.create_connection(('localhost', 9760), 2); s.close()" 2>/dev/null; then
+              echo "::notice::bridge ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::bridge did not become ready within 60s"
+          exit 1
+
+      - name: run-tests
+        env:
+          KICAD_INTEGRATION: "1"
+        run: |
+          python -m pytest tests/integration -m integration -v --tb=short
+
+      - name: upload-logs-on-failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-failure-logs
+          path: |
+            /tmp/pcbnew.stderr
+            /home/runner/.local/share/kicad/9.0/3rdparty/plugins/kicad_mcp_bridge/bridge_startup.log
+          if-no-files-found: warn

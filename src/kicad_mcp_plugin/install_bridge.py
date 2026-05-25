@@ -147,7 +147,24 @@ def install_bridge(version: str = "9.0", dry_run: bool = False) -> int:
         return 1
 
     plugins_root, scripting_root, pcbnew_json = _detect_kicad_dirs(version)
-    bridge_dir = plugins_root / "kicad_mcp_bridge"
+
+    # On Linux, the apt-installed pcbnew does not auto-import plugins from
+    # 3rdparty/plugins/ at startup — verified empirically in CI (run
+    # 26422190525): the install directory was created, pcbnew.json had the
+    # action_plugins entry, pcbnew was alive, but bridge_startup.log was
+    # never written. KiCad does scan scripting/plugins/ at pcbnew startup,
+    # so on Linux we install there instead.
+    #
+    # The "scripting/plugins is dangerous on Windows" hazard documented in
+    # docs/CLAUDE.md only applies when the kicad project-manager process
+    # pre-loads plugins before pcbnew is importable. Linux pcbnew launched
+    # directly never goes through the project manager.
+    if sys.platform.startswith("linux"):
+        bridge_dir = scripting_root / "kicad_mcp_bridge"
+        clean_dir = plugins_root  # stale copies live in 3rdparty/plugins on Linux
+    else:
+        bridge_dir = plugins_root / "kicad_mcp_bridge"
+        clean_dir = scripting_root  # Windows/macOS: stale copies live in scripting/plugins
     target_file = bridge_dir / "__init__.py"
 
     print(f"KiCad version  : {version}")
@@ -156,10 +173,10 @@ def install_bridge(version: str = "9.0", dry_run: bool = False) -> int:
     print(f"pcbnew.json    : {pcbnew_json}")
     print()
 
-    # Step 1 — remove stale scripting/plugins copies
-    _remove_stale_scripting_copies(scripting_root, dry_run)
+    # Step 1 — remove stale copies from the OTHER plugin dir (platform-dependent)
+    _remove_stale_scripting_copies(clean_dir, dry_run)
 
-    # Step 2 — install bridge as PCM plugin package
+    # Step 2 — install bridge as a Python package
     if dry_run:
         print(f"  Would install: {target_file}")
     else:
@@ -167,7 +184,10 @@ def install_bridge(version: str = "9.0", dry_run: bool = False) -> int:
         shutil.copy2(bridge_source, target_file)
         print(f"  Installed: {target_file}")
 
-    # Step 3 — patch pcbnew.json
+    # Step 3 — patch pcbnew.json. On Linux this is belt-and-braces (the
+    # plugin auto-imports from scripting/plugins anyway), but having the
+    # action_plugins entry costs nothing and makes the plugin discoverable
+    # in the GUI plugin manager.
     _patch_pcbnew_json(pcbnew_json, bridge_dir, dry_run)
 
     port = os.environ.get("KICAD_MCP_PLUGIN_PORT", "9760")

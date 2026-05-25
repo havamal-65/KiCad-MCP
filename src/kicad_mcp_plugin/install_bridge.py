@@ -193,28 +193,38 @@ def install_bridge(version: str = "9.0", dry_run: bool = False) -> int:
 
 
 def main() -> None:
-    """CLI entry point for ``kicad-mcp install-bridge``."""
+    """CLI entry point for ``kicad-mcp``."""
     parser = argparse.ArgumentParser(
-        prog="kicad-mcp install-bridge",
+        prog="kicad-mcp",
+        description="KiCad MCP server administration commands.",
+    )
+    subparsers = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    install_parser = subparsers.add_parser(
+        "install-bridge",
+        help="Install the kicad_mcp_bridge plugin into KiCad's PCM plugins directory.",
         description=(
             "Install the KiCad MCP bridge plugin into the KiCad PCM plugins directory. "
             "Also patches pcbnew.json so KiCad auto-loads the bridge on startup."
         ),
     )
-    parser.add_argument(
+    install_parser.add_argument(
         "--kicad-version",
         default="9.0",
         metavar="VERSION",
         help="KiCad version to target (default: 9.0)",
     )
-    parser.add_argument(
+    install_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be done without making any changes",
     )
 
     args = parser.parse_args()
-    sys.exit(install_bridge(version=args.kicad_version, dry_run=args.dry_run))
+
+    if args.cmd == "install-bridge":
+        sys.exit(install_bridge(version=args.kicad_version, dry_run=args.dry_run))
+    parser.error(f"Unknown command: {args.cmd!r}")  # unreachable; required=True guards it
 
 
 if __name__ == "__main__":

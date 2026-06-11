@@ -38,17 +38,27 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         }, indent=2)
 
     @mcp.tool()
-    def search_footprints(query: str, limit: int = 25) -> str:
+    def search_footprints(query: str, limit: int = 25, project_dir: str = "") -> str:
         """Search for PCB footprints across installed KiCad libraries.
+
+        Searches stock libraries plus everything registered in the global
+        fp-lib-table; pass project_dir to also include the project's own
+        fp-lib-table libraries.
 
         Args:
             query: Search text to match against footprint names (e.g. 'SOIC-8', 'QFP', '0805').
             limit: Maximum number of results to return (default 25).
+            project_dir: Optional project directory whose fp-lib-table should
+                be honored (enables ${KIPRJMOD}-relative project libraries).
 
         Returns:
             JSON with matching footprints (name, library, lib_id).
         """
-        ops = backend.get_library_ops()
+        if project_dir:
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            ops = FileLibraryOps(project_dir=project_dir)
+        else:
+            ops = backend.get_library_ops()
         results = ops.search_footprints(query)
         change_log.record("search_footprints", {"query": query})
         return json.dumps({
@@ -59,25 +69,83 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         }, indent=2)
 
     @mcp.tool()
-    def list_libraries() -> str:
-        """List all available KiCad symbol and footprint libraries.
+    def list_libraries(
+        summary: bool = True,
+        kind: str = "all",
+        name_filter: str = "",
+        limit: int = 0,
+        offset: int = 0,
+        project_dir: str = "",
+    ) -> str:
+        """List available KiCad symbol and footprint libraries.
+
+        Defaults to a compact summary (names + types, no paths) — the full
+        listing for ~310 libraries exceeds the tool response limit. Use the
+        filters to narrow, then summary=False for paths on the narrowed set.
+
+        Args:
+            summary: When True (default), return name/type per library;
+                footprint entries also carry their .kicad_mod count.
+                When False, include full paths.
+            kind: 'all' (default), 'symbols', or 'footprints'.
+            name_filter: Case-insensitive substring filter on library names.
+            limit: Maximum number of entries to return (0 = no limit).
+            offset: Number of matched entries to skip (for pagination).
+            project_dir: Optional project directory whose fp-lib-table should
+                be honored (enables ${KIPRJMOD}-relative project libraries).
 
         Returns:
-            JSON with library names, types, and paths.
+            JSON with total_matched, returned, offset, per-type counts, and
+            the (possibly paginated) libraries list.
         """
-        ops = backend.get_library_ops()
+        if project_dir:
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            ops = FileLibraryOps(project_dir=project_dir)
+        else:
+            ops = backend.get_library_ops()
         libraries = ops.list_libraries()
-        change_log.record("list_libraries", {})
+        change_log.record("list_libraries", {
+            "summary": summary, "kind": kind, "name_filter": name_filter,
+            "limit": limit, "offset": offset,
+        })
 
-        symbol_libs = [l for l in libraries if l.get("type") == "symbol"]
-        footprint_libs = [l for l in libraries if l.get("type") == "footprint"]
+        if kind in ("symbols", "footprints"):
+            want = "symbol" if kind == "symbols" else "footprint"
+            libraries = [l for l in libraries if l.get("type") == want]
+        if name_filter:
+            nf = name_filter.lower()
+            libraries = [l for l in libraries if nf in l.get("name", "").lower()]
+
+        total_matched = len(libraries)
+        symbol_count = sum(1 for l in libraries if l.get("type") == "symbol")
+        footprint_count = sum(1 for l in libraries if l.get("type") == "footprint")
+
+        page = libraries[offset:]
+        if limit > 0:
+            page = page[:limit]
+
+        if summary:
+            entries: list[dict] = []
+            for lib in page:
+                entry: dict = {"name": lib.get("name"), "type": lib.get("type")}
+                if lib.get("type") == "footprint" and lib.get("path"):
+                    try:
+                        from pathlib import Path
+                        entry["entries"] = len(list(Path(lib["path"]).glob("*.kicad_mod")))
+                    except OSError:
+                        pass
+                entries.append(entry)
+        else:
+            entries = page
 
         return json.dumps({
             "status": "success",
-            "total": len(libraries),
-            "symbol_libraries": len(symbol_libs),
-            "footprint_libraries": len(footprint_libs),
-            "libraries": libraries,
+            "total_matched": total_matched,
+            "returned": len(entries),
+            "offset": offset,
+            "symbol_libraries": symbol_count,
+            "footprint_libraries": footprint_count,
+            "libraries": entries,
         }, indent=2)
 
     @mcp.tool()
@@ -242,7 +310,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         }, indent=2)
 
     @mcp.tool()
-    def get_footprint_bounds(lib_id: str) -> str:
+    def get_footprint_bounds(lib_id: str, project_dir: str = "") -> str:
         """Get physical dimensions, courtyard bounds, and NPTH pad info for a footprint.
 
         Returns the courtyard rectangle (F.CrtYd) and pad geometry for any
@@ -253,6 +321,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Args:
             lib_id: Footprint identifier in 'Library:Footprint' format
                     (e.g. 'Resistor_SMD:R_0805_2012Metric').
+            project_dir: Optional project directory whose fp-lib-table should
+                be honored (enables ${KIPRJMOD}-relative project libraries).
 
         Returns:
             JSON with courtyard {xmin, ymin, xmax, ymax}, width_mm, height_mm,
@@ -264,11 +334,15 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
 
-        kicad_mod_text = _load_kicad_mod(lib_id)
+        kicad_mod_text = _load_kicad_mod(lib_id, project_dir or None)
         if kicad_mod_text is None:
             return json.dumps({
                 "status": "error",
-                "message": f"Footprint '{lib_id}' not found in system libraries.",
+                "message": (
+                    f"Footprint '{lib_id}' not found in stock or "
+                    "fp-lib-table-registered libraries. For project-local "
+                    "libraries, pass project_dir."
+                ),
             }, indent=2)
 
         bounds = _parse_footprint_bounds(kicad_mod_text)

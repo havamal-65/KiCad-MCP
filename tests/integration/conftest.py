@@ -9,7 +9,7 @@ Run locally:
     2. Verify the bridge log shows "TCP server started"
     3. ``$env:KICAD_INTEGRATION="1"; pytest tests/integration -v``
 
-See ``tests/integration/README.md`` for full setup, including the CI flow.
+See ``tests/integration/README.md`` for full setup.
 """
 
 from __future__ import annotations

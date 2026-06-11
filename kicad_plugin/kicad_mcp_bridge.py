@@ -340,6 +340,13 @@ def _load_footprint(lib_id: str):
     fp = pcbnew.FootprintLoad(lib_path, fp_name)
     if fp is None:
         raise ValueError(f"Footprint {fp_name!r} not found in {lib_path!r}")
+    # FootprintLoad fills only the item name; restore the library nickname so
+    # the stored FPID round-trips as 'Library:Name' (remove_component returns
+    # it, and KiCad's own update-from-library relies on it).
+    try:
+        fp.SetFPID(pcbnew.LIB_ID(lib_nick, fp_name))
+    except Exception as exc:
+        logger.warning("_load_footprint(%r): could not set FPID: %r", lib_id, exc)
     return fp
 
 

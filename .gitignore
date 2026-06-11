@@ -49,3 +49,7 @@ logs/
 null
 kicad-dev-docs/
 docs/specs/
+
+# Developer-local scratch board used as a throwaway target for the
+# integration test suite (tests/integration/). Never checked in.
+tests/_scratch/

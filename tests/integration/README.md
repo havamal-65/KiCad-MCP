@@ -48,27 +48,14 @@ KICAD_INTEGRATION=1 pytest tests/integration -v
 
 ---
 
-## Running in CI
-
-The `.github/workflows/integration.yml` workflow installs KiCad 9 on
-Ubuntu, installs the bridge, launches pcbnew headlessly under `xvfb`, and
-runs `pytest tests/integration` with `KICAD_INTEGRATION=1`.
-
-The workflow runs on push to `main` and on pull requests. It is allowed
-to fail informationally while the smoke harness is being validated; the
-job is promoted to a required check once green for ~5 consecutive runs.
-
----
-
 ## State isolation strategy
 
 pcbnew has one open board at a time, and `reload_board` is unreliable on
 KiCad 9 (see ROADMAP.md §3.4). Tests therefore follow these rules:
 
-1. **Shared session, one fixture board.** The CI workflow opens
-   `tests/integration/fixtures/blank_board.kicad_pcb` once at startup.
-   Tests use whatever board is open — they do not reopen, and they MUST
-   NOT call `reload_board`.
+1. **Shared session, developer-opened board.** You open any `.kicad_pcb`
+   in pcbnew once at the start of the session. Tests use whatever board
+   is open — they do not reopen, and they MUST NOT call `reload_board`.
 2. **Append-only with ref namespacing.** A test that adds footprints uses
    refs prefixed with its test number (e.g. `T06_R1` for the test
    anchoring REQ-COV-006, `T07_R1` for REQ-COV-007) so concurrently
@@ -84,7 +71,7 @@ KiCad 9 (see ROADMAP.md §3.4). Tests therefore follow these rules:
      destructive to all tracks/vias on the shared board — running it
      earlier would poison any later test that relied on routing state.
 5. **Teardown is best-effort.** The shared board is allowed to accumulate
-   state across a session; CI gets a fresh board each run.
+   state across a session; restart pcbnew between runs for a clean slate.
 
 If a test truly requires an empty board, it must restart pcbnew itself —
 do not assume "clear" state.

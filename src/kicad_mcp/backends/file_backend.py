@@ -41,17 +41,33 @@ logger = get_logger("backend.file")
 # Footprint library helpers used by place_component
 # ---------------------------------------------------------------------------
 
-def _load_kicad_mod(lib_id: str) -> str | None:
+def _load_kicad_mod(lib_id: str, project_dir: str | Path | None = None) -> str | None:
     """Find and return the raw text of the .kicad_mod file for *lib_id*.
 
-    *lib_id* is expected in ``Library:FootprintName`` format.  Returns
-    ``None`` when the file cannot be located.
+    *lib_id* is expected in ``Library:FootprintName`` format.  The library
+    nickname is resolved through the fp-lib-table map (project table >
+    global table > stock install), falling back to a directory-stem scan
+    for directories not registered in any table.  Returns ``None`` when the
+    file cannot be located.
+
+    Args:
+        lib_id: Footprint identifier, e.g. ``"Seeed_XIAO:XIAO-ESP32C3-DIP"``.
+        project_dir: Optional project directory whose fp-lib-table (and
+            ${KIPRJMOD}-relative URIs) should be honored.
     """
     if ":" not in lib_id:
         return None
     lib_name, fp_name = lib_id.split(":", 1)
+
+    from kicad_mcp.utils.fp_lib_table import get_footprint_library_map
+    lib_dir = get_footprint_library_map(project_dir).get(lib_name)
+    if lib_dir is not None:
+        fp_file = lib_dir / f"{fp_name}.kicad_mod"
+        if fp_file.exists():
+            return fp_file.read_text(encoding="utf-8")
+
     from kicad_mcp.utils.kicad_paths import find_footprint_libraries
-    for lib_dir in find_footprint_libraries():
+    for lib_dir in find_footprint_libraries(project_dir):
         if lib_dir.stem == lib_name or lib_dir.stem.replace(".pretty", "") == lib_name:
             fp_file = lib_dir / f"{fp_name}.kicad_mod"
             if fp_file.exists():
@@ -3437,12 +3453,20 @@ class FileDRCOps:
 
 
 class FileLibraryOps(LibraryOps):
-    """Library operations via direct file searching."""
+    """Library operations via direct file searching.
 
-    def __init__(self) -> None:
-        from kicad_mcp.utils.kicad_paths import find_footprint_libraries, find_symbol_libraries
+    Footprint libraries are resolved through the fp-lib-table map
+    (project table > global table > stock install), keyed by table
+    nickname — so custom/3rd-party libraries registered in fp-lib-table
+    are visible, not just the stock install glob.
+    """
+
+    def __init__(self, project_dir: str | Path | None = None) -> None:
+        from kicad_mcp.utils.fp_lib_table import get_footprint_library_map
+        from kicad_mcp.utils.kicad_paths import find_symbol_libraries
         self._symbol_libs = find_symbol_libraries()
-        self._footprint_libs = find_footprint_libraries()
+        self._footprint_map = get_footprint_library_map(project_dir)
+        self._footprint_libs = sorted(set(self._footprint_map.values()))
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
         results = []
@@ -3468,8 +3492,7 @@ class FileLibraryOps(LibraryOps):
     def search_footprints(self, query: str) -> list[dict[str, Any]]:
         results = []
         query_lower = query.lower()
-        for lib_dir in self._footprint_libs:
-            lib_name = lib_dir.stem.replace(".pretty", "")
+        for lib_name, lib_dir in sorted(self._footprint_map.items()):
             for fp_file in lib_dir.glob("*.kicad_mod"):
                 if query_lower in fp_file.stem.lower():
                     results.append({
@@ -3487,9 +3510,9 @@ class FileLibraryOps(LibraryOps):
                 "type": "symbol",
                 "path": str(lib_path),
             })
-        for lib_dir in self._footprint_libs:
+        for lib_name, lib_dir in sorted(self._footprint_map.items()):
             libs.append({
-                "name": lib_dir.stem.replace(".pretty", ""),
+                "name": lib_name,
                 "type": "footprint",
                 "path": str(lib_dir),
             })
@@ -3537,12 +3560,12 @@ class FileLibraryOps(LibraryOps):
             return {"error": f"Invalid lib_id format: {lib_id}. Expected 'Library:Footprint'"}
         lib_name, fp_name = parts
 
-        for lib_dir in self._footprint_libs:
-            if lib_dir.stem.replace(".pretty", "") == lib_name:
-                fp_file = lib_dir / f"{fp_name}.kicad_mod"
-                if fp_file.exists():
-                    tree = parse_sexp_file(fp_file)
-                    return _parse_footprint_detail(tree, lib_name, fp_name)
+        lib_dir = self._footprint_map.get(lib_name)
+        if lib_dir is not None:
+            fp_file = lib_dir / f"{fp_name}.kicad_mod"
+            if fp_file.exists():
+                tree = parse_sexp_file(fp_file)
+                return _parse_footprint_detail(tree, lib_name, fp_name)
         return {"error": f"Footprint not found: {lib_id}"}
 
     def suggest_footprints(self, lib_id: str) -> dict[str, Any]:
@@ -3566,8 +3589,7 @@ class FileLibraryOps(LibraryOps):
         matched: list[dict[str, Any]] = []
         seen: set[str] = set()
 
-        for lib_dir in self._footprint_libs:
-            lib_name = lib_dir.stem.replace(".pretty", "")
+        for lib_name, lib_dir in sorted(self._footprint_map.items()):
             for fp_file in lib_dir.glob("*.kicad_mod"):
                 fp_name = fp_file.stem
                 if fp_name in seen:

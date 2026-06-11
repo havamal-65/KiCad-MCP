@@ -137,6 +137,48 @@ def test_move_component_translation(bridge_session):
     assert abs(saved_y - 52.0) < _POSITION_TOL_MM, at
 
 
+_PROJECT_LIB_MOD = """\
+(footprint "R_Test"
+  (layer "F.Cu")
+  (fp_rect (start -1.5 -1) (end 1.5 1) (layer "F.CrtYd") (width 0.05))
+  (pad "1" smd rect (at -0.9 0) (size 1 1) (layers "F.Cu"))
+  (pad "2" smd rect (at 0.9 0) (size 1 1) (layers "F.Cu"))
+)
+"""
+
+
+def test_place_component_from_project_lib_table(bridge_session):
+    """Known-issues #1 (bridge side): a library registered only in the
+    project fp-lib-table — nickname differing from the .pretty dir name —
+    must resolve inside the bridge's _load_footprint."""
+    path = _board_path()
+    project_dir = Path(path).parent
+
+    lib_dir = project_dir / "T10_Custom.pretty"
+    lib_dir.mkdir(exist_ok=True)
+    (lib_dir / "R_Test.kicad_mod").write_text(_PROJECT_LIB_MOD, encoding="utf-8")
+
+    table = project_dir / "fp-lib-table"
+    entry = '(lib (name T10_TestLib)(type KiCad)(uri "${KIPRJMOD}/T10_Custom.pretty")(options "")(descr "integration fixture"))'
+    if table.exists():
+        content = table.read_text(encoding="utf-8")
+        if "T10_TestLib" not in content:
+            pytest.skip(
+                f"{table} already exists without our entry — not overwriting a developer file"
+            )
+    else:
+        table.write_text(f"(fp_lib_table\n  {entry}\n)\n", encoding="utf-8")
+
+    ref = "T10_R1"
+    _tcp_call(
+        "place_component", 5.0,
+        path=path, reference=ref, footprint="T10_TestLib:R_Test",
+        x=90.0, y=10.0, rotation=0,
+    )
+    comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
+    assert comp is not None, f"{ref} not placed from project fp-lib-table library"
+
+
 def test_move_component_rotation(bridge_session):
     """REQ-COV-009: rotate via move_component; new rotation in saved file."""
     path = _board_path()

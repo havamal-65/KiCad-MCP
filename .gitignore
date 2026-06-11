@@ -53,3 +53,7 @@ docs/specs/
 # Developer-local scratch board used as a throwaway target for the
 # integration test suite (tests/integration/). Never checked in.
 tests/_scratch/
+
+# Runtime diagnostic log the bridge writes next to its module file —
+# created in-repo when tests import kicad_plugin/kicad_mcp_bridge.py.
+kicad_plugin/bridge_startup.log

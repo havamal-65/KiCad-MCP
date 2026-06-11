@@ -144,41 +144,182 @@ def _layer_id(board, layer_name: str) -> int:
     return lid
 
 
+_STOCK_FOOTPRINT_DIRS = [
+    r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
+    r"C:\Program Files\KiCad\8.0\share\kicad\footprints",
+    "/usr/share/kicad/footprints",
+    "/usr/local/share/kicad/footprints",
+]
+
+
+def _parse_fp_lib_table_file(table_path: str) -> dict:
+    """Minimal fp-lib-table parser: returns {nickname: raw URI}.
+
+    Duplicated by design from ``src/kicad_mcp/utils/fp_lib_table.py`` —
+    this file runs inside KiCad's embedded Python and cannot import the
+    MCP package. Skips ``(disabled)`` entries; returns {} on any error.
+    """
+    import re
+    try:
+        with open(table_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return {}
+    entries: dict = {}
+    pos = 0
+    while True:
+        start = text.find("(lib", pos)
+        if start < 0:
+            break
+        depth = 0
+        end = -1
+        for j in range(start, len(text)):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end < 0:
+            break
+        block = text[start:end + 1]
+        pos = end + 1
+        if "(disabled)" in block:
+            continue
+        nm = re.search(r'\(name\s+(?:"([^"]*)"|([^)\s]+))\s*\)', block)
+        um = re.search(r'\(uri\s+(?:"([^"]*)"|([^)\s]+))\s*\)', block)
+        if nm and um:
+            name = nm.group(1) if nm.group(1) is not None else nm.group(2)
+            uri = um.group(1) if um.group(1) is not None else um.group(2)
+            entries[name] = uri
+    return entries
+
+
+def _expand_lib_uri(uri: str, project_dir):
+    """Expand ${VAR} path variables in a lib-table URI; None if unresolvable."""
+    import re
+
+    def _sub(m):
+        var = m.group(1)
+        if var in ("KIPRJMOD", "PROJ_DIR"):
+            if not project_dir:
+                raise KeyError(var)
+            return project_dir
+        val = os.environ.get(var)
+        if val:
+            return val
+        # KiCad path vars are not always exported to os.environ — fall back
+        # to the conventional stock locations for the footprint dir.
+        if re.fullmatch(r"KICAD\d*_FOOTPRINT_DIR", var):
+            for base in _STOCK_FOOTPRINT_DIRS:
+                if os.path.isdir(base):
+                    return base
+        raise KeyError(var)
+
+    try:
+        return re.sub(r"\$\{([^}]+)\}", _sub, uri)
+    except KeyError:
+        return None
+
+
+def _fp_lib_table_candidates():
+    """Paths of (global, project) fp-lib-table files plus the project dir."""
+    import pcbnew
+
+    tables = []  # (table_path, project_dir_or_None)
+    try:
+        settings_dir = pcbnew.SETTINGS_MANAGER.GetUserSettingsPath()
+        candidate = os.path.join(settings_dir, "fp-lib-table")
+        if os.path.isfile(candidate):
+            tables.append((candidate, None))
+    except Exception as exc:
+        logger.info("fp-lib-table: SETTINGS_MANAGER path failed: %r", exc)
+
+    project_dir = None
+    try:
+        board = pcbnew.GetBoard()
+        board_file = board.GetFileName() if board is not None else ""
+        if board_file:
+            project_dir = os.path.dirname(board_file)
+            candidate = os.path.join(project_dir, "fp-lib-table")
+            if os.path.isfile(candidate):
+                tables.append((candidate, project_dir))
+    except Exception as exc:
+        logger.info("fp-lib-table: project dir lookup failed: %r", exc)
+
+    return tables, project_dir
+
+
 def _load_footprint(lib_id: str):
-    """Load a footprint by 'Library:Name', trying multiple KiCad API paths."""
+    """Load a footprint by 'Library:Name', trying multiple KiCad API paths.
+
+    Resolution order: pcbnew's own lib-table API, then a direct parse of
+    the global + project fp-lib-table files (project wins), then stock
+    install directories by nickname. Every failed strategy is recorded and
+    reported in the final error so live failures are diagnosable.
+    """
     import pcbnew
     if ":" not in lib_id:
         raise ValueError(f"footprint must be 'Library:Name' format, got: {lib_id!r}")
     lib_nick, fp_name = lib_id.split(":", 1)
 
-    # Strategy 1: global footprint table (KiCad 8 API name)
+    attempts = []  # diagnostic trail, included in the final error
     lib_path = None
-    try:
-        table = pcbnew.GetGlobalFootprintTable()
-        lib_path = table.FindRow(lib_nick).GetFullURI(True)
-    except AttributeError:
-        pass
 
-    # Strategy 2: FOOTPRINT_LIB_TABLE static accessor (KiCad 9 API)
+    # Strategy 1: pcbnew lib-table API (accessor names vary across versions)
+    for getter in ("GetGlobalFootprintTable",):
+        try:
+            table = getattr(pcbnew, getter)()
+            row = table.FindRow(lib_nick)
+            if row is None:
+                attempts.append(f"{getter}: no row for {lib_nick!r}")
+            else:
+                lib_path = row.GetFullURI(True)
+        except Exception as exc:
+            attempts.append(f"{getter}: {exc!r}")
     if lib_path is None:
         for attr in ("GetGlobalTable", "GetUserTable"):
             try:
                 table = getattr(pcbnew.FOOTPRINT_LIB_TABLE, attr)()
-                lib_path = table.FindRow(lib_nick).GetFullURI(True)
+                row = table.FindRow(lib_nick)
+                if row is None:
+                    attempts.append(f"FOOTPRINT_LIB_TABLE.{attr}: no row for {lib_nick!r}")
+                    continue
+                lib_path = row.GetFullURI(True)
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                attempts.append(f"FOOTPRINT_LIB_TABLE.{attr}: {exc!r}")
+
+    # Strategy 2: parse the fp-lib-table files directly (project shadows global)
+    if lib_path is None:
+        tables, project_dir = _fp_lib_table_candidates()
+        merged = {}
+        for table_path, _tbl_proj in tables:
+            merged.update(_parse_fp_lib_table_file(table_path))
+        if not tables:
+            attempts.append("fp-lib-table: no table files found")
+        uri = merged.get(lib_nick)
+        if uri is None:
+            if tables:
+                attempts.append(
+                    f"fp-lib-table: {lib_nick!r} not in {len(merged)} parsed entries"
+                )
+        else:
+            expanded = _expand_lib_uri(uri, project_dir)
+            if expanded is None:
+                attempts.append(f"fp-lib-table: unresolvable URI {uri!r}")
+            elif not os.path.isdir(expanded):
+                attempts.append(f"fp-lib-table: resolved dir missing: {expanded!r}")
+            else:
+                lib_path = expanded
 
     # Strategy 3: search standard KiCad footprint directories by nickname
     if lib_path is None:
         _search_dirs = [
             os.environ.get("KICAD9_FOOTPRINT_DIR", ""),
             os.environ.get("KICAD8_FOOTPRINT_DIR", ""),
-            r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
-            r"C:\Program Files\KiCad\8.0\share\kicad\footprints",
-            "/usr/share/kicad/footprints",
-            "/usr/local/share/kicad/footprints",
-        ]
+        ] + _STOCK_FOOTPRINT_DIRS
         for base in _search_dirs:
             if not base:
                 continue
@@ -186,13 +327,16 @@ def _load_footprint(lib_id: str):
             if os.path.isdir(candidate):
                 lib_path = candidate
                 break
+        if lib_path is None:
+            attempts.append("stock dirs: no <dir>/" + lib_nick + ".pretty")
 
     if lib_path is None:
+        logger.warning("_load_footprint(%r) failed: %s", lib_id, "; ".join(attempts))
         raise ValueError(
-            f"Could not find library {lib_nick!r}. "
-            "Set KICAD9_FOOTPRINT_DIR to your KiCad footprints directory."
+            f"Could not find library {lib_nick!r}. Tried: " + "; ".join(attempts)
         )
 
+    logger.info("_load_footprint(%r): using %r", lib_id, lib_path)
     fp = pcbnew.FootprintLoad(lib_path, fp_name)
     if fp is None:
         raise ValueError(f"Footprint {fp_name!r} not found in {lib_path!r}")

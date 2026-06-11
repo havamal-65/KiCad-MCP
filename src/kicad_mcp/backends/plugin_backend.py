@@ -173,6 +173,9 @@ class PluginBoardOps(BoardOps):
             kwargs["rotation"] = rotation
         return self._call("move_component", path, **kwargs)
 
+    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+        return self._call("remove_component", path, reference=reference)
+
     def add_track(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float, width: float,

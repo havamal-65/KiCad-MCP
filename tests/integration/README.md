@@ -71,7 +71,11 @@ KiCad 9 (see ROADMAP.md §3.4). Tests therefore follow these rules:
      destructive to all tracks/vias on the shared board — running it
      earlier would poison any later test that relied on routing state.
 5. **Teardown is best-effort.** The shared board is allowed to accumulate
-   state across a session; restart pcbnew between runs for a clean slate.
+   state across a session. Restarting pcbnew is NOT enough for a clean
+   slate — placements are saved into the board file, so a second full run
+   against the same file sees duplicate refs (e.g. two `T08_R1`, and
+   file-content assertions match the stale one). Reset the scratch
+   `.kicad_pcb` to a blank board before relaunching pcbnew for a rerun.
 
 If a test truly requires an empty board, it must restart pcbnew itself —
 do not assume "clear" state.

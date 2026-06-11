@@ -21,6 +21,83 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.schematic")
 
 
+def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str) -> dict:
+    """Swap a PCB footprint for *new_fp*, preserving position/rotation/layer/nets.
+
+    File-backend-first (#2): edits the .kicad_pcb directly so the swap is
+    deterministic and CI-testable; a live pcbnew board must be reloaded
+    afterwards. Ambiguous cases are skipped with a reason — never guessed.
+
+    Returns {"applied": True, "record": {...}} on success, or
+    {"applied": False, "reason": "..."} when skipped.
+    """
+    from kicad_mcp.backends.file_backend import (
+        FileBoardOps,
+        _load_kicad_mod,
+        _parse_footprint_bounds,
+    )
+
+    file_ops = FileBoardOps(project_dir=pcb_p.parent)
+    try:
+        state = file_ops.get_component_state(pcb_p, ref)
+    except ValueError:
+        return {"applied": False, "reason": f"{ref} not found in PCB file"}
+    if state.get("locked"):
+        return {"applied": False, "reason": "footprint is locked"}
+    if state.get("position") is None:
+        return {"applied": False, "reason": "footprint has no (at ...) position"}
+
+    new_mod = _load_kicad_mod(new_fp, pcb_p.parent)
+    if new_mod is None:
+        return {
+            "applied": False,
+            "reason": f"new footprint '{new_fp}' not found in libraries",
+        }
+
+    old_pad_nets: dict[str, str] = state.get("pad_nets", {})
+    new_pad_names = {
+        str(p.get("number"))
+        for p in _parse_footprint_bounds(new_mod)["pads"]
+        if p.get("number")
+    }
+    if old_pad_nets and new_pad_names and not (set(old_pad_nets) & new_pad_names):
+        return {
+            "applied": False,
+            "reason": "pad names incompatible between old and new footprint",
+        }
+
+    removed = file_ops.remove_component(pcb_p, ref)
+    file_ops.place_component(
+        pcb_p, ref, new_fp,
+        removed["position"]["x"], removed["position"]["y"],
+        layer=removed.get("layer") or "F.Cu",
+        rotation=removed.get("rotation", 0.0),
+    )
+
+    unmatched_pads: list[dict[str, str]] = []
+    for pad_name, net in sorted(old_pad_nets.items()):
+        if new_pad_names and pad_name not in new_pad_names:
+            unmatched_pads.append({"pad": pad_name, "net": net})
+            continue
+        try:
+            file_ops.assign_net(pcb_p, ref, pad_name, net)
+        except ValueError:
+            unmatched_pads.append({"pad": pad_name, "net": net})
+
+    return {
+        "applied": True,
+        "record": {
+            "reference": ref,
+            "old_footprint": removed["footprint"],
+            "new_footprint": new_fp,
+            "position": removed["position"],
+            "rotation": removed.get("rotation", 0.0),
+            "nets_reassigned": len(old_pad_nets) - len(unmatched_pads),
+            "unmatched_pads": unmatched_pads,
+        },
+    }
+
+
 def _inject_footprint_sheet_path(pcb_path: Path, reference: str, sheet_path: str) -> None:
     """Add a ``(path "<sheet_path>")`` clause to a placed footprint block.
 
@@ -1165,7 +1242,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **limit_response(result)}, indent=2)
 
     @mcp.tool()
-    def sync_schematic_to_pcb(schematic_path: str, board_path: str) -> str:
+    def sync_schematic_to_pcb(
+        schematic_path: str, board_path: str,
+        apply_footprint_changes: bool = False,
+    ) -> str:
         """Synchronize schematic components to the PCB board.
 
         Reads the schematic and PCB, compares them, and applies safe
@@ -1173,15 +1253,25 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         - Components missing from PCB are placed at auto-positioned locations.
         - Value mismatches are updated on the PCB side.
         - Pin-to-net assignments are propagated from schematic connectivity to PCB pads.
-        - Footprint mismatches and extra PCB components are reported as warnings
-          (not auto-fixed, as they require manual review).
+        - Extra PCB components are reported as warnings (manual review).
+        - Footprint mismatches: warned by default; with
+          apply_footprint_changes=True the PCB footprint is swapped for the
+          schematic's one, preserving position, rotation, layer, and pad
+          nets (matched by pad name). Ambiguous cases — locked footprints,
+          unresolvable new footprints, fully incompatible pad names,
+          multi-unit symbols whose units disagree on footprint — are
+          skipped with a reason, never guessed. Swaps edit the board file
+          directly: if the board is open in pcbnew, reload it afterwards.
 
         Args:
             schematic_path: Path to .kicad_sch file.
             board_path: Path to .kicad_pcb file.
+            apply_footprint_changes: Swap mismatched PCB footprints to match
+                the schematic (default False reports them as warnings only).
 
         Returns:
-            JSON with summary of actions taken and warnings.
+            JSON with summary of actions taken, footprint changes
+            applied/skipped, and warnings.
         """
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
@@ -1208,6 +1298,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # Multi-unit components appear once per unit; merge so the footprint
         # from whichever unit carries it is preserved.
         sch_by_ref: dict[str, dict] = {}
+        conflicting_fp_refs: set[str] = set()
         for sym in sch_data.get("symbols", []):
             ref = sym.get("reference", "")
             if not ref or ref.startswith("#"):
@@ -1218,6 +1309,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 sch_by_ref[ref] = sym
             elif sym.get("footprint") and not sch_by_ref[ref].get("footprint"):
                 sch_by_ref[ref]["footprint"] = sym["footprint"]
+            elif (sym.get("footprint") and sch_by_ref[ref].get("footprint")
+                  and sym["footprint"] != sch_by_ref[ref]["footprint"]):
+                # Multi-unit symbol whose units disagree on footprint —
+                # ambiguous for the swap path, skip-with-reason there.
+                conflicting_fp_refs.add(ref)
 
         pcb_by_ref: dict[str, dict] = {}
         for comp in pcb_data.get("components", []):
@@ -1378,6 +1474,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         # Check mismatches for pre-existing components, and update values for all
         # (including newly placed, which start with the footprint name as Value).
+        footprint_changes_applied: list[dict] = []
+        footprint_changes_skipped: list[dict] = []
         for ref in sorted(set(sch_by_ref) & (set(pcb_by_ref) | placed_refs)):
             sch_sym = sch_by_ref[ref]
             pcb_comp = pcb_by_ref.get(ref)
@@ -1385,13 +1483,45 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             sch_fp = sch_sym.get("footprint", "")
             pcb_fp = pcb_comp.get("footprint", "") if pcb_comp else ""
             if sch_fp and pcb_fp and sch_fp != pcb_fp:
-                warnings.append({
-                    "type": "footprint_mismatch",
-                    "reference": ref,
-                    "schematic_footprint": sch_fp,
-                    "pcb_footprint": pcb_fp,
-                    "message": f"{ref} footprint mismatch: schematic={sch_fp}, pcb={pcb_fp}",
-                })
+                if not apply_footprint_changes:
+                    warnings.append({
+                        "type": "footprint_mismatch",
+                        "reference": ref,
+                        "schematic_footprint": sch_fp,
+                        "pcb_footprint": pcb_fp,
+                        "message": f"{ref} footprint mismatch: schematic={sch_fp}, pcb={pcb_fp}",
+                    })
+                elif ref in conflicting_fp_refs:
+                    footprint_changes_skipped.append({
+                        "reference": ref,
+                        "old_footprint": pcb_fp,
+                        "new_footprint": sch_fp,
+                        "reason": "multi-unit symbol units disagree on footprint",
+                    })
+                else:
+                    create_backup(pcb_p)
+                    try:
+                        swap = _attempt_footprint_swap(pcb_p, ref, sch_fp)
+                    except Exception as exc:
+                        swap = {"applied": False, "reason": f"swap failed: {exc}"}
+                    if swap["applied"]:
+                        footprint_changes_applied.append(swap["record"])
+                        actions.append({
+                            "type": "footprint_swapped",
+                            **swap["record"],
+                        })
+                        # The freshly embedded footprint carries the .kicad_mod's
+                        # own Value text — blank the stale read so the value-update
+                        # pass below rewrites it to the schematic's value.
+                        if pcb_comp is not None:
+                            pcb_comp["value"] = ""
+                    else:
+                        footprint_changes_skipped.append({
+                            "reference": ref,
+                            "old_footprint": pcb_fp,
+                            "new_footprint": sch_fp,
+                            "reason": swap["reason"],
+                        })
 
             sch_val = sch_sym.get("value", "")
             pcb_val = pcb_comp.get("value", "") if pcb_comp else ""
@@ -1590,21 +1720,45 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     "message": "Board modify backend not available; schematic nets were not synced to PCB pads.",
                 })
 
+        # Footprint swaps bypass any live pcbnew board (file-backend-first);
+        # warn once that the in-memory board is now stale.
+        if footprint_changes_applied and not isinstance(pcb_ops, FileBoardOps):
+            warnings.append({
+                "type": "board_reload_required",
+                "message": (
+                    "Footprint swaps edited the board file directly; reload the "
+                    "board in pcbnew (reload_board) before further live-board "
+                    "operations."
+                ),
+            })
+
         summary = {
             "components_placed": sum(1 for a in actions if a["type"] == "placed"),
             "values_updated": sum(1 for a in actions if a["type"] == "value_updated"),
             "nets_assigned": sum(1 for a in actions if a["type"] == "net_assigned"),
+            "footprint_changes_applied": len(footprint_changes_applied),
+            "footprint_changes_skipped": len(footprint_changes_skipped),
             "warnings": len(warnings),
         }
 
         change_log.record(
             "sync_schematic_to_pcb",
-            {"schematic_path": schematic_path, "board_path": board_path},
+            {
+                "schematic_path": schematic_path,
+                "board_path": board_path,
+                "apply_footprint_changes": apply_footprint_changes,
+            },
             file_modified=board_path,
         )
         return json.dumps({
             "status": "success",
-            **limit_response({"summary": summary, "actions": actions, "warnings": warnings}),
+            **limit_response({
+                "summary": summary,
+                "actions": actions,
+                "footprint_changes_applied": footprint_changes_applied,
+                "footprint_changes_skipped": footprint_changes_skipped,
+                "warnings": warnings,
+            }),
         }, indent=2)
 
     @mcp.tool()

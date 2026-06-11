@@ -79,7 +79,7 @@ def test_anchor_offset_aligns_courtyard_top_left_to_cursor(asymmetric_board: Pat
       courtyard xmin=-2, ymin=-10
       → expected anchor = (cursor.x - xmin, cursor.y - ymin) = (12.5, 20.5)
     """
-    def fake_load(lib_id: str):
+    def fake_load(lib_id: str, project_dir=None):
         return ASYMMETRIC_KICAD_MOD
 
     ops = FileBoardOps()
@@ -115,7 +115,7 @@ def test_no_overlap_after_placement_with_asymmetric_neighbour(tmp_path: Path):
         {"ref": "R1", "footprint_lib_id": "Test:R0402", "at_x": 0.0, "at_y": 0.0},
     ), encoding="utf-8")
 
-    def fake_load(lib_id: str):
+    def fake_load(lib_id: str, project_dir=None):
         if "Asymmetric" in lib_id:
             return ASYMMETRIC_KICAD_MOD
         return SYMMETRIC_0402_MOD

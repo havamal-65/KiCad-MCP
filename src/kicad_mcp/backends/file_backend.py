@@ -394,8 +394,78 @@ def _move_lib_symbol_before_child(content: str, parent_lib_id: str, child_lib_id
     return content
 
 
+def _footprint_state_from_block(block: str) -> dict[str, Any]:
+    """Extract placement state from a PCB ``(footprint ...)`` block.
+
+    Returns the footprint lib_id, position, rotation, layer, locked flag, and
+    pad→net map — the payload ``remove_component`` hands to callers that
+    re-place a different footprint at the same location (#2 footprint swaps).
+    """
+    state: dict[str, Any] = {
+        "footprint": None,
+        "position": None,
+        "rotation": 0.0,
+        "layer": None,
+        "locked": False,
+        "pad_nets": {},
+    }
+
+    lib_match = re.match(r'\(footprint\s+"([^"]+)"', block)
+    if lib_match:
+        state["footprint"] = lib_match.group(1)
+
+    # Footprint-level (at x y [rot]) — first occurrence precedes any
+    # property-level (at ...) clauses in the KiCad format.
+    at_match = re.search(r'\(at\s+(-?[\d.]+)\s+(-?[\d.]+)(?:\s+(-?[\d.]+))?\s*\)', block)
+    if at_match:
+        state["position"] = {"x": float(at_match.group(1)), "y": float(at_match.group(2))}
+        if at_match.group(3):
+            state["rotation"] = float(at_match.group(3))
+
+    layer_match = re.search(r'\(layer\s+"([^"]+)"\)', block)
+    if layer_match:
+        state["layer"] = layer_match.group(1)
+
+    # KiCad 9 writes (locked yes); older boards use a bare token after the lib id.
+    if re.search(r'\(locked\s+yes\)', block) or re.match(
+        r'\(footprint\s+"[^"]*"\s+locked\b', block
+    ):
+        state["locked"] = True
+
+    # Pad → net map. Multiple physical pads may share a logical name (e.g.
+    # thermal via arrays); they always carry the same net, so a name-keyed
+    # dict is lossless for net re-assignment.
+    search_start = 0
+    while True:
+        idx = block.find("(pad ", search_start)
+        if idx == -1:
+            break
+        end = _walk_balanced_parens(block, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+        pad_block = block[idx:end + 1]
+        name_match = re.match(r'\(pad\s+(?:"([^"]*)"|([^\s()]+))', pad_block)
+        net_match = re.search(r'\(net\s+\d+\s+"([^"]*)"\)', pad_block)
+        if name_match:
+            pad_name = (
+                name_match.group(1) if name_match.group(1) is not None
+                else name_match.group(2)
+            )
+            if pad_name and net_match and net_match.group(1):
+                state["pad_nets"][pad_name] = net_match.group(1)
+        search_start = end + 1
+
+    return state
+
+
 class FileBoardOps(BoardOps):
     """Read-only board operations via direct file parsing."""
+
+    def __init__(self, project_dir: str | Path | None = None) -> None:
+        # Footprint placement resolves lib_ids through the project fp-lib-table
+        # when set (#2 footprint swaps pass the board's directory here).
+        self._project_dir = project_dir
 
     def read_board(self, path: Path) -> dict[str, Any]:
         info = self.get_board_info(path)
@@ -518,7 +588,7 @@ class FileBoardOps(BoardOps):
         import uuid as _uuid
         fp_uuid = str(_uuid.uuid4())
 
-        kicad_mod = _load_kicad_mod(footprint)
+        kicad_mod = _load_kicad_mod(footprint, self._project_dir)
         if kicad_mod:
             fp_sexp = _embed_kicad_mod_as_pcb_footprint(
                 kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
@@ -591,6 +661,32 @@ class FileBoardOps(BoardOps):
             "position": {"x": x, "y": y},
             "rotation": new_rot,
         }
+
+    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+        """Remove a footprint from the board, returning its captured state.
+
+        The payload (footprint lib_id, position, rotation, layer, locked,
+        pad→net map) is what sync_schematic_to_pcb consumes to re-place a
+        swapped footprint at the same location with the same nets.
+        """
+        content = path.read_text(encoding="utf-8")
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
+        start, end = location
+        state = _footprint_state_from_block(content[start:end + 1])
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {"reference": reference, "removed": True, **state}
+
+    def get_component_state(self, path: Path, reference: str) -> dict[str, Any]:
+        """Capture a footprint's placement state without modifying the board."""
+        content = path.read_text(encoding="utf-8")
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
+        start, end = location
+        return {"reference": reference, **_footprint_state_from_block(content[start:end + 1])}
 
     def add_track(
         self, path: Path, start_x: float, start_y: float,
@@ -976,7 +1072,7 @@ class FileBoardOps(BoardOps):
                 warnings.append(f"Skipping {ref or '?'}: no footprint assigned")
                 continue
 
-            kicad_mod = _load_kicad_mod(fp)
+            kicad_mod = _load_kicad_mod(fp, self._project_dir)
             if kicad_mod is None:
                 warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
                 w, h = 5.0, 5.0
@@ -1286,7 +1382,7 @@ class FileBoardOps(BoardOps):
 
             try:
                 fp_uuid = str(_uuid.uuid4())
-                kicad_mod = _load_kicad_mod(footprint)
+                kicad_mod = _load_kicad_mod(footprint, self._project_dir)
                 if kicad_mod:
                     fp_sexp = _embed_kicad_mod_as_pcb_footprint(
                         kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid

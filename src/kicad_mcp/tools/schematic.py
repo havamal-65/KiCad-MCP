@@ -724,37 +724,105 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         )
         return json.dumps({"status": "success", **result}, indent=2)
 
-    @mcp.tool()
-    def remove_component(path: str, reference: str) -> str:
-        """Remove a component symbol from the schematic by reference designator.
-
-        Completely removes the symbol instance block (e.g. the placed R1 resistor)
-        from the schematic file. This does NOT remove associated wires or labels.
-        Power symbols such as #PWR001 or #FLG01 can also be removed.
-
-        Args:
-            path: Path to .kicad_sch file.
-            reference: Reference designator of the component to remove (e.g. 'R1', 'U3', '#PWR031').
-
-        Returns:
-            JSON confirming removal.
-        """
-        p = validate_kicad_path(path, ".kicad_sch")
-        validate_reference(reference)
-
-        backup = create_backup(p)
+    def _remove_schematic_component(sch_p: Path, reference: str) -> dict:
+        backup = create_backup(sch_p)
         ops = backend.get_schematic_modify_ops()
-        try:
-            result = ops.remove_component(p, reference)
-        except ValueError as exc:
-            return json.dumps({"status": "error", "message": str(exc)})
+        result = ops.remove_component(sch_p, reference)
         change_log.record(
             "remove_component",
-            {"path": path, "reference": reference},
-            file_modified=path,
+            {"path": str(sch_p), "reference": reference, "scope": "schematic"},
+            file_modified=str(sch_p),
             backup_path=str(backup) if backup else None,
         )
-        return json.dumps({"status": "success", **result}, indent=2)
+        return result
+
+    def _remove_board_component(pcb_p: Path, reference: str) -> dict:
+        """Bridge-first footprint removal with file-backend fallback (#3)."""
+        from kicad_mcp.backends.file_backend import FileBoardOps
+        from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
+        backup = create_backup(pcb_p)
+        try:
+            result = backend.get_board_modify_ops().remove_component(pcb_p, reference)
+        except (BridgeTemporarilyUnavailableError, NotImplementedError):
+            result = FileBoardOps().remove_component(pcb_p, reference)
+        change_log.record(
+            "remove_component",
+            {"path": str(pcb_p), "reference": reference, "scope": "pcb"},
+            file_modified=str(pcb_p),
+            backup_path=str(backup) if backup else None,
+        )
+        return result
+
+    @mcp.tool()
+    def remove_component(path: str, reference: str, scope: str = "schematic") -> str:
+        """Remove a component from the schematic and/or PCB by reference designator.
+
+        scope="schematic" (default) removes the symbol instance block from the
+        .kicad_sch file. This does NOT remove associated wires or labels.
+        Power symbols such as #PWR001 or #FLG01 can also be removed.
+
+        scope="pcb" removes the footprint from the .kicad_pcb file (live board
+        when the bridge is up, file edit otherwise) and returns the captured
+        placement state: footprint lib_id, position, rotation, layer, locked,
+        and the pad→net map — everything needed to re-place a replacement
+        footprint at the same spot.
+
+        scope="both" removes from both files; pass either file's path and the
+        sibling is derived by swapping the extension.
+
+        Args:
+            path: Path to .kicad_sch (scope=schematic), .kicad_pcb (scope=pcb),
+                  or either (scope=both).
+            reference: Reference designator to remove (e.g. 'R1', 'U3', '#PWR031').
+            scope: "schematic", "pcb", or "both".
+
+        Returns:
+            JSON confirming removal; for pcb/both, includes the captured state.
+        """
+        if scope not in ("schematic", "pcb", "both"):
+            return json.dumps({
+                "status": "error",
+                "message": f"Invalid scope '{scope}' — use 'schematic', 'pcb', or 'both'.",
+            })
+        validate_reference(reference)
+
+        if scope == "schematic":
+            sch_p = validate_kicad_path(path, ".kicad_sch")
+            try:
+                result = _remove_schematic_component(sch_p, reference)
+            except ValueError as exc:
+                return json.dumps({"status": "error", "message": str(exc)})
+            return json.dumps({"status": "success", **result}, indent=2)
+
+        if scope == "pcb":
+            pcb_p = validate_kicad_path(path, ".kicad_pcb")
+            try:
+                result = _remove_board_component(pcb_p, reference)
+            except ValueError as exc:
+                return json.dumps({"status": "error", "message": str(exc)})
+            return json.dumps({"status": "success", **result}, indent=2)
+
+        # scope == "both": derive the sibling file from whichever was given
+        base = Path(path)
+        sch_p = validate_kicad_path(str(base.with_suffix(".kicad_sch")), ".kicad_sch")
+        pcb_p = validate_kicad_path(str(base.with_suffix(".kicad_pcb")), ".kicad_pcb")
+
+        sides: dict[str, dict] = {}
+        errors = 0
+        try:
+            sides["schematic"] = _remove_schematic_component(sch_p, reference)
+        except ValueError as exc:
+            sides["schematic"] = {"error": str(exc)}
+            errors += 1
+        try:
+            sides["pcb"] = _remove_board_component(pcb_p, reference)
+        except ValueError as exc:
+            sides["pcb"] = {"error": str(exc)}
+            errors += 1
+
+        status = "success" if errors == 0 else ("partial" if errors == 1 else "error")
+        return json.dumps({"status": status, "scope": scope, **sides}, indent=2)
 
     @mcp.tool()
     def remove_wire(

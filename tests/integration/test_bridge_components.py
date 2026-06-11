@@ -179,6 +179,42 @@ def test_place_component_from_project_lib_table(bridge_session):
     assert comp is not None, f"{ref} not placed from project fp-lib-table library"
 
 
+def test_remove_component_returns_state(bridge_session):
+    """Known-issues #3 (bridge side): remove_component deletes the footprint
+    from the live board AND returns the captured placement state (position,
+    rotation, layer, pad→net map) that the footprint-swap path consumes."""
+    path = _board_path()
+    ref = "T11_R1"
+    _tcp_call(
+        "place_component", 5.0,
+        path=path, reference=ref, footprint=_RESISTOR_FP,
+        x=110.0, y=10.0, rotation=90,
+    )
+    _tcp_call("assign_net", 5.0, path=path, reference=ref, pad="1", net="T11_NET")
+
+    result = _tcp_call("remove_component", 10.0, path=path, reference=ref)
+
+    assert result["removed"] is True, result
+    assert result["reference"] == ref
+    assert result["footprint"] == _RESISTOR_FP, result
+    assert abs(result["position"]["x"] - 110.0) < _POSITION_TOL_MM, result
+    assert abs(result["position"]["y"] - 10.0) < _POSITION_TOL_MM, result
+    assert abs(result["rotation"] - 90.0) < 0.01, result
+    assert result["pad_nets"].get("1") == "T11_NET", result
+
+    # Gone from the live board and from the saved file.
+    components = _tcp_call("get_components", 5.0, path=path)
+    assert _find_component(components, ref) is None, f"{ref} still on board after removal"
+    assert _find_at_in_file(path, ref) is None, f"{ref} still in saved file after removal"
+
+
+def test_remove_component_unknown_ref_errors(bridge_session):
+    """Removing a nonexistent ref must raise a bridge error, not silently pass."""
+    path = _board_path()
+    with pytest.raises(RuntimeError, match="T11_NOPE"):
+        _tcp_call("remove_component", 10.0, path=path, reference="T11_NOPE")
+
+
 def test_move_component_rotation(bridge_session):
     """REQ-COV-009: rotate via move_component; new rotation in saved file."""
     path = _board_path()

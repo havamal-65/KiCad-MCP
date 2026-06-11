@@ -663,6 +663,47 @@ def _handle_move_component(path: str, reference: str,
     return _run_on_main_thread(_do)
 
 
+def _handle_remove_component(path: str, reference: str) -> dict[str, Any]:
+    """Remove a footprint, returning its captured placement state.
+
+    The payload mirrors FileBoardOps.remove_component (footprint lib_id,
+    position, rotation, layer, locked, pad→net map) so the footprint-swap
+    consumer (#2) works against either backend.
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        for fp in board.GetFootprints():
+            if fp.GetReference() != reference:
+                continue
+            pos = fp.GetPosition()
+            try:
+                lib_id = str(fp.GetFPID().GetUniStringLibId())
+            except Exception:
+                lib_id = None
+            pad_nets = {}
+            for pad in fp.Pads():
+                # PAD.GetName was renamed GetNumber across KiCad versions
+                name = (pad.GetNumber() if hasattr(pad, "GetNumber")
+                        else pad.GetName())
+                net = pad.GetNetname()
+                if name and net:
+                    pad_nets[str(name)] = str(net)
+            state = {
+                "footprint": lib_id,
+                "position": {"x": pcbnew.ToMM(pos.x), "y": pcbnew.ToMM(pos.y)},
+                "rotation": fp.GetOrientationDegrees(),
+                "layer": fp.GetLayerName(),
+                "locked": bool(fp.IsLocked()),
+                "pad_nets": pad_nets,
+            }
+            board.Remove(fp)
+            _save_and_refresh(board)
+            return {"reference": reference, "removed": True, **state}
+        raise ValueError(f"Component {reference!r} not found on board")
+    return _run_on_main_thread(_do)
+
+
 def _handle_add_track(path: str, start_x: float, start_y: float,
                       end_x: float, end_y: float, width: float,
                       layer: str = "F.Cu", net: str = "") -> dict[str, Any]:
@@ -1000,6 +1041,9 @@ _DISPATCH = {
     ),
     "move_component":     lambda req: _handle_move_component(
         req["path"], req["reference"], req["x"], req["y"], req.get("rotation"),
+    ),
+    "remove_component":   lambda req: _handle_remove_component(
+        req["path"], req["reference"],
     ),
     "add_track":          lambda req: _handle_add_track(
         req["path"], req["start_x"], req["start_y"], req["end_x"], req["end_y"],

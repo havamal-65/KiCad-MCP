@@ -67,6 +67,11 @@ class BoardOps(ABC):
         """Move a component to a new position."""
         raise NotImplementedError("This backend does not support board modification")
 
+    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+        """Remove a footprint from the board, returning its captured state
+        (footprint lib_id, position, rotation, layer, locked, pad→net map)."""
+        raise NotImplementedError("This backend does not support board modification")
+
     def add_track(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float, width: float,

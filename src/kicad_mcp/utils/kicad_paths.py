@@ -123,17 +123,22 @@ def find_symbol_libraries() -> list[Path]:
     return sorted(libraries)
 
 
-def find_footprint_libraries() -> list[Path]:
+def find_footprint_libraries(project_dir: str | Path | None = None) -> list[Path]:
     """Find all .pretty footprint library directories.
 
+    Includes the stock install libraries plus every resolvable entry from
+    the global fp-lib-table and, when *project_dir* is given, the project's
+    own fp-lib-table.
+
+    Args:
+        project_dir: Optional project directory whose fp-lib-table (and
+            ${KIPRJMOD}-relative URIs) should be honored.
+
     Returns:
-        List of paths to footprint library directories.
+        Sorted, de-duplicated list of footprint library directories.
     """
-    libraries: list[Path] = []
-    for base_path in get_system_library_paths():
-        if base_path.name == "footprints":
-            libraries.extend(base_path.glob("*.pretty"))
-    return sorted(libraries)
+    from kicad_mcp.utils.fp_lib_table import get_footprint_library_map
+    return sorted(set(get_footprint_library_map(project_dir).values()))
 
 
 def resolve_project_files(project_path: str | Path) -> dict[str, Path | None]:

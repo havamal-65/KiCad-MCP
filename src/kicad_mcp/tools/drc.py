@@ -18,6 +18,177 @@ from kicad_mcp.utils.validation import validate_kicad_path
 logger = get_logger("tools.drc")
 
 
+# ---------------------------------------------------------------------------
+# Symbol/footprint pair validator helpers (§6.2)
+# ---------------------------------------------------------------------------
+
+def _collect_all_real_symbols(root_sch_path: Path) -> list[dict[str, Any]]:
+    """Walk every sub-sheet from *root_sch_path* and return a flat list of real symbols.
+
+    "Real" means not power and reference does not start with "#" — matching the
+    filter used by ``run_validate_schematic_for_pcb``. Each returned dict carries
+    the schematic's ``reference``, ``lib_id``, and ``footprint`` fields plus a
+    ``_sheet_path`` (str) so error messages can name the originating file.
+    Circular sheet references are skipped (first occurrence wins).
+    """
+    from kicad_mcp.backends.file_backend import FileSchematicOps
+
+    sch_ops = FileSchematicOps()
+    visited: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    def _walk(p: Path) -> None:
+        resolved = str(p.resolve())
+        if resolved in visited:
+            return
+        visited.add(resolved)
+        try:
+            data = sch_ops.read_schematic(p)
+        except Exception:
+            return  # malformed sub-sheet — let the existing parse_error path handle it
+        for sym in data.get("symbols", []):
+            ref = sym.get("reference", "")
+            if sym.get("is_power"):
+                continue
+            if ref.startswith("#"):
+                continue
+            sym["_sheet_path"] = str(p)
+            out.append(sym)
+        for sh in data.get("sheets", []):
+            sheetfile = sh.get("sheetfile", "")
+            if not sheetfile:
+                continue
+            child_path = p.parent / sheetfile
+            if child_path.exists():
+                _walk(child_path)
+
+    _walk(root_sch_path)
+    return out
+
+
+def _classify_fp_resolution_failure(lib_name: str) -> str:
+    """Distinguish a missing footprint library from a missing footprint file inside one."""
+    from kicad_mcp.utils.kicad_paths import find_footprint_libraries
+    for lib_dir in find_footprint_libraries():
+        if lib_dir.stem == lib_name or lib_dir.stem.replace(".pretty", "") == lib_name:
+            return "footprint file not found"
+    return "library not found"
+
+
+def run_validate_symbol_footprint_pairs(sch_path: Path) -> dict[str, Any]:
+    """Verify every symbol's Footprint field resolves and its pin set is a
+    subset of the footprint's pad set.
+
+    Walks all sub-sheets, de-duplicates by reference (multi-unit instances),
+    skips symbols with empty Footprint (those are caught by check 1 of
+    ``run_validate_schematic_for_pcb``), and returns the shape documented in
+    docs/specs/symbol-footprint-validator/spec.md §4.2. Read-only.
+    """
+    from kicad_mcp.backends.file_backend import (
+        FileLibraryOps,
+        _load_kicad_mod,
+        _parse_footprint_detail,
+    )
+    from kicad_mcp.utils.sexp_parser import parse_sexp_content
+
+    mismatches: list[dict[str, Any]] = []
+    unresolvable: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    LIMIT = 20
+
+    symbols = _collect_all_real_symbols(sch_path)
+    lib_ops = FileLibraryOps()
+
+    seen_refs: set[str] = set()
+    checked = 0
+    for sym in symbols:
+        ref = sym.get("reference", "")
+        if ref in seen_refs:
+            continue
+        seen_refs.add(ref)
+        checked += 1
+
+        fp_lib_id = sym.get("footprint", "") or ""
+        if not fp_lib_id:
+            continue
+
+        fp_text = _load_kicad_mod(fp_lib_id)
+        if fp_text is None:
+            lib_name = fp_lib_id.split(":", 1)[0] if ":" in fp_lib_id else fp_lib_id
+            reason = _classify_fp_resolution_failure(lib_name)
+            unresolvable.append({
+                "ref": ref, "footprint": fp_lib_id, "reason": reason,
+            })
+            continue
+
+        sym_lib_id = sym.get("lib_id", "") or ""
+        sym_info = lib_ops.get_symbol_info(sym_lib_id)
+        if "error" in sym_info:
+            unresolvable.append({
+                "ref": ref, "footprint": fp_lib_id,
+                "reason": "symbol library not found",
+            })
+            continue
+
+        S = {
+            str(p.get("number", ""))
+            for p in sym_info.get("pins", [])
+            if p.get("number")
+        }
+
+        try:
+            fp_tree = parse_sexp_content(fp_text, source=fp_lib_id)
+            fp_detail = _parse_footprint_detail(fp_tree, *fp_lib_id.split(":", 1))
+        except Exception:
+            unresolvable.append({
+                "ref": ref, "footprint": fp_lib_id,
+                "reason": "footprint file not parseable",
+            })
+            continue
+
+        F = {
+            str(p.get("number", ""))
+            for p in fp_detail.get("pads", [])
+            if p.get("number")
+        }
+
+        missing = S - F
+        extra = F - S
+        if missing:
+            mismatches.append({
+                "ref": ref,
+                "footprint": fp_lib_id,
+                "symbol_pins": sorted(S),
+                "footprint_pads": sorted(F),
+                "missing": sorted(missing),
+            })
+        if extra:
+            warnings.append({
+                "ref": ref,
+                "footprint": fp_lib_id,
+                "extra_pads": sorted(extra),
+                "reason": (
+                    "footprint has pads not referenced by symbol "
+                    "(likely mechanical / thermal / NC)"
+                ),
+            })
+
+    over_limit = False
+    for arr in (mismatches, unresolvable, warnings):
+        if len(arr) > LIMIT:
+            over_limit = True
+            del arr[LIMIT:]
+
+    return {
+        "passed": not (mismatches or unresolvable),
+        "checked": checked,
+        "mismatches": mismatches,
+        "unresolvable": unresolvable,
+        "warnings": warnings,
+        "over_limit": over_limit,
+    }
+
+
 def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
     """File-based schematic completeness check before PCB sync.
 
@@ -1318,6 +1489,33 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         p = validate_kicad_path(path, ".kicad_sch")
         result = run_validate_schematic_for_pcb(p)
         change_log.record("validate_schematic_for_pcb", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def validate_symbol_footprint_pairs(path: str) -> str:
+        """Verify every symbol's Footprint field resolves and matches pad numbering.
+
+        For each non-power component (walking sub-sheets recursively):
+          - Loads the .kicad_mod that the symbol's Footprint property points at.
+          - Compares the symbol's pin numbers to the footprint's pad numbers.
+          - Reports mismatches (symbol pin missing from footprint = blocking),
+            unresolvable footprint or symbol-library references (= blocking), and
+            extras (pads with no symbol pin = warning, usually mechanical /
+            thermal / NC).
+
+        Read-only; no writes anywhere. Lists are capped at 20 entries each;
+        ``over_limit`` becomes true when any list was truncated.
+
+        Args:
+            path: Path to .kicad_sch file (root sheet).
+
+        Returns:
+            JSON with passed (bool), checked (int), mismatches, unresolvable,
+            warnings, over_limit.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        result = run_validate_symbol_footprint_pairs(p)
+        change_log.record("validate_symbol_footprint_pairs", {"path": path})
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()

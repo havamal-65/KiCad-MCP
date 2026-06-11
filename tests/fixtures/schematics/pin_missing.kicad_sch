@@ -1,0 +1,16 @@
+(kicad_sch
+  (version 20241229)
+  (generator "test_fixture")
+  (generator_version "9.0")
+  (uuid "00000000-0000-0000-0000-000000000002")
+  (paper "A4")
+  (symbol
+    (lib_id "TestPkg:U_5pin")
+    (at 50.8 50.8 0)
+    (unit 1)
+    (uuid "00000000-0000-0000-0000-00000000bb01")
+    (property "Reference" "U1" (at 52 49 0))
+    (property "Value" "U_5pin" (at 52 53 0))
+    (property "Footprint" "TestPkg:R_4pad" (at 50.8 50.8 0))
+  )
+)

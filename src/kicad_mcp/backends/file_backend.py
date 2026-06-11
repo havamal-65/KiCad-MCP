@@ -1417,7 +1417,14 @@ class FileSchematicOps(SchematicOps):
                     elif prop_key == "Footprint":
                         symbol_data["footprint"] = prop.value
             if hasattr(sym, "lib_id"):
-                lib_id_str = str(sym.lib_id)
+                li = sym.lib_id
+                # kicad-skip's ParsedValue.__str__ returns the raw source text
+                # ("    lib_id = power:PWR_FLAG\n"). Use .value when present —
+                # str() corrupts the value and makes is_power always False.
+                if hasattr(li, "value") and isinstance(li.value, str):
+                    lib_id_str = li.value
+                else:
+                    lib_id_str = str(li)
                 symbol_data["lib_id"] = lib_id_str
                 symbol_data["is_power"] = lib_id_str.startswith("power:")
             if hasattr(sym, "at"):

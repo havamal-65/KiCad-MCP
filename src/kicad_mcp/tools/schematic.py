@@ -972,6 +972,81 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def remove_label(
+        path: str, x: float, y: float, text: str | None = None,
+    ) -> str:
+        """Remove a net label from the schematic at the given position.
+
+        Matches local, global, and hierarchical labels by position within a
+        small tolerance (0.01 mm). Pass `text` to disambiguate when several
+        labels sit close together. Use read_schematic to find exact label
+        positions; a no-match error lists the nearest labels.
+
+        Args:
+            path: Path to .kicad_sch file.
+            x: X position of the label.
+            y: Y position of the label.
+            text: Optional label text that must also match.
+
+        Returns:
+            JSON confirming removal (includes the removed text and label type).
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.remove_label(p, x, y, text=text)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "remove_label",
+            {"path": path, "x": x, "y": y, "text": text},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def set_label_text(
+        path: str, x: float, y: float, new_text: str,
+        old_text: str | None = None,
+    ) -> str:
+        """Rename a net label in the schematic at the given position.
+
+        Matches local, global, and hierarchical labels by position within a
+        small tolerance (0.01 mm) and replaces the label text in place —
+        position, orientation, and styling are untouched. Pass `old_text`
+        to disambiguate when several labels sit close together. A no-match
+        error lists the nearest labels.
+
+        Args:
+            path: Path to .kicad_sch file.
+            x: X position of the label.
+            y: Y position of the label.
+            new_text: Replacement label text (the new net name).
+            old_text: Optional current text that must also match.
+
+        Returns:
+            JSON with old and new text and the label type.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.set_label_text(p, x, y, new_text, old_text=old_text)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        change_log.record(
+            "set_label_text",
+            {"path": path, "x": x, "y": y, "new_text": new_text, "old_text": old_text},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
     def move_schematic_component(
         path: str,
         reference: str,

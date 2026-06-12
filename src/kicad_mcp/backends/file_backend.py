@@ -23,9 +23,13 @@ from kicad_mcp.logging_config import get_logger
 from kicad_mcp.models.errors import GitOperationError, LibraryImportError, LibraryManageError
 from kicad_mcp.utils.library_sources import LibrarySourceRegistry
 from kicad_mcp.utils.sexp_parser import (
+    _unescape_sexp_string,
     _walk_balanced_parens,
     extract_sexp_block,
     find_footprint_block_by_reference,
+    find_label_block_by_position,
+    find_nearest_labels,
+    find_nearest_wires,
     find_no_connect_block_by_position,
     find_symbol_block_by_reference,
     find_wire_block_by_endpoints,
@@ -35,6 +39,23 @@ from kicad_mcp.utils.sexp_parser import (
 )
 
 logger = get_logger("backend.file")
+
+
+# KiCad's default schematic wiring grid (50 mil). Connection points placed
+# off this grid are unreachable by grid-drawn wires in the editor.
+_SCH_GRID_MM = 1.27
+
+
+def _snap_to_grid(value: float, grid: float = _SCH_GRID_MM) -> float:
+    """Snap a coordinate to the nearest grid multiple (round half away from zero)."""
+    import math
+    steps = math.floor(abs(value) / grid + 0.5)
+    return round(math.copysign(steps * grid, value), 4)
+
+
+def _is_on_grid(value: float, grid: float = _SCH_GRID_MM, tolerance: float = 0.005) -> bool:
+    """True when *value* sits on a grid multiple within *tolerance* mm."""
+    return abs(value - _snap_to_grid(value, grid)) <= tolerance
 
 
 # ---------------------------------------------------------------------------
@@ -1558,23 +1579,34 @@ class FileSchematicOps(SchematicOps):
                     })
 
         labels = []
-        for label_type in ["label", "global_label", "hierarchical_label"]:
-            for lbl in getattr(sch, label_type, []):
-                label_data: dict[str, Any] = {"label_type": label_type}
-                text_value = getattr(lbl, "text", None) if hasattr(lbl, "text") else None
-                name_value = getattr(lbl, "name", None) if hasattr(lbl, "name") else None
-                if text_value not in (None, ""):
-                    label_data["text"] = str(text_value)
-                elif name_value not in (None, ""):
-                    label_data["text"] = str(name_value)
-                else:
-                    # Skip malformed/empty labels instead of inventing a literal "None" net name.
-                    continue
-                if hasattr(lbl, "at"):
-                    pos = self._skip_at_to_pos(lbl.at)
-                    if pos:
-                        label_data["position"] = pos
-                labels.append(label_data)
+        skip_label_error: Exception | None = None
+        try:
+            for label_type in ["label", "global_label", "hierarchical_label"]:
+                for lbl in getattr(sch, label_type, []):
+                    label_data: dict[str, Any] = {"label_type": label_type}
+                    text_value = getattr(lbl, "text", None) if hasattr(lbl, "text") else None
+                    name_value = getattr(lbl, "name", None) if hasattr(lbl, "name") else None
+                    if text_value not in (None, ""):
+                        label_data["text"] = str(text_value)
+                    elif name_value not in (None, ""):
+                        label_data["text"] = str(name_value)
+                    else:
+                        # Skip malformed/empty labels instead of inventing a literal "None" net name.
+                        continue
+                    if hasattr(lbl, "at"):
+                        pos = self._skip_at_to_pos(lbl.at)
+                        if pos:
+                            label_data["position"] = pos
+                    labels.append(label_data)
+        except Exception as exc:
+            skip_label_error = exc
+            labels = []
+
+        # kicad-skip silently yields no labels on some files (#5). When it
+        # found none but the raw text plainly contains label blocks, trust
+        # the sexp parse instead.
+        if not labels:
+            labels = self._sexp_labels_fallback(path, skip_label_error)
 
         # Parse no_connects, junctions, and sheets via sexp fallback (skip doesn't expose these well)
         no_connects = []
@@ -1618,6 +1650,49 @@ class FileSchematicOps(SchematicOps):
             "junctions": junctions,
             "sheets": sheets,
         }
+
+    @staticmethod
+    def _sexp_labels_fallback(
+        path: Path, skip_error: Exception | None,
+    ) -> list[dict[str, Any]]:
+        """Parse labels directly from the file when the skip path came up empty.
+
+        Returns ``[]`` without parsing when the raw text contains no label
+        blocks at all (a schematic with zero labels is not an error).
+        """
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+
+        if not re.search(r"\((?:label|global_label|hierarchical_label)[\s(]", content):
+            return []
+
+        if skip_error is not None:
+            logger.warning(
+                "kicad-skip label extraction failed for %s (%r); "
+                "falling back to sexp label parse", path, skip_error,
+            )
+        else:
+            logger.warning(
+                "kicad-skip returned 0 labels for %s but the file contains "
+                "label blocks; falling back to sexp label parse", path,
+            )
+
+        labels: list[dict[str, Any]] = []
+        try:
+            tree = parse_sexp_content(content)
+            for node in tree:
+                if not isinstance(node, list) or len(node) < 1:
+                    continue
+                tag = node[0] if isinstance(node[0], str) else ""
+                if tag in ("label", "global_label", "hierarchical_label"):
+                    lbl = _parse_sch_label(node, tag)
+                    if lbl:
+                        labels.append(lbl)
+        except Exception as exc:
+            logger.warning("sexp label fallback also failed for %s: %r", path, exc)
+        return labels
 
     def _read_with_sexp(self, path: Path) -> dict[str, Any]:
         tree = parse_sexp_file(path)
@@ -2459,6 +2534,7 @@ class FileSchematicOps(SchematicOps):
 
         connected: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
         blocks: list[str] = []
 
         for pin_str in pins:
@@ -2488,6 +2564,23 @@ class FileSchematicOps(SchematicOps):
             px = float(pin_pos["x"])
             py = float(pin_pos["y"])
 
+            # The label/junction point must land on KiCad's 1.27 mm grid or
+            # later grid-drawn wires can never attach to it. The pin-attached
+            # end stays exactly on the pin — moving it would disconnect the
+            # stub — so an off-grid pin gets a warning, never a silent move.
+            if not (_is_on_grid(px) and _is_on_grid(py)):
+                warnings.append({
+                    "type": "off_grid_pin",
+                    "pin": pin_str,
+                    "position": {"x": px, "y": py},
+                    "message": (
+                        f"Pin {pin_str} at ({px}, {py}) is off the 1.27 mm grid; "
+                        f"its stub will be slightly diagonal to reach an on-grid "
+                        f"connection point. Consider move_schematic_component to "
+                        f"an on-grid origin."
+                    ),
+                })
+
             if stub_length > 0:
                 dx_raw = px - sx
                 dy_raw = py - sy
@@ -2499,8 +2592,13 @@ class FileSchematicOps(SchematicOps):
                 else:
                     dx = 0.0
                     dy = 1.0 if dy_raw >= 0 else -1.0
-                end_x = round(px + dx * stub_length, 4)
-                end_y = round(py + dy * stub_length, 4)
+                end_x = _snap_to_grid(px + dx * stub_length)
+                end_y = _snap_to_grid(py + dy * stub_length)
+                # Snapping a very short stub can collapse it onto the pin;
+                # keep at least one axis-aligned grid step in that case.
+                if end_x == px and end_y == py:
+                    end_x = round(px + dx * _SCH_GRID_MM, 4)
+                    end_y = round(py + dy * _SCH_GRID_MM, 4)
             else:
                 end_x = px
                 end_y = py
@@ -2539,7 +2637,10 @@ class FileSchematicOps(SchematicOps):
             content = content[:insert_pos] + "".join(blocks) + content[insert_pos:]
             path.write_text(content, encoding="utf-8")
 
-        return {"connected": connected, "failed": failed, "net": net}
+        result = {"connected": connected, "failed": failed, "net": net}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     def add_no_connects_bulk(
         self, path: Path, points: list[dict],
@@ -2768,8 +2869,19 @@ class FileSchematicOps(SchematicOps):
         content = path.read_text(encoding="utf-8")
         location = find_wire_block_by_endpoints(content, start_x, start_y, end_x, end_y)
         if location is None:
+            nearest = find_nearest_wires(content, start_x, start_y, end_x, end_y)
+            if nearest:
+                hints = "; ".join(
+                    f"({w['start']['x']}, {w['start']['y']})-({w['end']['x']}, {w['end']['y']})"
+                    f" at {w['distance']} mm"
+                    for w in nearest
+                )
+                detail = f" Nearest wires: {hints}"
+            else:
+                detail = " The schematic contains no wires."
             raise ValueError(
-                f"Wire from ({start_x}, {start_y}) to ({end_x}, {end_y}) not found in {path}"
+                f"Wire from ({start_x}, {start_y}) to ({end_x}, {end_y}) "
+                f"not found in {path}.{detail}"
             )
         start, end = location
         content = remove_sexp_block(content, start, end)
@@ -2793,6 +2905,82 @@ class FileSchematicOps(SchematicOps):
         return {
             "position": {"x": x, "y": y},
             "removed": True,
+        }
+
+    @staticmethod
+    def _locate_label(
+        content: str, path: Path, x: float, y: float, text: str | None,
+    ) -> tuple[int, int]:
+        """Find a label block or raise with nearest-label diagnostics."""
+        location = find_label_block_by_position(content, x, y, text=text)
+        if location is not None:
+            return location
+
+        wanted = f'Label{f" {text!r}" if text else ""} at ({x}, {y})'
+        nearest = find_nearest_labels(content, x, y)
+        if nearest:
+            hints = "; ".join(
+                f'{lbl["label_type"]} "{lbl["text"]}" at '
+                f'({lbl["position"]["x"]}, {lbl["position"]["y"]}), '
+                f'{lbl["distance"]} mm away'
+                for lbl in nearest
+            )
+            detail = f" Nearest labels: {hints}"
+        else:
+            detail = " The schematic contains no labels."
+        raise ValueError(f"{wanted} not found in {path}.{detail}")
+
+    def remove_label(
+        self, path: Path, x: float, y: float, text: str | None = None,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        start, end = self._locate_label(content, path, x, y, text)
+
+        block = content[start:end + 1]
+        kind_match = re.match(r'\((\w+)\s+"((?:[^"\\]|\\.)*)"', block)
+        removed_kind = kind_match.group(1) if kind_match else None
+        removed_text = (
+            _unescape_sexp_string(kind_match.group(2)) if kind_match else None
+        )
+
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "text": removed_text,
+            "label_type": removed_kind,
+            "position": {"x": x, "y": y},
+            "removed": True,
+        }
+
+    def set_label_text(
+        self, path: Path, x: float, y: float, new_text: str,
+        old_text: str | None = None,
+    ) -> dict[str, Any]:
+        content = path.read_text(encoding="utf-8")
+        start, end = self._locate_label(content, path, x, y, old_text)
+
+        block = content[start:end + 1]
+        text_match = re.match(r'\((\w+)\s+"((?:[^"\\]|\\.)*)"', block)
+        if text_match is None:
+            raise ValueError(
+                f"Label block at ({x}, {y}) in {path} has no parsable text"
+            )
+        kind = text_match.group(1)
+        previous_text = _unescape_sexp_string(text_match.group(2))
+
+        escaped = new_text.replace("\\", "\\\\").replace('"', '\\"')
+        new_block = (
+            block[:text_match.start(2) - 1]
+            + f'"{escaped}"'
+            + block[text_match.end(2) + 1:]
+        )
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+        return {
+            "old_text": previous_text,
+            "new_text": new_text,
+            "label_type": kind,
+            "position": {"x": x, "y": y},
         }
 
     def get_symbol_pin_positions(

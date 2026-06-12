@@ -346,6 +346,17 @@ def test_add_power_symbols_bulk_resumes_from_existing_max(sch_with_existing_pwr:
 # connect_pins_bulk
 # ---------------------------------------------------------------------------
 
+def test_snap_to_grid_helper():
+    from kicad_mcp.backends.file_backend import _is_on_grid, _snap_to_grid
+
+    assert _snap_to_grid(96.52) == 96.52          # already on grid
+    assert _snap_to_grid(94.92) == 95.25          # rounds to nearest multiple
+    assert _snap_to_grid(0.635) == 1.27           # half rounds away from zero
+    assert _snap_to_grid(-0.635) == -1.27
+    assert _snap_to_grid(0.0) == 0.0
+    assert _is_on_grid(50.8)
+    assert not _is_on_grid(50.0)
+
 def test_connect_pins_places_label_at_each_pin(sch_with_r1: Path):
     """stub_length=0 → label at exact pin coord, no wire emitted."""
     ops = FileSchematicOps()
@@ -372,7 +383,12 @@ def test_connect_pins_places_label_at_each_pin(sch_with_r1: Path):
 
 
 def test_connect_pins_with_stub_generates_wire_and_label(sch_with_r1: Path):
-    """stub_length=2.54 → wire from pin to stub end + label at stub end."""
+    """stub_length=2.54 → wire from pin to snapped stub end + label there.
+
+    R1's origin (100, 50) is off the 1.27 mm grid, so the stub's free end
+    snaps to the nearest grid point — (94.92, 50) → (95.25, 49.53) — and an
+    off_grid_pin warning fires (#9). The pin-attached end never moves.
+    """
     ops = FileSchematicOps()
     result = ops.connect_pins_bulk(
         sch_with_r1, ["R1.1"], net="GND", stub_length=2.54,
@@ -383,15 +399,77 @@ def test_connect_pins_with_stub_generates_wire_and_label(sch_with_r1: Path):
     entry = result["connected"][0]
 
     # Pin 1 outward direction is -X (pin at 97.46, symbol center at 100).
-    # Stub end = (97.46 - 2.54, 50) = (94.92, 50).
-    assert entry["x"] == pytest.approx(94.92)
-    assert entry["y"] == pytest.approx(50.0)
+    assert entry["x"] == pytest.approx(95.25)
+    assert entry["y"] == pytest.approx(49.53)
     assert entry["wire_uuid"] is not None
     assert entry["label_uuid"] is not None
 
     content = sch_with_r1.read_text(encoding="utf-8")
-    assert "(wire (pts (xy 97.46 50.0) (xy 94.92 50.0))" in content
-    assert '(label "GND" (at 94.92 50.0 0)' in content
+    assert "(wire (pts (xy 97.46 50.0) (xy 95.25 49.53))" in content
+    assert '(label "GND" (at 95.25 49.53 0)' in content
+
+    assert [w["type"] for w in result["warnings"]] == ["off_grid_pin"]
+    assert result["warnings"][0]["pin"] == "R1.1"
+    assert "move_schematic_component" in result["warnings"][0]["message"]
+
+
+@pytest.fixture
+def sch_with_on_grid_r(tmp_path: Path) -> Path:
+    # (101.6, 50.8) = (80, 40) × 1.27 → both pins land on grid too.
+    return _make_schematic(
+        tmp_path, TEST_R_LIB_SYMBOL,
+        instances=_resistor_instance("R5", 101.6, 50.8),
+    )
+
+
+def test_connect_pins_on_grid_pin_unchanged_no_warning(sch_with_on_grid_r: Path):
+    """On-grid pin + grid-multiple stub → exact axis-aligned stub, no warning."""
+    ops = FileSchematicOps()
+    result = ops.connect_pins_bulk(
+        sch_with_on_grid_r, ["R5.1"], net="GND", stub_length=2.54,
+    )
+
+    assert result["failed"] == []
+    entry = result["connected"][0]
+    # Pin 1 at (99.06, 50.8); stub -X 2.54 → (96.52, 50.8). Already on grid.
+    assert entry["x"] == pytest.approx(96.52)
+    assert entry["y"] == pytest.approx(50.8)
+    assert "warnings" not in result
+
+    content = sch_with_on_grid_r.read_text(encoding="utf-8")
+    assert "(wire (pts (xy 99.06 50.8) (xy 96.52 50.8))" in content
+
+
+def test_connect_pins_off_grid_pin_attached_end_stays_on_pin(sch_with_r1: Path):
+    """The pin-attached end must equal the pin position exactly (#9)."""
+    ops = FileSchematicOps()
+    result = ops.connect_pins_bulk(
+        sch_with_r1, ["R1.2"], net="SIG", stub_length=2.54,
+    )
+
+    entry = result["connected"][0]
+    content = sch_with_r1.read_text(encoding="utf-8")
+    # Pin 2 at (102.54, 50); wire starts exactly there.
+    assert "(xy 102.54 50.0)" in content
+    # Free end on the 1.27 mm grid in both axes.
+    assert entry["x"] / 1.27 == pytest.approx(round(entry["x"] / 1.27))
+    assert entry["y"] / 1.27 == pytest.approx(round(entry["y"] / 1.27))
+    assert [w["type"] for w in result["warnings"]] == ["off_grid_pin"]
+
+
+def test_connect_pins_short_stub_never_collapses_onto_pin(sch_with_on_grid_r: Path):
+    """A sub-grid stub must not snap to a zero-length wire."""
+    ops = FileSchematicOps()
+    result = ops.connect_pins_bulk(
+        sch_with_on_grid_r, ["R5.1"], net="GND", stub_length=0.5,
+    )
+
+    entry = result["connected"][0]
+    # Snapping 0.5 mm from on-grid (99.06, 50.8) would land back on the pin;
+    # the guard keeps one full grid step instead.
+    assert (entry["x"], entry["y"]) != (99.06, 50.8)
+    assert entry["x"] == pytest.approx(97.79)
+    assert entry["y"] == pytest.approx(50.8)
 
 
 def test_connect_pins_invalid_pin_ref_in_failed_list(sch_with_r1: Path):

@@ -228,6 +228,19 @@ class SchematicOps(ABC):
         """Remove a no-connect marker identified by its position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def remove_label(
+        self, path: Path, x: float, y: float, text: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove a net label identified by its position (and optionally text)."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def set_label_text(
+        self, path: Path, x: float, y: float, new_text: str,
+        old_text: str | None = None,
+    ) -> dict[str, Any]:
+        """Rename a net label identified by its position (and optionally old text)."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
     def get_sheet_hierarchy(self, path: Path) -> dict[str, Any]:
         """Get hierarchical sheet tree structure from a root schematic."""
         raise NotImplementedError("This backend does not support hierarchy queries")

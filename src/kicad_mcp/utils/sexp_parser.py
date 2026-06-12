@@ -348,6 +348,50 @@ def find_footprint_block_by_reference(content: str, reference: str) -> tuple[int
     return None
 
 
+def _iter_wire_segments(
+    content: str,
+) -> "list[tuple[int, int, tuple[float, float, float, float]]]":
+    """Enumerate wire blocks with their two endpoints.
+
+    Handles both the compact one-line form this tool writes
+    (``(wire (pts (xy ...) (xy ...)) ...)``) and KiCad's native multi-line
+    form (``(wire\\n  (pts\\n    (xy ...) (xy ...)\\n  ) ...)``).
+
+    Returns:
+        List of ``(start_index, end_index, (x1, y1, x2, y2))`` tuples.
+    """
+    segments = []
+    search_start = 0
+    while True:
+        idx = content.find("(wire", search_start)
+        if idx == -1:
+            break
+
+        # Require a delimiter after the keyword so e.g. "(wires" never matches.
+        after = idx + len("(wire")
+        if after >= len(content) or content[after] not in " \t\r\n(":
+            search_start = idx + 1
+            continue
+
+        end = _walk_balanced_parens(content, idx)
+        if end is None:
+            search_start = idx + 1
+            continue
+
+        block = content[idx:end + 1]
+        xys = re.findall(r'\(xy\s+(-?[\d.]+)\s+(-?[\d.]+)\s*\)', block)
+        if len(xys) >= 2:
+            segments.append((
+                idx, end,
+                (float(xys[0][0]), float(xys[0][1]),
+                 float(xys[1][0]), float(xys[1][1])),
+            ))
+
+        search_start = end + 1
+
+    return segments
+
+
 def find_wire_block_by_endpoints(
     content: str,
     start_x: float, start_y: float,
@@ -356,8 +400,9 @@ def find_wire_block_by_endpoints(
 ) -> tuple[int, int] | None:
     """Locate a wire block by its start/end coordinates.
 
-    Scans for ``(wire (pts (xy sx sy) (xy ex ey)) ...)`` blocks and checks
-    whether both endpoints match the given coordinates within *tolerance*.
+    Endpoints are compared numerically within *tolerance* (so ``63.5``
+    matches ``63.50``), in both orders — a wire stored as end→start still
+    matches a start→end query.
 
     Args:
         content: Full schematic file text.
@@ -370,37 +415,50 @@ def find_wire_block_by_endpoints(
     Returns:
         ``(start_index, end_index)`` inclusive, or ``None`` if not found.
     """
-    search_start = 0
-    while True:
-        idx = content.find("(wire ", search_start)
-        if idx == -1:
-            break
+    def _close(ax: float, ay: float, bx: float, by: float) -> bool:
+        return abs(ax - bx) <= tolerance and abs(ay - by) <= tolerance
 
-        end = _walk_balanced_parens(content, idx)
-        if end is None:
-            search_start = idx + 1
-            continue
-
-        block = content[idx:end + 1]
-
-        # Extract the two (xy ...) values from (pts ...)
-        pts_match = re.search(
-            r'\(pts\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\s+\(xy\s+([-\d.]+)\s+([-\d.]+)\)\)',
-            block,
-        )
-        if pts_match:
-            wx1 = float(pts_match.group(1))
-            wy1 = float(pts_match.group(2))
-            wx2 = float(pts_match.group(3))
-            wy2 = float(pts_match.group(4))
-
-            if (abs(wx1 - start_x) <= tolerance and abs(wy1 - start_y) <= tolerance
-                    and abs(wx2 - end_x) <= tolerance and abs(wy2 - end_y) <= tolerance):
-                return (idx, end)
-
-        search_start = end + 1
+    for idx, end, (wx1, wy1, wx2, wy2) in _iter_wire_segments(content):
+        forward = _close(wx1, wy1, start_x, start_y) and _close(wx2, wy2, end_x, end_y)
+        reverse = _close(wx2, wy2, start_x, start_y) and _close(wx1, wy1, end_x, end_y)
+        if forward or reverse:
+            return (idx, end)
 
     return None
+
+
+def find_nearest_wires(
+    content: str,
+    start_x: float, start_y: float,
+    end_x: float, end_y: float,
+    count: int = 3,
+) -> list[dict]:
+    """Rank wires by endpoint distance to the requested segment.
+
+    Used to build actionable no-match diagnostics for ``remove_wire``.
+    Distance is the smaller (over both endpoint pairings) sum of euclidean
+    distances between requested and actual endpoints.
+
+    Returns:
+        Up to *count* dicts ``{"start": {x, y}, "end": {x, y}, "distance": mm}``
+        sorted nearest-first.
+    """
+    import math
+
+    candidates = []
+    for _idx, _end, (wx1, wy1, wx2, wy2) in _iter_wire_segments(content):
+        forward = (math.hypot(wx1 - start_x, wy1 - start_y)
+                   + math.hypot(wx2 - end_x, wy2 - end_y))
+        reverse = (math.hypot(wx2 - start_x, wy2 - start_y)
+                   + math.hypot(wx1 - end_x, wy1 - end_y))
+        candidates.append({
+            "start": {"x": wx1, "y": wy1},
+            "end": {"x": wx2, "y": wy2},
+            "distance": round(min(forward, reverse), 4),
+        })
+
+    candidates.sort(key=lambda c: c["distance"])
+    return candidates[:count]
 
 
 def find_no_connect_block_by_position(
@@ -446,6 +504,119 @@ def find_no_connect_block_by_position(
         search_start = end + 1
 
     return None
+
+
+_LABEL_KINDS = ("label", "global_label", "hierarchical_label")
+
+
+def _unescape_sexp_string(raw: str) -> str:
+    """Undo KiCad s-expression string escaping (\\" and \\\\)."""
+    return raw.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _iter_label_blocks(
+    content: str,
+    kinds: tuple[str, ...] = _LABEL_KINDS,
+) -> list[dict]:
+    """Enumerate label blocks of the given kinds.
+
+    Returns:
+        List of ``{"start", "end", "kind", "text", "x", "y"}`` dicts where
+        ``start``/``end`` are inclusive block indices into *content*.
+    """
+    blocks = []
+    for kind in kinds:
+        token = f"({kind}"
+        search_start = 0
+        while True:
+            idx = content.find(token, search_start)
+            if idx == -1:
+                break
+
+            after = idx + len(token)
+            if after >= len(content) or content[after] not in " \t\r\n":
+                search_start = idx + 1
+                continue
+
+            end = _walk_balanced_parens(content, idx)
+            if end is None:
+                search_start = idx + 1
+                continue
+
+            block = content[idx:end + 1]
+            text_match = re.match(
+                rf'\({kind}\s+"((?:[^"\\]|\\.)*)"', block,
+            )
+            at_match = re.search(r'\(at\s+(-?[\d.]+)\s+(-?[\d.]+)', block)
+            if text_match and at_match:
+                blocks.append({
+                    "start": idx,
+                    "end": end,
+                    "kind": kind,
+                    "text": _unescape_sexp_string(text_match.group(1)),
+                    "x": float(at_match.group(1)),
+                    "y": float(at_match.group(2)),
+                })
+
+            search_start = end + 1
+
+    return blocks
+
+
+def find_label_block_by_position(
+    content: str,
+    x: float, y: float,
+    text: str | None = None,
+    tolerance: float = 0.01,
+    kinds: tuple[str, ...] = _LABEL_KINDS,
+) -> tuple[int, int] | None:
+    """Locate a label block by its position, optionally filtered by text.
+
+    Scans ``(label "..." (at x y angle) ...)`` blocks (plus global and
+    hierarchical variants) and matches the position numerically within
+    *tolerance*. When *text* is given, the label text must also match
+    exactly (after unescaping).
+
+    Returns:
+        ``(start_index, end_index)`` inclusive, or ``None`` if not found.
+    """
+    for blk in _iter_label_blocks(content, kinds):
+        if abs(blk["x"] - x) > tolerance or abs(blk["y"] - y) > tolerance:
+            continue
+        if text is not None and blk["text"] != text:
+            continue
+        return (blk["start"], blk["end"])
+
+    return None
+
+
+def find_nearest_labels(
+    content: str,
+    x: float, y: float,
+    count: int = 3,
+    kinds: tuple[str, ...] = _LABEL_KINDS,
+) -> list[dict]:
+    """Rank labels by distance to the requested position.
+
+    Used to build actionable no-match diagnostics for the label edit ops.
+
+    Returns:
+        Up to *count* dicts ``{"text", "label_type", "position": {x, y},
+        "distance": mm}`` sorted nearest-first.
+    """
+    import math
+
+    candidates = [
+        {
+            "text": blk["text"],
+            "label_type": blk["kind"],
+            "position": {"x": blk["x"], "y": blk["y"]},
+            "distance": round(math.hypot(blk["x"] - x, blk["y"] - y), 4),
+        }
+        for blk in _iter_label_blocks(content, kinds)
+    ]
+    candidates.sort(key=lambda c: c["distance"])
+    return candidates[:count]
 
 
 def extract_sexp_block(content: str, tag: str, name: str) -> str | None:

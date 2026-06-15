@@ -102,6 +102,35 @@ def _tcp_call(method: str, timeout: float, **kwargs) -> Any:
     return response.get("result")
 
 
+def _validate_bridge_identity(result: Any) -> None:
+    """Reject a ping identity that belongs to a non-pcbnew owner (#13B).
+
+    Post-#13B the bridge only binds inside pcbnew and reports ``app="pcbnew"``.
+    If something else is holding the port — the classic case is the KiCad
+    project manager leaking port 9760 across a pcbnew restart — the ping
+    identifies it and we treat the bridge as unavailable so the existing
+    fallback machinery engages.  We never auto-kill the offending process;
+    the error just names it.
+
+    Bridges from before the identity handshake omit the ``app`` field entirely;
+    those are accepted unchanged (legacy back-compat).
+    """
+    if not isinstance(result, dict):
+        return
+    app = result.get("app")
+    if app is None:
+        return  # legacy bridge — no identity payload, accept as-is
+    if app != "pcbnew":
+        pid = result.get("pid")
+        raise BridgeTemporarilyUnavailableError(
+            f"Bridge on port {_get_port()} is held by {app!r}"
+            + (f" (pid {pid})" if pid is not None else "")
+            + ", not the pcbnew editor. This usually means the KiCad project "
+            "manager is holding the port. Close all KiCad windows, then reopen "
+            "the board in the PCB editor."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Board ops
 # ---------------------------------------------------------------------------
@@ -274,10 +303,16 @@ class PluginBackend(KiCadBackend):
         return available
 
     def _probe(self) -> bool:
-        """Try a ping; return True if bridge responds correctly."""
+        """Try a ping; return True if a pcbnew bridge responds correctly."""
         try:
             result = _tcp_call("ping", _get_ping_timeout())
-            return result.get("pong") is True
+            if not (isinstance(result, dict) and result.get("pong") is True):
+                return False
+            _validate_bridge_identity(result)
+            return True
+        except BridgeTemporarilyUnavailableError:
+            # Wrong owner (e.g. project manager) or unreachable — not usable.
+            return False
         except (ConnectionRefusedError, OSError, json.JSONDecodeError, TimeoutError):
             return False
 

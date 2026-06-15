@@ -46,6 +46,10 @@ _PORT = int(os.environ.get("KICAD_MCP_PLUGIN_PORT", "9760"))
 _server_thread: threading.Thread | None = None
 _tcp_server: socketserver.TCPServer | None = None
 
+# Bumped whenever the bridge protocol changes (identity handshake, dispatch
+# surface, etc.).  Reported by `ping` so the client can detect a stale bridge.
+_BRIDGE_VERSION = "2.0.0-s4"
+
 
 # ---------------------------------------------------------------------------
 # Thread safety — write ops must run on the wxPython main thread
@@ -355,12 +359,34 @@ def _load_footprint(lib_id: str):
 # ---------------------------------------------------------------------------
 
 def _handle_ping() -> dict[str, Any]:
+    """Health check + identity handshake (#13B).
+
+    The identity fields let the client confirm the bridge it reached is the
+    pcbnew editor (not a leftover project-manager listener) and which board is
+    loaded, without a second round-trip.  Reading GetBoard() here mirrors
+    _handle_get_active_project, which already reads it off the bridge thread.
+    """
     try:
         import pcbnew
         version = pcbnew.GetBuildVersion()
     except Exception:
         version = "unknown"
-    return {"pong": True, "kicad_version": version}
+    board_path = None
+    try:
+        import pcbnew
+        board = pcbnew.GetBoard()
+        if board is not None:
+            board_path = board.GetFileName() or None
+    except Exception:
+        pass
+    return {
+        "pong": True,
+        "kicad_version": version,
+        "app": "pcbnew",
+        "pid": os.getpid(),
+        "board_path": board_path,
+        "bridge_version": _BRIDGE_VERSION,
+    }
 
 
 def _handle_get_board_info(path: str) -> dict[str, Any]:
@@ -1122,6 +1148,55 @@ class _MCPRequestHandler(socketserver.StreamRequestHandler):
 # Server startup
 # ---------------------------------------------------------------------------
 
+def _should_bind() -> bool:
+    """Return True only when running inside the pcbnew editor process.
+
+    KiCad imports this plugin module in BOTH the project-manager process and
+    the pcbnew editor.  Binding the TCP port from the project manager leaks it
+    (issue #13B): after pcbnew closes, the PM keeps holding port 9760, so a
+    freshly-launched pcbnew cannot bind its bridge and the client gets a
+    reachable-but-boardless bridge that answers "No board is currently open".
+    Binding only inside pcbnew removes that failure class outright.
+
+    Detection, most-reliable first.  Every decision is written to the startup
+    log so a live session can see which strategy classified the process:
+      1. wx application name contains "pcbnew" (set by KiCad per-editor).
+      2. host executable name contains "pcbnew" / "kicad".
+      3. undetectable → bind (preserve legacy single-process behavior).
+    """
+    # Strategy 1: wx application name — the clearest signal when a wx app exists.
+    try:
+        import wx
+        app = wx.GetApp()
+        if app is not None:
+            name = (app.GetAppName() or "").lower()
+            if "pcbnew" in name:
+                _write_diag(f"_should_bind: wx app name {name!r} → pcbnew, binding")
+                return True
+            if name and "pcbnew" not in name:
+                _write_diag(f"_should_bind: wx app name {name!r} → not pcbnew, NOT binding")
+                return False
+    except Exception as exc:
+        _write_diag(f"_should_bind: wx app-name check skipped ({exc})")
+
+    # Strategy 2: host executable name (works headless / before the wx app exists).
+    try:
+        import sys
+        exe = os.path.basename(sys.executable or "").lower()
+        if "pcbnew" in exe:
+            _write_diag(f"_should_bind: executable {exe!r} → pcbnew, binding")
+            return True
+        if "kicad" in exe and "pcbnew" not in exe:
+            _write_diag(f"_should_bind: executable {exe!r} → project manager, NOT binding")
+            return False
+    except Exception as exc:
+        _write_diag(f"_should_bind: executable check skipped ({exc})")
+
+    # Strategy 3: cannot classify — bind so a single-process setup still works.
+    _write_diag("_should_bind: process unclassified, binding (legacy default)")
+    return True
+
+
 def _start_server() -> None:
     """Start the TCP server in a daemon background thread."""
     global _tcp_server, _server_thread
@@ -1183,12 +1258,17 @@ except ImportError as _imp_err:
     def register():
         _start_server()
 else:
-    # Inside KiCad — start the TCP server unconditionally.
-    _start_server()
-    if _tcp_server is not None:
-        _write_diag(f"TCP server started on port {_PORT}")
+    # Inside KiCad.  Only bind the TCP port when running inside the pcbnew
+    # editor — never from the project manager (issue #13B: a PM-held port leaks
+    # across pcbnew restarts).
+    if _should_bind():
+        _start_server()
+        if _tcp_server is not None:
+            _write_diag(f"TCP server started on port {_PORT}")
+        else:
+            _write_diag(f"TCP server FAILED to bind on port {_PORT}")
     else:
-        _write_diag(f"TCP server FAILED to bind on port {_PORT}")
+        _write_diag("_should_bind() False — TCP server NOT started (not pcbnew)")
 
     # Register as an ActionPlugin so KiCad records the plugin in pcbnew.json
     # (action_plugins list) and auto-loads it on subsequent sessions.

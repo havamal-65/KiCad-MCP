@@ -16,7 +16,9 @@ from kicad_mcp.resources.definitions import register_resources
 from kicad_mcp.tools import board, drc, export, library, library_manage, parts, project, routing, schematic
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.platform_helper import (
+    cleanup_stale_session_files,
     is_kicad_running,
+    is_pcbnew_running,
     launch_kicad,
     launch_pcbnew,
     wait_for_bridge,
@@ -48,6 +50,82 @@ def _wait_for_board(pcb_path: "Path", timeout: float = 10.0, interval: float = 0
             pass
         time.sleep(interval)
     return False
+
+
+def _norm_path(p: str) -> str:
+    """Case/normalize a path for cross-platform comparison."""
+    return os.path.normcase(os.path.normpath(p)) if p else ""
+
+
+def _evaluate_launch_guard(
+    pcb_path: "Path",
+    identity: dict | None,
+    pcbnew_running: bool,
+    force: bool,
+) -> dict | None:
+    """Decide whether open_kicad should launch pcbnew for *pcb_path* (#13A).
+
+    Pure decision function (no I/O) so it is unit-testable.  The caller fetches
+    the current state — the bridge ping *identity* (None if unreachable or
+    wrong-owner), whether a pcbnew editor is already running, and the user's
+    *force* flag — and this returns either:
+
+      * a terminal response dict (reuse-success or a structured refusal), or
+      * None, meaning "safe to launch pcbnew".
+
+    The refusals exist to stop the issue-#13 double-launch: launching a second
+    pcbnew while one is already open leaks the bridge port and can trigger
+    autosave reverts.  ``force=True`` overrides every refusal.
+    """
+    bridge_up = isinstance(identity, dict) and identity.get("pong") is True
+    # A bridge that identifies as a non-pcbnew owner (e.g. the project manager
+    # holding the port) is not a usable editor session.
+    wrong_owner = bridge_up and identity.get("app") not in (None, "pcbnew")
+
+    if bridge_up and not wrong_owner:
+        open_board = identity.get("board_path") or ""
+        if open_board and _norm_path(open_board) == _norm_path(str(pcb_path)):
+            return {
+                "status": "success",
+                "bridge": "ready",
+                "message": f"Reusing the existing KiCad session — {pcb_path.name} is already open.",
+            }
+        # Bridge is a live pcbnew editor on a DIFFERENT (or unknown) board.
+        if not force:
+            return {
+                "status": "refused",
+                "bridge": "ready",
+                "open_board": open_board or None,
+                "requested_board": str(pcb_path),
+                "error": (
+                    f"KiCad already has a different board open ("
+                    f"{open_board or 'unknown'}). Launching pcbnew for "
+                    f"{pcb_path.name} would start a SECOND editor instance and leak "
+                    "the bridge port (issue #13). Close the current board and open "
+                    f"{pcb_path.name} in pcbnew, or call open_kicad again with "
+                    "force=True to launch anyway."
+                ),
+            }
+        return None  # force → launch
+
+    # No usable bridge.  If a pcbnew editor is already running (bridge down or
+    # wrong-owner), launching another would double up — refuse unless forced.
+    if pcbnew_running and not force:
+        return {
+            "status": "refused",
+            "bridge": "down",
+            "requested_board": str(pcb_path),
+            "error": (
+                "A pcbnew editor is already running but its bridge is not "
+                "reachable (it may still be loading, the bridge plugin may be "
+                "disabled, or the project manager is holding the port). Opening "
+                f"{pcb_path.name} now risks a second instance and a leaked bridge "
+                "port (issue #13). Close all KiCad windows and retry, or call "
+                "open_kicad again with force=True to launch anyway."
+            ),
+        }
+
+    return None  # safe to launch (nothing running, or force)
 
 
 _BRIDGE_DOWN_RESPONSE = json.dumps({
@@ -95,7 +173,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     # Register open_kicad first — exempt from the bridge guard because it is
     # the tool used to START KiCad when it isn't running yet.
     @mcp.tool()
-    def open_kicad(project_path: str = "") -> str:
+    def open_kicad(project_path: str = "", force: bool = False) -> str:
         """Open KiCad and the PCB editor, then wait for the MCP bridge to start.
 
         Handles the full startup sequence automatically:
@@ -108,9 +186,15 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
         reachable, launches the KiCad project manager and asks the user to open a
         board in the PCB editor.
 
+        To avoid a second pcbnew instance leaking the bridge port (issue #13),
+        the tool refuses to launch when a different board is already open or a
+        pcbnew editor is running without a reachable bridge.  Pass force=True to
+        override that guard.
+
         Args:
             project_path: Path to a .kicad_pcb or .kicad_pro file to open.
                           Leave empty to launch the KiCad project manager only.
+            force: Launch pcbnew even when the double-launch guard would refuse.
 
         Returns:
             JSON with status and bridge availability.
@@ -121,17 +205,23 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
 
         # [DIAG] Log every call so we can confirm this code version is executing
         # and verify what project_path value arrives.
-        logger.info("open_kicad called: project_path=%r", project_path)
+        logger.info("open_kicad called: project_path=%r force=%s", project_path, force)
 
-        # --- check if bridge is already up ---
-        bridge_is_up = False
+        # --- check if bridge is already up (capture full identity, #13B) ---
+        identity: dict | None = None
         try:
             result = _tcp_call("ping", _get_ping_timeout())
-            bridge_is_up = isinstance(result, dict) and result.get("pong") is True
+            if isinstance(result, dict) and result.get("pong") is True:
+                identity = result
         except Exception:
             pass  # bridge not yet up — continue with launch sequence
 
-        logger.info("open_kicad: bridge_is_up=%s", bridge_is_up)
+        # A bridge that identifies as a non-pcbnew owner (project manager holding
+        # the port) is not a usable editor session.
+        wrong_owner = identity is not None and identity.get("app") not in (None, "pcbnew")
+        bridge_is_up = identity is not None and not wrong_owner
+
+        logger.info("open_kicad: bridge_is_up=%s wrong_owner=%s", bridge_is_up, wrong_owner)
 
         # If bridge is running and no specific board was requested, we're done.
         if bridge_is_up and not project_path:
@@ -171,40 +261,33 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
 
         logger.info("open_kicad: resolved pcb_path=%r", str(pcb_path) if pcb_path else None)
 
-        # If bridge is up and a specific board was requested, check whether that
-        # board is already the one open in KiCad.  If yes, return immediately.
-        # If no, fall through to launch pcbnew with the correct path.
-        if bridge_is_up and pcb_path is not None:
-            open_board = ""
-            try:
-                active = _tcp_call("get_active_project", _get_ping_timeout())
-                open_board = active.get("board_path", "") if isinstance(active, dict) else ""
-                logger.info("open_kicad: get_active_project returned board_path=%r", open_board)
-            except Exception as exc:
-                logger.info("open_kicad: get_active_project failed: %s", exc)
+        # --- double-launch guard (#13A) ---
+        if pcb_path is not None:
+            # Legacy bridges report no board_path in ping; backfill it so the
+            # guard can recognize a same-board reuse against an old bridge.
+            if bridge_is_up and not (identity or {}).get("board_path"):
+                try:
+                    active = _tcp_call("get_active_project", _get_ping_timeout())
+                    if isinstance(active, dict) and active.get("board_path"):
+                        identity = {**(identity or {}), "board_path": active["board_path"]}
+                except Exception as exc:
+                    logger.info("open_kicad: get_active_project backfill failed: %s", exc)
 
-            requested_norm = os.path.normcase(os.path.normpath(str(pcb_path)))
-            open_norm = os.path.normcase(os.path.normpath(open_board)) if open_board else ""
-            logger.info(
-                "open_kicad: comparing open=%r vs requested=%r — match=%s",
-                open_norm, requested_norm, open_norm == requested_norm,
+            guard = _evaluate_launch_guard(
+                pcb_path, identity, is_pcbnew_running(), force,
             )
-
-            if open_board and open_norm == requested_norm:
-                return json.dumps({
-                    "status": "success",
-                    "bridge": "ready",
-                    "message": f"KiCad bridge is ready with {pcb_path.name} open.",
-                }, indent=2)
-
-            # Board doesn't match — fall through to launch pcbnew with the new path.
-            logger.info(
-                "open_kicad: board mismatch — re-launching pcbnew with %r (was %r)",
-                str(pcb_path), open_board,
-            )
+            if guard is not None:
+                logger.info("open_kicad: guard decision status=%s", guard.get("status"))
+                return json.dumps(guard, indent=2)
 
         # --- launch pcbnew (preferred) or project manager ---
         if pcb_path is not None:
+            # Remove stale lock/autosave files so the relaunch opens the on-disk
+            # board, not a stale autosave (#14B).  No-op while KiCad is running.
+            stale_removed = cleanup_stale_session_files(pcb_path.parent)
+            if stale_removed:
+                logger.info("open_kicad: removed stale session files: %s", stale_removed)
+
             launched = launch_pcbnew(pcb_path)
             if not launched:
                 return json.dumps({
@@ -212,32 +295,31 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
                     "error": "Failed to launch pcbnew. Verify KiCad is installed.",
                 }, indent=2)
 
+            def _launch_response(bridge: str, message: str) -> str:
+                payload: dict = {"status": "success", "bridge": bridge, "message": message}
+                if stale_removed:
+                    payload["stale_files_removed"] = stale_removed
+                return json.dumps(payload, indent=2)
+
             bridge_up = wait_for_bridge(port=port, timeout=20.0)
             if bridge_up:
                 board_ready = _wait_for_board(pcb_path, timeout=10.0)
                 if board_ready:
-                    return json.dumps({
-                        "status": "success",
-                        "bridge": "ready",
-                        "message": f"pcbnew opened with {pcb_path.name} and bridge is ready.",
-                    }, indent=2)
+                    return _launch_response(
+                        "ready",
+                        f"pcbnew opened with {pcb_path.name} and bridge is ready.",
+                    )
                 # Bridge is up but pcbnew hasn't finished loading the board yet.
-                return json.dumps({
-                    "status": "success",
-                    "bridge": "pending",
-                    "message": (
-                        f"pcbnew launched with {pcb_path.name}. Bridge is reachable but "
-                        "the board has not finished loading yet. Retry in a few seconds."
-                    ),
-                }, indent=2)
-            return json.dumps({
-                "status": "success",
-                "bridge": "pending",
-                "message": (
-                    f"pcbnew launched with {pcb_path.name} but bridge not reachable yet. "
-                    "Ensure kicad_mcp_bridge is installed and enabled in KiCad, then retry."
-                ),
-            }, indent=2)
+                return _launch_response(
+                    "pending",
+                    f"pcbnew launched with {pcb_path.name}. Bridge is reachable but "
+                    "the board has not finished loading yet. Retry in a few seconds.",
+                )
+            return _launch_response(
+                "pending",
+                f"pcbnew launched with {pcb_path.name} but bridge not reachable yet. "
+                "Ensure kicad_mcp_bridge is installed and enabled in KiCad, then retry.",
+            )
 
         # --- no PCB file: fall back to project manager ---
         if not is_kicad_running():

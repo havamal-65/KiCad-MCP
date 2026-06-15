@@ -202,12 +202,11 @@ def find_kicad_executable() -> Path | None:
     return None
 
 
-def _check_kicad_process() -> bool:
-    """Perform the actual subprocess check for a running KiCad GUI process.
+def _any_process_running(names: tuple[str, ...]) -> bool:
+    """Return True if any process whose image name matches *names* is running.
 
-    Matches the project manager (kicad) and the standalone editors (pcbnew,
-    eeschema). The bridge runs inside whichever process the user has open, so
-    any of these counts as "KiCad running" for startup-gate purposes.
+    *names* are bare executable stems (e.g. "pcbnew", "kicad"); the Windows
+    ".exe" suffix is added automatically.
     """
     import subprocess
 
@@ -215,21 +214,22 @@ def _check_kicad_process() -> bool:
     try:
         if platform == "windows":
             flags = subprocess.CREATE_NO_WINDOW
-            for name in ("kicad.exe", "pcbnew.exe", "eeschema.exe"):
+            for stem in names:
+                image = f"{stem}.exe"
                 result = subprocess.run(
-                    ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"],
+                    ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"],
                     capture_output=True,
                     text=True,
                     timeout=5,
                     creationflags=flags,
                 )
-                if name.lower() in result.stdout.lower():
+                if image.lower() in result.stdout.lower():
                     return True
             return False
         else:
-            for name in ("kicad", "pcbnew", "eeschema"):
+            for stem in names:
                 result = subprocess.run(
-                    ["pgrep", "-x", name],
+                    ["pgrep", "-x", stem],
                     capture_output=True,
                     timeout=5,
                 )
@@ -237,8 +237,31 @@ def _check_kicad_process() -> bool:
                     return True
             return False
     except Exception as e:
-        logger.debug("KiCad process check failed: %s", e)
+        logger.debug("Process check failed for %s: %s", names, e)
         return False
+
+
+def _check_kicad_process() -> bool:
+    """Perform the actual subprocess check for a running KiCad GUI process.
+
+    Matches the project manager (kicad) and the standalone editors (pcbnew,
+    eeschema). The bridge runs inside whichever process the user has open, so
+    any of these counts as "KiCad running" for startup-gate purposes.
+    """
+    return _any_process_running(("kicad", "pcbnew", "eeschema"))
+
+
+def is_pcbnew_running() -> bool:
+    """Check whether a pcbnew editor process is currently running.
+
+    Narrower than is_kicad_running() (which also matches the project manager
+    and eeschema).  open_kicad uses this to decide whether launching pcbnew
+    would create a SECOND editor instance and leak the bridge port (#13A) —
+    the project manager being open on its own is not a double-launch risk.
+
+    Not cached: called at most once per open_kicad invocation.
+    """
+    return _any_process_running(("pcbnew",))
 
 
 def is_kicad_running() -> bool:
@@ -379,6 +402,56 @@ def launch_pcbnew(pcb_path: Path) -> bool:
     except Exception as e:
         logger.warning("Failed to launch pcbnew: %s", e)
         return False
+
+
+def cleanup_stale_session_files(project_dir: Path | str) -> list[str]:
+    """Delete stale KiCad lock and autosave files in *project_dir* (#14B).
+
+    After a crash or hard-kill, KiCad leaves ``~*.lck`` lock files and
+    ``_autosave*`` recovery files behind.  On the next launch pcbnew may
+    silently restore the stale autosave board — which then overwrites external
+    edits made in the meantime (issue #14: a stale autosave reverted a spliced
+    footprint and every "passing" check ran against the wrong board).
+
+    Removing those files makes the next launch open the on-disk board as-is.
+    To stay safe we delete **only when no KiCad process is running** — a lock
+    file belonging to a live session must never be removed.
+
+    Args:
+        project_dir: Directory holding the board/project files.
+
+    Returns:
+        Sorted list of removed file paths (empty if KiCad is running, the
+        directory is missing, or nothing matched).
+    """
+    if is_kicad_running():
+        logger.info("cleanup_stale_session_files: KiCad is running — skipping for safety")
+        return []
+
+    directory = Path(project_dir)
+    if not directory.is_dir():
+        return []
+
+    # Lock files: KiCad writes "~*.lck"; match plain "*.lck" too for safety.
+    # Autosave files: KiCad 9 writes "_autosave-<name>.kicad_*"; "*autosave*"
+    # also catches older "<name>-autosave" variants.
+    patterns = ("~*.lck", "*.lck", "_autosave*", "*autosave*")
+    removed: list[str] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for path in directory.glob(pattern):
+            if path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            try:
+                path.unlink()
+                removed.append(str(path))
+                logger.info("cleanup_stale_session_files: removed %s", path.name)
+            except OSError as exc:
+                logger.warning(
+                    "cleanup_stale_session_files: could not remove %s: %s", path.name, exc
+                )
+    return sorted(removed)
 
 
 def wait_for_bridge(port: int = 9760, timeout: float = 20.0) -> bool:

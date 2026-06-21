@@ -68,6 +68,81 @@ def _impl_clear_routes(
     return json.dumps(result, indent=2)
 
 
+def _is_boardless_bridge_error(err: object) -> bool:
+    """True if *err* is the reachable-but-boardless bridge failure (#13C).
+
+    The bridge answered but has no live board, so its in-memory export path
+    can't run — the classic symptom is "No board is currently open" or the
+    detached-SwigPyObject ``'SwigPyObject' object has no attribute 'GetFileName'``.
+    Distinct from BridgeTemporarilyUnavailableError (bridge unreachable at all),
+    which already triggers the subprocess fallback. On either, export_dsn falls
+    back to a headless subprocess that loads the board from disk.
+    """
+    msg = str(err)
+    return (
+        "No board is currently open" in msg
+        or "object has no attribute 'GetFileName'" in msg
+        or ("SwigPyObject" in msg and "GetFileName" in msg)
+    )
+
+
+def _export_dsn_subprocess(p: Path, dsn_path: Path) -> dict:
+    """Headless DSN export: load the on-disk board in a subprocess pcbnew and run
+    ExportSpecctraDSN.
+
+    The #13C fallback used when the live bridge is unreachable OR reachable but
+    boardless. Reads the .kicad_pcb from disk, so the caller is responsible for
+    the disk holding the intended state. Raises on failure.
+    """
+    pcbnew = _get_pcbnew()
+    if pcbnew is not None:
+        board = pcbnew.LoadBoard(str(p))
+        if board is None:
+            raise RuntimeError(_malformed_board_message(p))
+        ok = pcbnew.ExportSpecctraDSN(board, str(dsn_path))
+        if not ok:
+            raise RuntimeError(f"ExportSpecctraDSN failed for {dsn_path}")
+        return {"success": True, "dsn_path": str(dsn_path), "via": "subprocess"}
+
+    script = f"""
+import pcbnew, sys
+board = pcbnew.LoadBoard({str(p)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
+ok = pcbnew.ExportSpecctraDSN(board, {str(dsn_path)!r})
+print("DSN_OK" if ok else "DSN_FAIL")
+"""
+    ok, output_text = _run_pcbnew_script(script, timeout=_BOARD_CLEAN_TIMEOUT_SECONDS)
+    if not ok or "DSN_OK" not in output_text:
+        raise RuntimeError(_format_pcbnew_error("DSN export failed", output_text, p))
+    return {"success": True, "dsn_path": str(dsn_path), "via": "subprocess"}
+
+
+def _export_dsn_with_fallback(backend: BackendProtocol, p: Path, dsn_path: Path) -> dict:
+    """Export DSN via the live bridge, falling back to a headless subprocess.
+
+    The bridge path reads pcbnew's live in-memory board (preferred — it reflects
+    unsaved edits). On an unreachable bridge OR a reachable-but-boardless bridge
+    (#13C), fall back to a subprocess that loads the board from disk, mirroring
+    how _impl_clear_routes falls back for BridgeTemporarilyUnavailableError.
+    """
+    from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
+    try:
+        return backend.export_dsn(p, dsn_path)
+    except BridgeTemporarilyUnavailableError as exc:
+        logger.warning("export_dsn: bridge unreachable (%s); subprocess fallback", exc)
+        return _export_dsn_subprocess(p, dsn_path)
+    except Exception as exc:
+        if _is_boardless_bridge_error(exc):
+            logger.warning(
+                "export_dsn: bridge reachable but boardless (%s); subprocess fallback", exc
+            )
+            return _export_dsn_subprocess(p, dsn_path)
+        raise
+
+
 def _impl_run_freerouter(
     dsn_path: str,
     output: str,
@@ -508,7 +583,7 @@ def register_tools(
         dsn_path = Path(output) if output else p.parent / "freerouting.dsn"
         dsn_path = dsn_path.resolve()
         try:
-            result = backend.export_dsn(p, dsn_path)
+            result = _export_dsn_with_fallback(backend, p, dsn_path)
         except Exception as exc:
             return json.dumps({"status": "error", "message": str(exc)}, indent=2)
 
@@ -715,10 +790,11 @@ def register_tools(
                 report["message"] = f"Board cleanup failed: {result.get('message', '')}"
                 return json.dumps(report, indent=2)
 
-        # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board)
-        # or subprocess pcbnew, via BOARD_ROUTE capability.
+        # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board),
+        # falling back to subprocess pcbnew when the bridge is unreachable or
+        # reachable-but-boardless (#13C).
         try:
-            dsn_result = backend.export_dsn(p, dsn)
+            dsn_result = _export_dsn_with_fallback(backend, p, dsn)
             # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
             try:
                 npth_pads = _extract_npth_pads(p)

@@ -51,6 +51,22 @@ class BridgeTemporarilyUnavailableError(BackendNotAvailableError):
     """
 
 
+class StaleBoardError(RuntimeError):
+    """The bridge refused a mutation because the .kicad_pcb on disk is newer than
+    the board it holds in memory (#14C / #8).
+
+    Emitted by the bridge as a structured ``{error_code: "stale_board", ...}``
+    response. ``PluginBoardOps._call`` self-heals by reloading the board from
+    disk once and retrying the original op; a second stale verdict propagates.
+    """
+
+    def __init__(self, message: str, disk_mtime: float | None = None,
+                 loaded_mtime: float | None = None) -> None:
+        super().__init__(message)
+        self.disk_mtime = disk_mtime
+        self.loaded_mtime = loaded_mtime
+
+
 _DEFAULT_PORT = 9760
 _DEFAULT_PING_TIMEOUT = 2.0
 _DEFAULT_OP_TIMEOUT = 10.0
@@ -98,6 +114,12 @@ def _tcp_call(method: str, timeout: float, **kwargs) -> Any:
         ) from exc
     response = json.loads(data.decode("utf-8").strip())
     if response.get("status") == "error":
+        if response.get("error_code") == "stale_board":
+            raise StaleBoardError(
+                response.get("message", "board on disk is newer than in-memory copy"),
+                response.get("disk_mtime"),
+                response.get("loaded_mtime"),
+            )
         raise RuntimeError(f"Plugin bridge error: {response.get('message', 'unknown')}")
     return response.get("result")
 
@@ -147,6 +169,19 @@ class PluginBoardOps(BoardOps):
         if path is not None:
             kw = {"path": str(path), **kwargs}
         try:
+            return _tcp_call(method, _get_op_timeout(), **kw)
+        except StaleBoardError:
+            # Disk changed under the bridge (#14C): reload from disk once, then
+            # retry the original op exactly once. A second stale verdict — the
+            # file changed again between reload and retry — propagates.
+            if path is None:
+                raise
+            try:
+                _tcp_call("reload_board", _get_op_timeout(), path=str(path))
+            except BridgeTemporarilyUnavailableError:
+                if self._on_disconnect is not None:
+                    self._on_disconnect()
+                raise
             return _tcp_call(method, _get_op_timeout(), **kw)
         except BridgeTemporarilyUnavailableError:
             if self._on_disconnect is not None:

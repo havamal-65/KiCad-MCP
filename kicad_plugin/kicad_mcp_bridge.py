@@ -91,25 +91,141 @@ def _run_on_main_thread(fn):
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Disk/in-memory coherence tracking (#14C / #8). Maps a normalized .kicad_pcb
+# path → the on-disk mtime the bridge last knew its in-memory board to match
+# (set on first contact, updated after every save and on reload). A disk mtime
+# newer than the recorded value means the file changed under the bridge — an
+# external edit, an autosave recovery, or a parallel writer — so the in-memory
+# board is stale. Mutating handlers refuse rather than clobber the newer disk
+# state; the client reloads once and retries (see StaleBoardError in
+# plugin_backend.py).
+_board_load_mtimes: dict[str, float] = {}
+
+
+class _StaleBoardError(Exception):
+    """The on-disk .kicad_pcb is newer than the board the bridge holds (#14C).
+
+    Carries the two mtimes so the dispatcher can emit a structured
+    ``{error_code: "stale_board", disk_mtime, loaded_mtime}`` response that the
+    client recognizes and self-heals from (reload-then-retry-once).
+    """
+
+    def __init__(self, filename: str, disk_mtime: float, loaded_mtime: float) -> None:
+        self.filename = filename
+        self.disk_mtime = disk_mtime
+        self.loaded_mtime = loaded_mtime
+        super().__init__(
+            f"Board on disk is newer than the bridge's in-memory copy "
+            f"({filename}): disk mtime {disk_mtime} > loaded {loaded_mtime}. "
+            "The file changed under the bridge (external edit or autosave "
+            "recovery); reload it before mutating."
+        )
+
+
+def _norm_board_path(filename: str) -> str:
+    return os.path.normcase(os.path.normpath(filename))
+
+
+def _board_disk_mtime(filename: str):
+    """Current on-disk mtime of *filename*, or None if it can't be read."""
+    try:
+        return os.path.getmtime(filename)
+    except OSError:
+        return None
+
+
+def _note_first_contact(filename: str) -> None:
+    """Record the disk mtime as the coherence baseline, but only once.
+
+    Establishes "the in-memory board matches this on-disk state" the first time
+    the bridge touches a board. Never overwrites an existing baseline, so an
+    external write between first contact and a later mutation is detectable.
+    Saves and reloads update the baseline explicitly via _record_load_mtime.
+    """
+    if not filename:
+        return
+    key = _norm_board_path(filename)
+    if key not in _board_load_mtimes:
+        mt = _board_disk_mtime(filename)
+        if mt is not None:
+            _board_load_mtimes[key] = mt
+
+
+def _record_load_mtime(filename: str) -> None:
+    """Mark the bridge as in sync with the current on-disk state of *filename*."""
+    if not filename:
+        return
+    mt = _board_disk_mtime(filename)
+    if mt is not None:
+        _board_load_mtimes[_norm_board_path(filename)] = mt
+
+
+def _check_disk_coherence(filename: str) -> None:
+    """Raise _StaleBoardError if disk is newer than the recorded baseline (#14C).
+
+    First contact (no baseline yet) records the current state and passes —
+    coherence tracking starts when the bridge first sees the board. A missing
+    or unreadable file passes too; the operation surfaces its own error.
+    """
+    if not filename:
+        return
+    key = _norm_board_path(filename)
+    disk = _board_disk_mtime(filename)
+    if disk is None:
+        return
+    loaded = _board_load_mtimes.get(key)
+    if loaded is None:
+        _board_load_mtimes[key] = disk
+        return
+    if disk > loaded:
+        raise _StaleBoardError(filename, disk, loaded)
+
+
 def _get_open_board(path: str):
-    """Return the currently open pcbnew Board, verifying it matches *path*."""
+    """Return the currently open pcbnew Board, verifying it matches *path*.
+
+    Always re-fetches via ``pcbnew.GetBoard()`` — the bridge never stores a
+    BOARD handle across calls. If ``GetFileName()`` raises (the detached
+    SwigPyObject failure seen after some in-place mutations, issue #14A), the
+    board is re-fetched once before giving up.
+    """
     import pcbnew
     board = pcbnew.GetBoard()
     if board is None:
         raise ValueError("No board is currently open in KiCad")
-    board_path = board.GetFileName()
+    try:
+        board_path = board.GetFileName()
+    except AttributeError:
+        # The wrapper returned by GetBoard() lost its BOARD type (observed
+        # after some in-place mutations). Re-fetch once; a second failure
+        # propagates as a clear error.
+        board = pcbnew.GetBoard()
+        if board is None:
+            raise ValueError("No board is currently open in KiCad")
+        board_path = board.GetFileName()
     if os.path.normcase(os.path.normpath(board_path)) != os.path.normcase(os.path.normpath(path)):
         raise ValueError(
             f"Requested board '{path}' does not match open board '{board_path}'. "
             "Open the correct .kicad_pcb file in KiCad first."
         )
+    # Establish the disk-coherence baseline on first contact (#14C).
+    _note_first_contact(board_path)
     return board
 
 
-def _save_and_refresh(board) -> None:
-    """Save board to disk, then refresh KiCad's display on the main thread."""
+def _save_and_refresh(board, filename: str | None = None) -> None:
+    """Save board to disk, then refresh KiCad's display on the main thread.
+
+    Records the post-save disk mtime as the new coherence baseline (#14C) so a
+    subsequent mutation doesn't false-positive on the bridge's own write. Pass
+    *filename* when the caller captured it before mutating (issue #14A); falls
+    back to ``board.GetFileName()`` otherwise.
+    """
     import pcbnew
-    board.Save(board.GetFileName())
+    if not filename:
+        filename = board.GetFileName()
+    board.Save(filename)
+    _record_load_mtime(filename)
     # Schedule Refresh on the main thread — calling it from a background thread
     # crashes pcbnew on Windows.
     try:
@@ -975,7 +1091,9 @@ def _handle_clear_routes(path: str, backup: bool = True) -> dict[str, Any]:
                 tracks_removed += 1
             board.Remove(item)
 
-        _save_and_refresh(board)
+        # Pass the filename captured before mutation (#14A) — an in-place
+        # mutation can detach the board's filename mid-handler.
+        _save_and_refresh(board, filename)
         return {
             "status": "success",
             "tracks_removed": tracks_removed,
@@ -1043,6 +1161,9 @@ def _handle_reload_board(path: str) -> dict[str, Any]:
             loaded = True
         except Exception as exc:
             logger.warning("reload_board: board.Load() failed (%s); falling back to Refresh()", exc)
+        # The in-memory board now matches disk — reset the coherence baseline
+        # (#14C) so the stale_board self-heal can complete its retry.
+        _record_load_mtime(filename)
         try:
             import wx
             wx.CallAfter(pcbnew.Refresh)
@@ -1110,6 +1231,47 @@ _DISPATCH = {
 }
 
 
+# Methods that mutate the in-memory board and write it back to disk. Each gets a
+# disk-coherence pre-check (#14C): if the .kicad_pcb on disk is newer than the
+# bridge's recorded baseline, refuse with a structured stale_board error rather
+# than clobber the newer disk state. The check is a pure mtime comparison, so it
+# runs on the bridge thread before the handler's main-thread dispatch.
+_MUTATING_METHODS = frozenset({
+    "place_component", "place_components_bulk", "move_component",
+    "remove_component", "add_track", "add_via", "assign_net",
+    "refill_zones", "save_board", "clear_routes", "add_board_outline",
+    "auto_place", "import_ses",
+})
+
+
+def _dispatch_request(request: dict) -> dict:
+    """Route one request dict to its handler and wrap the result/errors.
+
+    Mutating methods get a disk-coherence pre-check (#14C) before the handler
+    runs; a stale board is reported as a structured ``stale_board`` response the
+    client recognizes and self-heals from (reload-then-retry-once).
+    """
+    method = request.get("method", "")
+    handler = _DISPATCH.get(method)
+    if handler is None:
+        return {"status": "error", "message": f"Unknown method: {method!r}"}
+    try:
+        if method in _MUTATING_METHODS:
+            _check_disk_coherence(request.get("path", "") or "")
+        result = handler(request)
+        return {"status": "ok", "result": result}
+    except _StaleBoardError as exc:
+        return {
+            "status": "error",
+            "error_code": "stale_board",
+            "message": str(exc),
+            "disk_mtime": exc.disk_mtime,
+            "loaded_mtime": exc.loaded_mtime,
+        }
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
 # ---------------------------------------------------------------------------
 # TCP request handler
 # ---------------------------------------------------------------------------
@@ -1123,7 +1285,7 @@ class _MCPRequestHandler(socketserver.StreamRequestHandler):
             if not raw:
                 return
             request = json.loads(raw.decode("utf-8").strip())
-            response = self._dispatch(request)
+            response = _dispatch_request(request)
         except Exception as exc:
             response = {"status": "error", "message": str(exc)}
         try:
@@ -1131,17 +1293,6 @@ class _MCPRequestHandler(socketserver.StreamRequestHandler):
             self.wfile.flush()
         except Exception:
             pass
-
-    def _dispatch(self, request: dict) -> dict:
-        method = request.get("method", "")
-        handler = _DISPATCH.get(method)
-        if handler is None:
-            return {"status": "error", "message": f"Unknown method: {method!r}"}
-        try:
-            result = handler(request)
-            return {"status": "ok", "result": result}
-        except Exception as exc:
-            return {"status": "error", "message": str(exc)}
 
 
 # ---------------------------------------------------------------------------

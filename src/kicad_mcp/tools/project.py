@@ -509,37 +509,77 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
     def save_project(path: str) -> str:
         """Trigger save for an open KiCad project (requires IPC backend).
 
+        The response reports which backend persisted the file and whether a live
+        KiCad/pcbnew bridge session is open. This matters for save coherence
+        (#8/#14): file-based operations (autoroute SES import, kicad-cli exports)
+        write the .kicad_pcb on disk, while a live bridge keeps the board in
+        pcbnew's memory. The two can diverge — saving from the pcbnew GUI can
+        overwrite a file-based write, and a stale in-memory board can clobber
+        newer on-disk edits on its next flush. After an external file write,
+        call ``reload_board`` so the live session re-reads disk before mutating.
+
         Args:
             path: Path to the project file.
 
         Returns:
-            JSON with save status.
+            JSON with save status, the backend name, and live_bridge_session.
         """
         from kicad_mcp.backends.base import BackendCapability
+
+        backend_name = type(backend).__name__
+        # A live bridge session means pcbnew holds the board in memory; detect it
+        # so the response can warn about disk/memory divergence.
+        live_bridge = False
+        try:
+            live_bridge = bool(backend.get_active_project())
+        except Exception:
+            live_bridge = False
+
         if backend.has_capability(BackendCapability.REAL_TIME_SYNC):
             try:
                 # IPC backend can trigger save
-                result = {"status": "success", "message": "Project saved via IPC"}
                 change_log.record("save_project", {"path": path})
-                return json.dumps(result)
+                return json.dumps({
+                    "status": "success",
+                    "backend": backend_name,
+                    "live_bridge_session": live_bridge,
+                    "message": "Project saved via IPC.",
+                }, indent=2)
             except Exception as e:
                 return json.dumps({"status": "error", "message": str(e)})
-        else:
-            return json.dumps({
-                "status": "info",
-                "message": "Save requires KiCad running with IPC backend. "
-                           "File-based operations auto-save on modification.",
-            })
+
+        message = ("File-based operations auto-save on modification; no explicit "
+                   "project save is required.")
+        if live_bridge:
+            message += (" A live KiCad/pcbnew bridge session is open: its "
+                        "in-memory board may diverge from disk. Saving from the "
+                        "pcbnew GUI can overwrite file-based writes (e.g. an "
+                        "autoroute SES import), and a stale in-memory board can "
+                        "clobber newer on-disk edits on its next flush. Call "
+                        "reload_board after any external file write to keep the "
+                        "live session in sync.")
+        return json.dumps({
+            "status": "info",
+            "backend": backend_name,
+            "live_bridge_session": live_bridge,
+            "message": message,
+        }, indent=2)
 
     @mcp.tool()
     def get_active_project() -> str:
         """Get the currently open KiCad project from a running KiCad instance.
 
-        Queries KiCad via IPC to discover which project is currently open,
-        along with any open schematic and PCB editor documents. On Linux
-        builds where the IPC `GetOpenDocuments` handler is unavailable,
-        project info falls back to the active board document metadata.
-        Requires KiCad 9+ running with IPC enabled.
+        Queries the live KiCad session to discover which project is open, along
+        with any open schematic and PCB editor documents. On Linux builds where
+        the `GetOpenDocuments` handler is unavailable, project info falls back to
+        the active board document metadata.
+
+        Requires a live KiCad session: KiCad 9+ open with the PCB editor showing
+        a board so the kicad_mcp_bridge is reachable. A status of "unavailable"
+        (the "IPC unavailable" message) means no live pcbnew/bridge session is
+        running — it does NOT indicate a broken install. Launch one with
+        ``open_kicad(<path>)`` and re-run ``get_startup_checklist`` until the
+        bridge is ready, then call this again.
 
         Returns:
             JSON with project_name, project_path, and open_documents list.
@@ -548,8 +588,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         if not backend.has_capability(BackendCapability.REAL_TIME_SYNC):
             return json.dumps({
                 "status": "unavailable",
-                "message": "IPC backend is not available. Ensure KiCad 9+ is running "
-                           "with IPC enabled and the kipy package is installed.",
+                "message": "No live KiCad/pcbnew session is available (IPC/bridge "
+                           "unavailable). This is expected until KiCad is open: "
+                           "call open_kicad(<path>) and wait for the bridge to be "
+                           "ready (get_startup_checklist), then retry.",
             })
 
         try:

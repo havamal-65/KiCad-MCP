@@ -48,7 +48,8 @@ _tcp_server: socketserver.TCPServer | None = None
 
 # Bumped whenever the bridge protocol changes (identity handshake, dispatch
 # surface, etc.).  Reported by `ping` so the client can detect a stale bridge.
-_BRIDGE_VERSION = "2.0.0-s4"
+# 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
+_BRIDGE_VERSION = "2.1.0-s5"
 
 
 # ---------------------------------------------------------------------------

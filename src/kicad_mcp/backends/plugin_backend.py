@@ -170,18 +170,31 @@ class PluginBoardOps(BoardOps):
             kw = {"path": str(path), **kwargs}
         try:
             return _tcp_call(method, _get_op_timeout(), **kw)
-        except StaleBoardError:
+        except StaleBoardError as stale:
             # Disk changed under the bridge (#14C): reload from disk once, then
             # retry the original op exactly once. A second stale verdict — the
             # file changed again between reload and retry — propagates.
             if path is None:
                 raise
             try:
-                _tcp_call("reload_board", _get_op_timeout(), path=str(path))
+                reload_result = _tcp_call("reload_board", _get_op_timeout(), path=str(path))
             except BridgeTemporarilyUnavailableError:
                 if self._on_disconnect is not None:
                     self._on_disconnect()
                 raise
+            # The bridge reports loaded=False when pcbnew could not reload the
+            # board in place (KiCad 9 embedded board.Load() quirk). Retrying
+            # would either re-stale or clobber the newer disk state, so refuse
+            # with actionable guidance instead.
+            if isinstance(reload_result, dict) and reload_result.get("loaded") is False:
+                raise StaleBoardError(
+                    f"{stale} The bridge could not reload the board from disk in "
+                    "place (pcbnew board.Load() is unavailable in embedded "
+                    "Python), so the mutation was refused to avoid overwriting "
+                    "the newer on-disk file. Revert/reload the board in the "
+                    "KiCad PCB editor (File > Revert), then retry.",
+                    stale.disk_mtime, stale.loaded_mtime,
+                ) from None
             return _tcp_call(method, _get_op_timeout(), **kw)
         except BridgeTemporarilyUnavailableError:
             if self._on_disconnect is not None:

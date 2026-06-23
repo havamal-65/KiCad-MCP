@@ -49,7 +49,9 @@ _tcp_server: socketserver.TCPServer | None = None
 # Bumped whenever the bridge protocol changes (identity handshake, dispatch
 # surface, etc.).  Reported by `ping` so the client can detect a stale bridge.
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
-_BRIDGE_VERSION = "2.1.0-s5"
+# 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
+#           failed in-place reload can never let a mutation clobber newer disk.
+_BRIDGE_VERSION = "2.1.1-s5"
 
 
 # ---------------------------------------------------------------------------
@@ -1162,9 +1164,13 @@ def _handle_reload_board(path: str) -> dict[str, Any]:
             loaded = True
         except Exception as exc:
             logger.warning("reload_board: board.Load() failed (%s); falling back to Refresh()", exc)
-        # The in-memory board now matches disk — reset the coherence baseline
-        # (#14C) so the stale_board self-heal can complete its retry.
-        _record_load_mtime(filename)
+        # Only reset the coherence baseline (#14C) when the in-memory board
+        # actually reloaded from disk. If board.Load() failed (KiCad 9 embedded
+        # quirk — common), the in-memory board STILL diverges from disk, so the
+        # baseline must stay stale: a subsequent mutation keeps refusing with
+        # stale_board rather than clobbering the newer on-disk state.
+        if loaded:
+            _record_load_mtime(filename)
         try:
             import wx
             wx.CallAfter(pcbnew.Refresh)

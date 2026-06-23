@@ -1,0 +1,45 @@
+title: KiCad MCP Server
+description: A pure Python Model Context Protocol server for KiCad EDA automation.
+url: "https://havamal-65.github.io"
+baseurl: "/KiCad-MCP"
+
+remote_theme: just-the-docs/just-the-docs@v0.10.0
+
+# Navigation
+nav_enabled: true
+nav_sort: order
+
+# Search
+search_enabled: true
+search_tokenizer_separator: /[\s/]+/
+
+# Footer links
+footer_content: "KiCad MCP Server — <a href=\"https://github.com/havamal-65/KiCad-MCP\">GitHub</a>"
+
+# Aux links in top nav
+aux_links:
+  "GitHub":
+    - "https://github.com/havamal-65/KiCad-MCP"
+
+aux_links_new_tab: true
+
+# Color scheme
+color_scheme: light
+
+# Callouts
+callouts_level: quiet
+callouts:
+  note:
+    title: Note
+    color: blue
+  warning:
+    title: Warning
+    color: yellow
+  tip:
+    title: Tip
+    color: green
+
+# Plugins
+plugins:
+  - jekyll-seo-tag
+  - jekyll-remote-theme

@@ -72,15 +72,27 @@ def _is_boardless_bridge_error(err: object) -> bool:
     """True if *err* is the reachable-but-boardless bridge failure (#13C).
 
     The bridge answered but has no live board, so its in-memory export path
-    can't run — the classic symptom is "No board is currently open" or the
-    detached-SwigPyObject ``'SwigPyObject' object has no attribute 'GetFileName'``.
-    Distinct from BridgeTemporarilyUnavailableError (bridge unreachable at all),
-    which already triggers the subprocess fallback. On either, export_dsn falls
-    back to a headless subprocess that loads the board from disk.
+    can't run. Live-observed signatures on KiCad 9 (verified 2026-06-23):
+    - ``Requested board '<path>' does not match open board ''`` — pcbnew open
+      with NO board: ``GetBoard()`` returns a blank board (empty filename), so
+      the path-match check fails against ``''``. This is the actual boardless
+      symptom on this build, NOT "No board is currently open".
+    - ``No board is currently open`` — emitted when ``GetBoard()`` is None.
+    - the detached-SwigPyObject ``'SwigPyObject' object has no attribute
+      'GetFileName'``.
+
+    Only the EMPTY open-board case (``open board ''``) counts — a mismatch
+    against a different *real* board is a genuine wrong-board error and must not
+    silently route to disk. Distinct from BridgeTemporarilyUnavailableError
+    (bridge unreachable at all), which already triggers the subprocess fallback.
+    On any of these, export_dsn falls back to a headless subprocess that loads
+    the board from disk.
     """
     msg = str(err)
     return (
         "No board is currently open" in msg
+        or "match open board ''" in msg
+        or 'match open board ""' in msg
         or "object has no attribute 'GetFileName'" in msg
         or ("SwigPyObject" in msg and "GetFileName" in msg)
     )

@@ -92,7 +92,7 @@ def test_call_reloads_and_retries_on_stale_board():
         if method == "clear_routes" and len([c for c in calls if c[0] == "clear_routes"]) == 1:
             raise StaleBoardError("stale", 2.0, 1.0)  # first attempt only
         if method == "reload_board":
-            return {"success": True}
+            return {"success": True, "loaded": True}  # board actually reloaded
         return {"status": "success", "tracks_removed": 4}
 
     with patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=fake_tcp_call):
@@ -108,12 +108,35 @@ def test_call_reloads_and_retries_on_stale_board():
 def test_call_propagates_when_still_stale_after_reload():
     def fake_tcp_call(method: str, timeout: float, **kwargs):
         if method == "reload_board":
-            return {"success": True}
+            return {"success": True, "loaded": True}
         raise StaleBoardError("still stale", 3.0, 1.0)  # clear_routes always stale
 
     with patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=fake_tcp_call):
         with pytest.raises(StaleBoardError):
             PluginBoardOps().clear_routes(Path("/tmp/b.kicad_pcb"))
+
+
+def test_call_refuses_without_retry_when_reload_could_not_load():
+    """KiCad-9 case: board.Load() fails so reload_board reports loaded=False.
+
+    The client must NOT retry the mutation (retrying would re-stale or clobber
+    the newer disk). It surfaces StaleBoardError with GUI-revert guidance, and
+    the original op is attempted exactly once (the first, failing, call).
+    """
+    calls: list[str] = []
+
+    def fake_tcp_call(method: str, timeout: float, **kwargs):
+        calls.append(method)
+        if method == "reload_board":
+            return {"success": True, "loaded": False}  # pcbnew could not reload
+        raise StaleBoardError("stale", 2.0, 1.0)
+
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=fake_tcp_call):
+        with pytest.raises(StaleBoardError, match="Revert/reload the board"):
+            PluginBoardOps().clear_routes(Path("/tmp/b.kicad_pcb"))
+
+    # clear_routes attempted once, reload attempted once, NO second clear_routes.
+    assert calls == ["clear_routes", "reload_board"]
 
 
 def test_call_reload_failure_marks_bridge_down():

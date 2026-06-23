@@ -31,6 +31,10 @@ from kicad_mcp.tools.routing import (
     "No board is currently open in KiCad",
     "'SwigPyObject' object has no attribute 'GetFileName'",
     "RuntimeError: SwigPyObject ... GetFileName failed",
+    # Live-observed on KiCad 9 (2026-06-23): pcbnew open with no board reports an
+    # empty open board, so the path-match check fails against ''.
+    "Requested board 'D:/proj/test_board.kicad_pcb' does not match open board ''. "
+    "Open the correct .kicad_pcb file in KiCad first.",
 ])
 def test_boardless_patterns_match(msg):
     assert _is_boardless_bridge_error(RuntimeError(msg)) is True
@@ -38,8 +42,11 @@ def test_boardless_patterns_match(msg):
 
 @pytest.mark.parametrize("msg", [
     "ExportSpecctraDSN failed for foo.dsn",
-    "Requested board does not match open board",
     "some unrelated bridge error",
+    # A mismatch against a DIFFERENT real board is a genuine wrong-board error —
+    # must NOT silently route to disk.
+    "Requested board 'D:/proj/test_board.kicad_pcb' does not match open board "
+    "'D:/proj/other.kicad_pcb'. Open the correct .kicad_pcb file in KiCad first.",
 ])
 def test_non_boardless_patterns_do_not_match(msg):
     assert _is_boardless_bridge_error(RuntimeError(msg)) is False

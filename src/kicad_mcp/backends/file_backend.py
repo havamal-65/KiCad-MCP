@@ -836,6 +836,38 @@ class FileBoardOps(BoardOps):
             "pads_updated": len(pad_matches),
         }
 
+    def set_footprint_value(
+        self, path: Path, reference: str, value: str,
+    ) -> dict[str, Any]:
+        """Set a footprint's Value property in the .kicad_pcb file (#2/#7).
+
+        Footprint-targeted (unlike update_component_property, which targets
+        schematic symbols). Gives FileBoardOps and PluginBoardOps a uniform
+        set_footprint_value contract so sync_schematic_to_pcb can push the
+        schematic value to whichever backend is live without branching.
+        """
+        content = path.read_text(encoding="utf-8")
+        location = find_footprint_block_by_reference(content, reference)
+        if location is None:
+            raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
+        start, end = location
+        block = content[start:end + 1]
+
+        val_pattern = re.compile(r'(\(property\s+"Value"\s+)"([^"]*)"')
+        match = val_pattern.search(block)
+        if match is None:
+            raise ValueError(f"Value property not found in footprint '{reference}'")
+        old_value = match.group(2)
+        new_block = block[:match.start(2)] + value + block[match.end(2):]
+        content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        return {
+            "reference": reference,
+            "old_value": old_value,
+            "new_value": value,
+        }
+
 
     # IPC-2221 Class 2 and JLCPCB 2-layer standard rule presets
     _DESIGN_RULE_PRESETS: dict[str, dict[str, float]] = {

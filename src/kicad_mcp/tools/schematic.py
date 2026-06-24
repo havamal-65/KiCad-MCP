@@ -21,15 +21,19 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.schematic")
 
 
-def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str) -> dict:
+def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str, board_ops=None) -> dict:
     """Swap a PCB footprint for *new_fp*, preserving position/rotation/layer/nets.
 
-    File-backend-first (#2): edits the .kicad_pcb directly so the swap is
-    deterministic and CI-testable; a live pcbnew board must be reloaded
-    afterwards. Ambiguous cases are skipped with a reason — never guessed.
+    The three mutations (remove → place → re-net) route through *board_ops* — the
+    live pcbnew bridge when one is open, so the swap lands on the in-memory board
+    and NO reload is needed (#2 deferred work). When *board_ops* is None or the
+    file backend, it edits the .kicad_pcb directly (deterministic, CI-testable).
+    Reads (current placement, footprint resolution) stay file-side: they are
+    read-only and need the fp-lib-table resolver, and file/live board are in sync
+    at swap time. Ambiguous cases are skipped with a reason — never guessed.
 
-    Returns {"applied": True, "record": {...}} on success, or
-    {"applied": False, "reason": "..."} when skipped.
+    Returns {"applied": True, "record": {...}, "via": "bridge"|"file"} on success,
+    or {"applied": False, "reason": "..."} when skipped.
     """
     from kicad_mcp.backends.file_backend import (
         FileBoardOps,
@@ -38,6 +42,10 @@ def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str) -> dict:
     )
 
     file_ops = FileBoardOps(project_dir=pcb_p.parent)
+    # Mutations go to the live bridge when one is open; reads stay file-side.
+    mutate_ops = board_ops if board_ops is not None else file_ops
+    via = "file" if isinstance(mutate_ops, FileBoardOps) else "bridge"
+
     try:
         state = file_ops.get_component_state(pcb_p, ref)
     except ValueError:
@@ -66,8 +74,8 @@ def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str) -> dict:
             "reason": "pad names incompatible between old and new footprint",
         }
 
-    removed = file_ops.remove_component(pcb_p, ref)
-    file_ops.place_component(
+    removed = mutate_ops.remove_component(pcb_p, ref)
+    mutate_ops.place_component(
         pcb_p, ref, new_fp,
         removed["position"]["x"], removed["position"]["y"],
         layer=removed.get("layer") or "F.Cu",
@@ -80,12 +88,13 @@ def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str) -> dict:
             unmatched_pads.append({"pad": pad_name, "net": net})
             continue
         try:
-            file_ops.assign_net(pcb_p, ref, pad_name, net)
+            mutate_ops.assign_net(pcb_p, ref, pad_name, net)
         except ValueError:
             unmatched_pads.append({"pad": pad_name, "net": net})
 
     return {
         "applied": True,
+        "via": via,
         "record": {
             "reference": ref,
             "old_footprint": removed["footprint"],
@@ -1419,6 +1428,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         place_x, place_y = 50.0, 50.0
         place_step = 10.0
         placed_refs: set[str] = set()
+        # True if any applied footprint swap edited the .kicad_pcb file directly
+        # (file backend) rather than the live bridge board — drives the
+        # board_reload_required warning (#2/B3).
+        swaps_used_file_path = False
 
         for ref in sorted(sch_by_ref):
             if ref not in pcb_by_ref:
@@ -1576,10 +1589,14 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 else:
                     create_backup(pcb_p)
                     try:
-                        swap = _attempt_footprint_swap(pcb_p, ref, sch_fp)
+                        swap = _attempt_footprint_swap(
+                            pcb_p, ref, sch_fp, board_ops=board_modify_ops,
+                        )
                     except Exception as exc:
                         swap = {"applied": False, "reason": f"swap failed: {exc}"}
                     if swap["applied"]:
+                        if swap.get("via") == "file":
+                            swaps_used_file_path = True
                         footprint_changes_applied.append(swap["record"])
                         actions.append({
                             "type": "footprint_swapped",
@@ -1601,48 +1618,25 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             sch_val = sch_sym.get("value", "")
             pcb_val = pcb_comp.get("value", "") if pcb_comp else ""
             if sch_val and sch_val != pcb_val:
-                # Update PCB value
+                # Update the PCB footprint Value through board_modify_ops — the
+                # live bridge when one is open (so the value lands on the
+                # in-memory board, not just the file behind the bridge's back,
+                # which is the #7 revert root cause), else the file backend.
                 if board_modify_ops is not None:
                     try:
-                        # Update the Value property via text replacement
-                        content = pcb_p.read_text(encoding="utf-8")
-                        from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
-                        location = find_footprint_block_by_reference(content, ref)
-                        if location:
-                            start, end = location
-                            block = content[start:end + 1]
-                            # Replace the Value property
-                            import re
-                            val_pattern = re.compile(
-                                r'(\(property\s+"Value"\s+)"([^"]*)"'
-                            )
-                            match = val_pattern.search(block)
-                            if match:
-                                new_block = (
-                                    block[:match.start(2)]
-                                    + sch_val
-                                    + block[match.end(2):]
-                                )
-                                content = content[:start] + new_block + content[end + 1:]
-                                pcb_p.write_text(content, encoding="utf-8")
-                                actions.append({
-                                    "type": "value_updated",
-                                    "reference": ref,
-                                    "old_value": pcb_val,
-                                    "new_value": sch_val,
-                                })
-                            else:
-                                warnings.append({
-                                    "type": "value_mismatch",
-                                    "reference": ref,
-                                    "message": f"Could not find Value property in PCB for {ref}.",
-                                })
-                        else:
-                            warnings.append({
-                                "type": "value_mismatch",
-                                "reference": ref,
-                                "message": f"Could not locate {ref} in PCB for value update.",
-                            })
+                        board_modify_ops.set_footprint_value(pcb_p, ref, sch_val)
+                        actions.append({
+                            "type": "value_updated",
+                            "reference": ref,
+                            "old_value": pcb_val,
+                            "new_value": sch_val,
+                        })
+                    except ValueError as exc:
+                        warnings.append({
+                            "type": "value_mismatch",
+                            "reference": ref,
+                            "message": f"Could not update Value for {ref}: {exc}",
+                        })
                     except Exception as exc:
                         warnings.append({
                             "type": "value_update_failed",
@@ -1795,15 +1789,19 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     "message": "Board modify backend not available; schematic nets were not synced to PCB pads.",
                 })
 
-        # Footprint swaps bypass any live pcbnew board (file-backend-first);
-        # warn once that the in-memory board is now stale.
-        if footprint_changes_applied and not isinstance(pcb_ops, FileBoardOps):
+        # Swaps normally route through the live bridge (B1), so the in-memory
+        # board already matches disk and no reload is needed. Warn only when a
+        # swap actually fell back to the file path while a live pcbnew board is
+        # open (e.g. the bridge dropped mid-sync) — that is the only case where
+        # the in-memory board now diverges from disk (#2/B3).
+        if (footprint_changes_applied and swaps_used_file_path
+                and not isinstance(pcb_ops, FileBoardOps)):
             warnings.append({
                 "type": "board_reload_required",
                 "message": (
-                    "Footprint swaps edited the board file directly; reload the "
-                    "board in pcbnew (reload_board) before further live-board "
-                    "operations."
+                    "Footprint swaps fell back to editing the board file directly; "
+                    "reload the board in pcbnew (reload_board) before further "
+                    "live-board operations."
                 ),
             })
 

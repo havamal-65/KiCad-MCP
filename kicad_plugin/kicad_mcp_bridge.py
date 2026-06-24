@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.1.1-s5"
+_BRIDGE_VERSION = "2.2.0-s6"
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +943,31 @@ def _handle_assign_net(path: str, reference: str, pad: str, net: str) -> dict[st
     return _run_on_main_thread(_do)
 
 
+def _handle_set_footprint_value(path: str, reference: str, value: str) -> dict[str, Any]:
+    """Set a footprint's Value field on the live in-memory board and save (#2/#7).
+
+    Lets sync_schematic_to_pcb push schematic-synced Values through the live
+    bridge instead of editing the .kicad_pcb file behind the bridge's back —
+    which is the file/memory divergence that lets a later bridge save revert the
+    Value (#7). The bridge previously only read Values (GetValue), never wrote.
+    """
+    def _do():
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        old_value = fp.GetValue()
+        fp.SetValue(value)
+        _save_and_refresh(board)
+        return {
+            "status": "ok",
+            "reference": reference,
+            "old_value": old_value,
+            "new_value": value,
+        }
+    return _run_on_main_thread(_do)
+
+
 def _handle_refill_zones(path: str) -> dict[str, Any]:
     def _do():
         import pcbnew
@@ -1122,6 +1147,27 @@ def _handle_export_dsn(path: str, dsn_path: str) -> dict[str, Any]:
     return _run_on_main_thread(_do)
 
 
+def _snapshot_footprint_values(footprints) -> dict:
+    """Map reference → Value for every footprint (the pre-import snapshot, #7)."""
+    return {fp.GetReference(): fp.GetValue() for fp in footprints}
+
+
+def _restore_footprint_values(footprints, values_before: dict) -> int:
+    """Restore any footprint Value that changed since *values_before* (#7).
+
+    Pure helper over GetReference/GetValue/SetValue so the snapshot/restore guard
+    is unit-testable without pcbnew. Returns how many Values were restored.
+    """
+    restored = 0
+    for fp in footprints:
+        ref = fp.GetReference()
+        old_val = values_before.get(ref)
+        if old_val is not None and fp.GetValue() != old_val:
+            fp.SetValue(old_val)
+            restored += 1
+    return restored
+
+
 def _handle_import_ses(path: str, ses_path: str) -> dict[str, Any]:
     """Import a Specctra SES routing file into the live in-memory board.
 
@@ -1132,9 +1178,15 @@ def _handle_import_ses(path: str, ses_path: str) -> dict[str, Any]:
         import pcbnew
         board = _get_open_board(path)
         tracks_before = len(board.GetTracks())
+        # Snapshot footprint Values before the import (#7 insurance). SES files
+        # carry routing + placements, not Values, so ImportSpecctraSES should not
+        # touch them — but defensively restore any it changes, so a routing import
+        # can never revert a footprint Value regardless of KiCad version.
+        values_before = _snapshot_footprint_values(board.GetFootprints())
         ok = pcbnew.ImportSpecctraSES(board, ses_path)
         if not ok:
             raise ValueError(f"ImportSpecctraSES failed for {ses_path!r}")
+        values_restored = _restore_footprint_values(board.GetFootprints(), values_before)
         tracks_after = len(board.GetTracks())
         _save_and_refresh(board)
         return {
@@ -1142,6 +1194,7 @@ def _handle_import_ses(path: str, ses_path: str) -> dict[str, Any]:
             "tracks_before": tracks_before,
             "tracks_after": tracks_after,
             "new_tracks": tracks_after - tracks_before,
+            "values_restored": values_restored,
         }
     return _run_on_main_thread(_do)
 
@@ -1218,6 +1271,9 @@ _DISPATCH = {
     "assign_net":         lambda req: _handle_assign_net(
         req["path"], req["reference"], req["pad"], req["net"],
     ),
+    "set_footprint_value": lambda req: _handle_set_footprint_value(
+        req["path"], req["reference"], req["value"],
+    ),
     "refill_zones":       lambda req: _handle_refill_zones(req["path"]),
     "save_board":         lambda req: _handle_save_board(req["path"]),
     "clear_routes":       lambda req: _handle_clear_routes(
@@ -1246,8 +1302,8 @@ _DISPATCH = {
 _MUTATING_METHODS = frozenset({
     "place_component", "place_components_bulk", "move_component",
     "remove_component", "add_track", "add_via", "assign_net",
-    "refill_zones", "save_board", "clear_routes", "add_board_outline",
-    "auto_place", "import_ses",
+    "set_footprint_value", "refill_zones", "save_board", "clear_routes",
+    "add_board_outline", "auto_place", "import_ses",
 })
 
 

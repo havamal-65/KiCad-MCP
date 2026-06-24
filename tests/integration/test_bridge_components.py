@@ -215,6 +215,41 @@ def test_remove_component_unknown_ref_errors(bridge_session):
         _tcp_call("remove_component", 10.0, path=path, reference="T11_NOPE")
 
 
+def test_set_footprint_value_lands_on_live_board_and_file(bridge_session):
+    """Known-issues #2/#7 (bridge side): set_footprint_value updates the Value on
+    the live in-memory board AND the saved file — so sync_schematic_to_pcb can
+    push schematic Values through the bridge instead of editing the file behind
+    the bridge's back (the #7 revert root cause)."""
+    path = _board_path()
+    ref = "T12_U6"
+    _tcp_call(
+        "place_component", 5.0,
+        path=path, reference=ref, footprint=_RESISTOR_FP,
+        x=130.0, y=10.0, rotation=0,
+    )
+
+    result = _tcp_call(
+        "set_footprint_value", 5.0,
+        path=path, reference=ref, value="Adafruit_PMSA003I",
+    )
+    assert result["status"] == "ok", result
+    assert result["new_value"] == "Adafruit_PMSA003I", result
+
+    # Live board reflects the new Value...
+    comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
+    assert comp is not None and comp["value"] == "Adafruit_PMSA003I", comp
+    # ...and so does the saved file.
+    text = Path(path).read_text(encoding="utf-8")
+    assert '(property "Value" "Adafruit_PMSA003I"' in text
+
+
+def test_set_footprint_value_unknown_ref_errors(bridge_session):
+    """Setting a Value on a nonexistent ref must raise, not silently pass."""
+    path = _board_path()
+    with pytest.raises(RuntimeError, match="T12_NOPE"):
+        _tcp_call("set_footprint_value", 5.0, path=path, reference="T12_NOPE", value="x")
+
+
 def test_move_component_rotation(bridge_session):
     """REQ-COV-009: rotate via move_component; new rotation in saved file."""
     path = _board_path()

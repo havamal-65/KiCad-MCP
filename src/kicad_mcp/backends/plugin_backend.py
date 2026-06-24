@@ -278,6 +278,12 @@ class PluginBoardOps(BoardOps):
         return self._call("assign_net", path,
                           reference=reference, pad=pad, net=net)
 
+    def set_footprint_value(
+        self, path: Path, reference: str, value: str,
+    ) -> dict[str, Any]:
+        return self._call("set_footprint_value", path,
+                          reference=reference, value=value)
+
     def refill_zones(self, path: Path) -> dict[str, Any]:
         return self._call("refill_zones", path)
 

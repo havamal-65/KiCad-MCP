@@ -1,0 +1,71 @@
+(session s6_route
+  (base_design s6_route)
+  (placement
+    (resolution um 10)
+    (component Resistor_SMD:R_0805_2012Metric
+      (place R2 650000 -550000 front 0)
+      (place R1 500000 -500000 front 0)
+      (place T12_U6 1300000 -100000 front 0)
+      (place T08_R1 550000 -520000 front 0)
+      (place T07_R3 340000 -100000 front 0)
+      (place T07_R2 320000 -100000 front 0)
+      (place T07_R1 300000 -100000 front 0)
+      (place T06_R1 100000 -100000 front 0)
+    )
+    (component Resistor_SMD:R_0805_2012Metric::1
+      (place T09_R1 700000 -500000 front 90)
+    )
+    (component T10_TestLib:R_Test
+      (place T10_R1 900000 -100000 front 0)
+    )
+  )
+  (was_is
+  )
+  (routes 
+    (resolution um 10)
+    (parser
+      (host_cad "KiCad's Pcbnew")
+      (host_version 9.0.7)
+    )
+    (library_out 
+      (padstack "Via[0-1]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+      (padstack "Via[0-1]_600:300_um"
+        (shape
+          (circle F.Cu 6000 0 0)
+        )
+        (shape
+          (circle B.Cu 6000 0 0)
+        )
+        (attach off)
+      )
+    )
+    (network_out 
+      (net NETA
+        (wire
+          (path F.Cu 2000
+            490875 -500000
+            540875 -550000
+            640875 -550000
+          )
+        )
+      )
+      (net NETB
+        (wire
+          (path F.Cu 2000
+            509125 -500000
+            609125 -500000
+            659125 -550000
+          )
+        )
+      )
+    )
+  )
+)

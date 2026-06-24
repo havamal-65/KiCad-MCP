@@ -275,3 +275,89 @@ def test_skip_when_multi_unit_footprints_conflict(project, tmp_path: Path):
     assert result["summary"]["footprint_changes_skipped"] == 1
     assert "multi-unit" in result["footprint_changes_skipped"][0]["reason"]
     assert "Test:R_0603" in pcb.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Bridge-path routing (#2 deferred / B1+B3) — swaps go through the live board
+# ---------------------------------------------------------------------------
+
+class _RecordingBridgeOps:
+    """A stand-in for the live PluginBoardOps — NOT a FileBoardOps, so
+    _attempt_footprint_swap treats it as the live bridge and routes the three
+    mutations to it instead of editing the file."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def remove_component(self, path, reference):
+        self.calls.append(("remove_component", reference))
+        # Mirror the bridge handler's captured-state payload (S2).
+        return {
+            "reference": reference,
+            "removed": True,
+            "footprint": "Test:R_0603",
+            "position": {"x": 50.0, "y": 60.0},
+            "rotation": 90.0,
+            "layer": "F.Cu",
+            "locked": False,
+            "pad_nets": {"1": "VCC", "2": "GND"},
+        }
+
+    def place_component(self, path, reference, footprint, x, y, layer="F.Cu", rotation=0.0):
+        self.calls.append(("place_component", reference, footprint, x, y, layer, rotation))
+        return {"reference": reference}
+
+    def assign_net(self, path, reference, pad, net):
+        self.calls.append(("assign_net", reference, pad, net))
+        return {"reference": reference, "pad": pad, "net": net}
+
+
+def test_swap_routes_mutations_through_live_bridge(project):
+    """With a live bridge ops object, the swap's remove/place/assign land on the
+    bridge (not the file), and the record is tagged via="bridge"."""
+    sch, pcb = project()
+    bridge = _RecordingBridgeOps()
+    original = pcb.read_text(encoding="utf-8")
+
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod", return_value=_R_0805_MOD):
+        swap = schematic._attempt_footprint_swap(
+            pcb, "R1", "Test:R_0805", board_ops=bridge,
+        )
+
+    assert swap["applied"] is True
+    assert swap["via"] == "bridge"
+    methods = [c[0] for c in bridge.calls]
+    assert methods == ["remove_component", "place_component", "assign_net", "assign_net"]
+    # Position/rotation/layer preserved on the bridge place call.
+    place = next(c for c in bridge.calls if c[0] == "place_component")
+    assert place[3:7] == (50.0, 60.0, "F.Cu", 90.0)
+    # The file was NOT edited directly — the bridge owns the mutation.
+    assert pcb.read_text(encoding="utf-8") == original
+
+
+def test_swap_via_file_when_no_bridge(project):
+    """Default (board_ops=None) keeps the deterministic file path, via="file"."""
+    sch, pcb = project()
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod", return_value=_R_0805_MOD):
+        swap = schematic._attempt_footprint_swap(pcb, "R1", "Test:R_0805")
+
+    assert swap["applied"] is True
+    assert swap["via"] == "file"
+    # File path actually edits the board.
+    assert "Test:R_0603" not in pcb.read_text(encoding="utf-8")
+
+
+def test_no_reload_warning_when_swap_uses_file_backend(project):
+    """With the file backend end-to-end (pcb_ops is FileBoardOps), a swap edits
+    the file but no live board is open — so no board_reload_required warning."""
+    sch, pcb = project()
+    result = _call_sync(
+        sch, pcb, {"Test:R_0805": _R_0805_MOD}, apply_footprint_changes=True,
+    )
+
+    reload_warnings = [w for w in result["warnings"] if w.get("type") == "board_reload_required"]
+    assert reload_warnings == []
+    # Value still synced to the schematic value through set_footprint_value.
+    assert '(property "Value" "10k"' in _footprint_block(
+        pcb.read_text(encoding="utf-8"), "Test:R_0805"
+    )

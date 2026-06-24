@@ -155,6 +155,106 @@ def _export_dsn_with_fallback(backend: BackendProtocol, p: Path, dsn_path: Path)
         raise
 
 
+def _import_ses_subprocess(p: Path, ses_path: Path) -> dict:
+    """Headless SES import: load the on-disk board in a subprocess pcbnew, run
+    ImportSpecctraSES, and save back to disk.
+
+    The #7 fix: because the board is loaded FRESH from disk, it carries the
+    latest file-written footprint Values (e.g. the schematic-synced Value set by
+    sync_schematic_to_pcb). The save therefore cannot revert them — unlike the
+    bridge path, whose stale in-memory board would clobber the file. Used when
+    the live bridge is unreachable, boardless, or holds a stale board. Raises on
+    failure.
+    """
+    pcbnew = _get_pcbnew()
+    if pcbnew is not None:
+        board = pcbnew.LoadBoard(str(p))
+        if board is None:
+            raise RuntimeError(_malformed_board_message(p))
+        tracks_before = len(board.GetTracks())
+        ok = pcbnew.ImportSpecctraSES(board, str(ses_path))
+        if not ok:
+            raise RuntimeError(f"ImportSpecctraSES failed for {ses_path}")
+        tracks_after = len(board.GetTracks())
+        board.Save(str(p))
+        return {
+            "success": True,
+            "tracks_before": tracks_before,
+            "tracks_after": tracks_after,
+            "new_tracks": tracks_after - tracks_before,
+            "via": "subprocess",
+        }
+
+    script = f"""
+import pcbnew, sys
+board = pcbnew.LoadBoard({str(p)!r})
+if board is None:
+    print("{_BOARD_LOAD_FAILED_SENTINEL}")
+    sys.exit(2)
+before = len(board.GetTracks())
+ok = pcbnew.ImportSpecctraSES(board, {str(ses_path)!r})
+if not ok:
+    print("SES_FAIL")
+    sys.exit(2)
+board.Save({str(p)!r})
+after = len(board.GetTracks())
+print("SES_OK %d %d" % (before, after))
+"""
+    ok, output_text = _run_pcbnew_script(script, timeout=_BOARD_CLEAN_TIMEOUT_SECONDS)
+    if not ok or "SES_OK" not in output_text:
+        raise RuntimeError(_format_pcbnew_error("SES import failed", output_text, p))
+    before, after = 0, 0
+    for line in output_text.splitlines():
+        if line.startswith("SES_OK"):
+            parts = line.split()
+            if len(parts) == 3:
+                before, after = int(parts[1]), int(parts[2])
+            break
+    return {
+        "success": True,
+        "tracks_before": before,
+        "tracks_after": after,
+        "new_tracks": after - before,
+        "via": "subprocess",
+    }
+
+
+def _import_ses_with_fallback(backend: BackendProtocol, p: Path, ses_path: Path) -> dict:
+    """Import SES via the live bridge, falling back to a headless subprocess.
+
+    The bridge path imports into pcbnew's live in-memory board and saves. But
+    when that in-memory board is STALE relative to disk (the #7 root cause — a
+    footprint Value was written to the file while the bridge held an older
+    board), saving it would revert the file. So on a stale board (StaleBoardError
+    from the S5 coherence gate), a boardless bridge (#13C), or an unreachable
+    bridge, fall back to _import_ses_subprocess, which loads the board fresh from
+    disk and preserves the file-written state. Mirrors _export_dsn_with_fallback.
+    """
+    from kicad_mcp.backends.plugin_backend import (
+        BridgeTemporarilyUnavailableError,
+        StaleBoardError,
+    )
+
+    try:
+        return backend.import_ses(p, ses_path)
+    except StaleBoardError as exc:
+        logger.warning(
+            "import_ses: bridge board stale vs disk (%s); subprocess fallback "
+            "loads fresh from disk so file-written Values survive (#7)", exc
+        )
+        return _import_ses_subprocess(p, ses_path)
+    except BridgeTemporarilyUnavailableError as exc:
+        logger.warning("import_ses: bridge unreachable (%s); subprocess fallback", exc)
+        return _import_ses_subprocess(p, ses_path)
+    except Exception as exc:
+        if _is_boardless_bridge_error(exc):
+            logger.warning(
+                "import_ses: bridge reachable but boardless (%s); subprocess fallback", exc
+            )
+            return _import_ses_subprocess(p, ses_path)
+        raise
+
+
 def _impl_run_freerouter(
     dsn_path: str,
     output: str,
@@ -636,7 +736,7 @@ def register_tools(
         ses = Path(ses_path).resolve()
         backup = create_backup(p)
         try:
-            result = backend.import_ses(p, ses)
+            result = _import_ses_with_fallback(backend, p, ses)
         except Exception as exc:
             return json.dumps({"status": "error", "message": str(exc)}, indent=2)
         change_log.record(
@@ -645,7 +745,13 @@ def register_tools(
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
-        backend.reload_board(p)
+        # Refresh the live bridge so post-import tracks are visible. The
+        # subprocess fallback already wrote disk; reload is a best-effort GUI
+        # sync and must not mask a successful import if the bridge is down.
+        try:
+            backend.reload_board(p)
+        except Exception as reload_exc:
+            logger.warning("import_ses: reload_board after import failed (non-fatal): %s", reload_exc)
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
@@ -835,10 +941,11 @@ def register_tools(
             dsn.unlink(missing_ok=True)
             return json.dumps(report, indent=2)
 
-        # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves)
-        # or subprocess pcbnew, via BOARD_ROUTE capability.
+        # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves),
+        # falling back to a headless subprocess that loads the board fresh from disk when the
+        # bridge is unreachable, boardless, or stale (#7 — preserves file-written Values).
         try:
-            ses_result = backend.import_ses(p, ses)
+            ses_result = _import_ses_with_fallback(backend, p, ses)
             report["steps"].append({"step": "import_ses", "status": "success", **ses_result})
             report["message"] = (
                 f"Auto-routing complete: {ses_result.get('new_tracks', 0)} tracks routed"

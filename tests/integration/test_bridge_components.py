@@ -84,6 +84,9 @@ def test_place_component_appears_in_get_components(bridge_session):
     assert found is not None, f"{ref} not found in get_components after placement"
     assert abs(found["x"] - 10.0) < _POSITION_TOL_MM, found
     assert abs(found["y"] - 10.0) < _POSITION_TOL_MM, found
+    # get_components MUST carry the footprint lib_id, else sync_schematic_to_pcb
+    # cannot detect footprint mismatches against a live board (#2 swap path).
+    assert found.get("footprint") == _RESISTOR_FP, found
 
 
 def test_place_components_bulk_adds_all(bridge_session):

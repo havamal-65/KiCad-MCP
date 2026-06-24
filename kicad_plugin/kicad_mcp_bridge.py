@@ -533,9 +533,19 @@ def _handle_get_components(path: str) -> list[dict[str, Any]]:
         components = []
         for fp in board.GetFootprints():
             pos = fp.GetPosition()
+            # Include the footprint lib_id (e.g. "Resistor_SMD:R_0805_2012Metric")
+            # so sync_schematic_to_pcb can detect footprint mismatches on the
+            # live-bridge read path — without it the swap branch never fires
+            # against a live board (#2). Mirrors the lib_id read in
+            # _handle_remove_component.
+            try:
+                lib_id = str(fp.GetFPID().GetUniStringLibId())
+            except Exception:
+                lib_id = ""
             components.append({
                 "reference": fp.GetReference(),
                 "value": fp.GetValue(),
+                "footprint": lib_id,
                 "x": round(pcbnew.ToMM(pos.x), 4),
                 "y": round(pcbnew.ToMM(pos.y), 4),
                 "layer": fp.GetLayerName(),

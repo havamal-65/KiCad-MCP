@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -13,6 +15,123 @@ from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.validation import validate_kicad_path
 
 logger = get_logger("tools.export")
+
+
+# ── §6.6 verify_3d_models — 3D model file resolution ─────────────────────────
+# Pure file-read: walks every footprint's (model "…") clause, expands KiCad path
+# variables, and checks the file exists on disk. Records the verdict to the
+# validation cache so the §6.7 manufacturing audit can consume it. No bridge.
+
+# .wrl <-> .step/.stp: KiCad footprints often reference one format while only the
+# other is on disk (export_step vs the 3D viewer prefer different ones). Treat a
+# present sibling as the model being present, not missing.
+_MODEL_EXT_SIBLINGS: dict[str, list[str]] = {
+    ".wrl": [".step", ".stp"],
+    ".step": [".wrl"],
+    ".stp": [".wrl"],
+}
+
+
+def _resolve_model_path(model_path: str, project_dir: Path) -> tuple[Path | None, str | None]:
+    """Resolve a footprint model path to an absolute filesystem path.
+
+    Returns ``(resolved_path, None)`` on success, or ``(None, variable_name)``
+    when a ``${VAR}`` in the path cannot be expanded. ``${KIPRJMOD}``/``${PROJ_DIR}``
+    resolve against *project_dir*; other variables try the environment then the
+    KiCad-conventional defaults (``_default_var_value``). Relative paths with no
+    variable are taken relative to *project_dir* (KiCad's ${KIPRJMOD} default).
+    """
+    from kicad_mcp.utils.fp_lib_table import (
+        _VAR_PATTERN,
+        _default_var_value,
+        resolve_lib_uri,
+    )
+
+    # Pinpoint any unresolvable variable so the caller can report which to fix.
+    for m in _VAR_PATTERN.finditer(model_path):
+        var = m.group(1)
+        if var in ("KIPRJMOD", "PROJ_DIR"):
+            continue  # backed by project_dir
+        if os.environ.get(var) or _default_var_value(var):
+            continue
+        return None, var
+
+    resolved = resolve_lib_uri(model_path, project_dir)
+    if resolved is None:
+        return None, None
+    if not resolved.is_absolute():
+        resolved = project_dir / resolved
+    return resolved, None
+
+
+def _model_exists(resolved: Path) -> tuple[bool, str | None]:
+    """Return ``(exists, note)``. *note* is set when the model was found only via
+    a ``.wrl``/``.step`` sibling (REQ-RESOLVE-003)."""
+    if resolved.exists():
+        return True, None
+    for alt in _MODEL_EXT_SIBLINGS.get(resolved.suffix.lower(), []):
+        if resolved.with_suffix(alt).exists():
+            return True, f"found via {alt} sibling"
+    return False, None
+
+
+def run_verify_3d_models(board_path: Path) -> dict[str, Any]:
+    """Verify every placed footprint's 3D model file resolves on disk.
+
+    Read-only. Returns ``{ready, checked, missing, warnings}`` where
+    ``ready == (missing == [])``. Records ``{ready, missing_count}`` to the
+    validation cache for the §6.7 manufacturing-readiness audit.
+    """
+    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.utils.validation_cache import record_validation
+
+    project_dir = board_path.parent
+    components = FileBoardOps(project_dir=str(project_dir)).get_components(board_path)
+
+    checked = 0
+    missing: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    for comp in components:
+        ref = comp.get("reference", "?")
+        fp = comp.get("footprint", "?")
+        for model_path in comp.get("models", []):  # no models -> skipped (REQ-CHECK-004)
+            checked += 1
+            resolved, unresolved_var = _resolve_model_path(model_path, project_dir)
+            if resolved is None:
+                missing.append({
+                    "footprint": fp, "ref": ref, "model_path": model_path,
+                    "resolved_path": model_path, "reason": "unresolved_variable",
+                    "variable": unresolved_var,
+                })
+                continue
+            exists, note = _model_exists(resolved)
+            if exists:
+                if note:
+                    warnings.append({
+                        "ref": ref, "type": "extension_sibling",
+                        "message": f"{ref}: {model_path} {note}",
+                    })
+            else:
+                missing.append({
+                    "footprint": fp, "ref": ref, "model_path": model_path,
+                    "resolved_path": str(resolved), "reason": "file_not_found",
+                })
+
+    over_limit = len(missing) > 25
+    result: dict[str, Any] = {
+        "ready": not missing,
+        "checked": checked,
+        "missing": missing[:25],
+        "warnings": warnings,
+    }
+    if over_limit:
+        result["over_limit"] = True
+
+    record_validation(
+        board_path, "verify_3d_models",
+        {"ready": result["ready"], "missing_count": len(missing)},
+    )
+    return result
 
 
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
@@ -275,6 +394,27 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 "status": "error",
                 "message": f"STEP export failed: {e}. Requires kicad-cli backend.",
             })
+
+    @mcp.tool()
+    def verify_3d_models(board_path: str) -> str:
+        """Verify every footprint's 3D model file resolves on disk.
+
+        Walks each placed footprint's (model "…") clause, expands KiCad path
+        variables (${KICAD9_3DMODEL_DIR}, ${KIPRJMOD}, …), and checks the file
+        exists — with a .wrl<->.step sibling fallback. Read-only; a pre-flight
+        for export_step and the manufacturing-readiness audit. Records its
+        verdict to the validation cache.
+
+        Args:
+            board_path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON: {ready, checked, missing:[{footprint,ref,model_path,resolved_path,reason}], warnings}.
+            ready is true iff missing is empty. reason is "file_not_found" or
+            "unresolved_variable".
+        """
+        p = validate_kicad_path(board_path, ".kicad_pcb")
+        return json.dumps(run_verify_3d_models(p), indent=2)
 
     @mcp.tool()
     def export_vrml(path: str, output: str | None = None) -> str:

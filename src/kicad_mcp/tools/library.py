@@ -218,22 +218,35 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
     @mcp.tool()
     def estimate_board_size(
         footprint_ids: list[str],
-        routing_overhead_pct: float = 20.0,
+        routing_channel_pct: float = 20.0,
         edge_clearance_mm: float = 3.0,
         margin_pct: float = 25.0,
+        panel_keepout_mm: float = 3.0,
+        mounting_hole_keepout_mm: float = 3.0,
+        fiducial_keepout_mm: float = 1.0,
+        routing_overhead_pct: float | None = None,
     ) -> str:
         """Estimate minimum board dimensions from a list of footprints.
 
         Calculates recommended board width and height before calling plan_project,
         so that board dimensions are driven by actual component footprints rather
-        than guesswork. Call this with all key footprints before plan_project.
+        than guesswork. Factors in the same manufacturing tolerances that
+        verify_board_size (§6.5) enforces, so the recommendation is one the
+        verifier accepts. Call this with all key footprints before plan_project.
 
         Args:
             footprint_ids: List of footprint lib_ids to size for, e.g.
                 ["RF_Module:ESP32-C3-WROOM-02", "Sensor_Humidity:SHT31-DIS"].
-            routing_overhead_pct: Extra area for routing channels (default 20%).
-            edge_clearance_mm: Board-edge-to-copper clearance added to each edge (default 3.0).
+            routing_channel_pct: Area reserved for routing as % of component
+                courtyard area (default 20%). Canonical name for the legacy
+                routing_overhead_pct.
+            edge_clearance_mm: Legacy alias for panel_keepout_mm (default 3.0).
             margin_pct: Final dimensional margin applied after all other calculations (default 25%).
+            panel_keepout_mm: Panelization edge keepout band per edge (default 3.0).
+            mounting_hole_keepout_mm: Keepout radius per mounting-hole footprint (default 3.0).
+            fiducial_keepout_mm: Keepout radius per fiducial footprint (default 1.0).
+            routing_overhead_pct: Deprecated alias for routing_channel_pct; when
+                both are supplied, routing_channel_pct wins.
 
         Returns:
             JSON with recommended_width_mm, recommended_height_mm, area breakdown,
@@ -241,10 +254,26 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         import math
         from kicad_mcp.backends.file_backend import _load_kicad_mod, _parse_footprint_bounds
+        from kicad_mcp.utils.board_size import ceil5, is_fiducial, is_mounting_hole
+
+        # Legacy-alias resolution (REQ-EST-002). The canonical params win when an
+        # alias is also supplied; an alias is honored only when its canonical
+        # counterpart is left at its default.
+        alias_note: str | None = None
+        effective_channel = routing_channel_pct
+        if routing_overhead_pct is not None:
+            if routing_channel_pct != 20.0:
+                alias_note = "routing_overhead_pct ignored; routing_channel_pct supplied (it wins)"
+            else:
+                effective_channel = routing_overhead_pct
+                alias_note = "routing_overhead_pct is a deprecated alias for routing_channel_pct"
+        effective_panel = panel_keepout_mm if panel_keepout_mm != 3.0 else edge_clearance_mm
 
         per_component: list[dict] = []
         missing: list[str] = []
         component_area = 0.0
+        mh_count = 0
+        fid_count = 0
 
         for fp_id in footprint_ids:
             kicad_mod = _load_kicad_mod(fp_id)
@@ -262,52 +291,69 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 "height_mm": round(h, 4),
                 "area_mm2": area,
             })
+            if is_mounting_hole("", fp_id):
+                mh_count += 1
+            elif is_fiducial("", fp_id):
+                fid_count += 1
 
         if component_area == 0.0:
             # Nothing found — return a safe minimum
             component_area = 400.0  # 20×20 mm fallback
 
-        routing_overhead = component_area * (routing_overhead_pct / 100.0)
-        routed_area = component_area + routing_overhead
+        routing_channel = component_area * (effective_channel / 100.0)
+        mh_fid_keepout = (
+            mh_count * math.pi * mounting_hole_keepout_mm ** 2
+            + fid_count * math.pi * fiducial_keepout_mm ** 2
+        )
+        routed_area = component_area + routing_channel + mh_fid_keepout
 
         # Landscape aspect ratio (width : height ≈ 1.4) using sqrt
         landscape_ratio = 1.4
         raw_width = math.sqrt(routed_area * landscape_ratio)
         raw_height = math.sqrt(routed_area / landscape_ratio)
 
-        # Add edge clearance to both sides of each dimension
-        raw_width += edge_clearance_mm * 2
-        raw_height += edge_clearance_mm * 2
-
-        def _ceil5(v: float) -> float:
-            return math.ceil(v / 5.0) * 5.0
+        # Add the panelization edge keepout band to both sides of each dimension
+        raw_width += effective_panel * 2
+        raw_height += effective_panel * 2
 
         # Round up to nearest 5 mm (standard fab panel snap)
-        w5 = _ceil5(raw_width)
-        h5 = _ceil5(raw_height)
+        w5 = ceil5(raw_width)
+        h5 = ceil5(raw_height)
 
         # Apply final dimensional margin
-        final_w = _ceil5(w5 * (1.0 + margin_pct / 100.0))
-        final_h = _ceil5(h5 * (1.0 + margin_pct / 100.0))
+        final_w = ceil5(w5 * (1.0 + margin_pct / 100.0))
+        final_h = ceil5(h5 * (1.0 + margin_pct / 100.0))
 
-        edge_clearance_contrib = (edge_clearance_mm * 2) ** 2
+        panel_keepout_contrib = (effective_panel * 2) ** 2
 
-        change_log.record("estimate_board_size", {"footprint_count": len(footprint_ids)})
-        return json.dumps({
+        area_breakdown = {
+            "component_area_mm2": round(component_area, 2),
+            "routing_channel_mm2": round(routing_channel, 2),
+            "panel_keepout_mm2": round(panel_keepout_contrib, 2),
+            "margin_applied_pct": margin_pct,
+            # Back-compat keys (REQ-EST-003: existing area_breakdown keys preserved)
+            "routing_overhead_mm2": round(routing_channel, 2),
+            "edge_clearance_contribution_mm2": round(panel_keepout_contrib, 2),
+        }
+        if mh_count or fid_count:
+            area_breakdown["mounting_fiducial_keepout_mm2"] = round(mh_fid_keepout, 2)
+
+        result = {
             "status": "success",
             "component_count": len(per_component),
             "missing_footprints": missing,
             "component_area_mm2": round(component_area, 2),
             "recommended_width_mm": final_w,
             "recommended_height_mm": final_h,
-            "area_breakdown": {
-                "component_area_mm2": round(component_area, 2),
-                "routing_overhead_mm2": round(routing_overhead, 2),
-                "edge_clearance_contribution_mm2": round(edge_clearance_contrib, 2),
-                "margin_applied_pct": margin_pct,
-            },
+            "area_breakdown": area_breakdown,
             "per_component": per_component,
-        }, indent=2)
+        }
+        if alias_note is not None:
+            result["routing_overhead_pct_alias_used"] = True
+            result["alias_note"] = alias_note
+
+        change_log.record("estimate_board_size", {"footprint_count": len(footprint_ids)})
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def get_footprint_bounds(lib_id: str, project_dir: str = "") -> str:

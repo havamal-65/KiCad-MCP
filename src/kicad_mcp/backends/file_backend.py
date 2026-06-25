@@ -4328,6 +4328,12 @@ def _parse_footprint(node: list) -> dict[str, Any] | None:
                 comp["reference"] = child[2]
             elif child[1] == "value":
                 comp["value"] = child[2]
+        elif tag == "model" and isinstance(child[1], str):
+            # 3D model reference: (model "${KICAD9_3DMODEL_DIR}/Foo.3dshapes/Bar.step"
+            #   (offset ...) (scale ...) (rotate ...)). A footprint may carry zero,
+            #   one, or several. verify_3d_models (§6.6) walks these. The path string
+            #   may contain ${VAR} path variables resolved at check time.
+            comp.setdefault("models", []).append(child[1])
     return comp
 
 

@@ -22,6 +22,183 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.board")
 
 
+# ── §6.5 board-size verification ─────────────────────────────────────────────
+
+def run_verify_board_size(
+    board_path: Path,
+    *,
+    panel_keepout_mm: float = 3.0,
+    mounting_hole_keepout_mm: float = 3.0,
+    fiducial_keepout_mm: float = 1.0,
+    routing_channel_pct: float = 20.0,
+) -> dict:
+    """Verify the board outline accommodates all placed parts plus manufacturing
+    tolerances. Read-only. Records {passed, shortfall_breakdown,
+    suggested_min_dimensions} to the validation cache so auto_place can gate on
+    it (§6.5). Returns the full verdict dict.
+    """
+    import math
+
+    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.tools.drc import _parse_board_bbox, _parse_placed_courtyards
+    from kicad_mcp.utils.board_size import (
+        BoardSizeTolerances,
+        is_fiducial,
+        is_mounting_hole,
+        suggest_dimensions,
+    )
+    from kicad_mcp.utils.validation_cache import record_validation
+
+    tol = BoardSizeTolerances(
+        panel_keepout_mm=panel_keepout_mm,
+        mounting_hole_keepout_mm=mounting_hole_keepout_mm,
+        fiducial_keepout_mm=fiducial_keepout_mm,
+        routing_channel_pct=routing_channel_pct,
+    )
+    content = board_path.read_text(encoding="utf-8")
+
+    # Outline (REQ-CHECK-001) — no Edge.Cuts is a hard fail, not a crash.
+    bbox = _parse_board_bbox(content)
+    if bbox is None:
+        sb = {"reason": "no_board_outline"}
+        result = {
+            "passed": False,
+            "shortfall_breakdown": sb,
+            "message": (
+                "No Edge.Cuts outline found. Add a board outline "
+                "(add_board_outline) before verifying size."
+            ),
+            "warnings": [],
+        }
+        record_validation(
+            board_path, "verify_board_size",
+            {"passed": False, "shortfall_breakdown": sb, "suggested_min_dimensions": {}},
+        )
+        return result
+
+    xmin, ymin, xmax, ymax = bbox
+    width, height = xmax - xmin, ymax - ymin
+    outline_area = width * height
+
+    courtyards, no_courtyard = _parse_placed_courtyards(content)
+    warnings: list[dict] = []
+
+    # Per-part dimensions; footprints with no courtyard contribute a 5x5 default.
+    parts: list[tuple[str, float, float]] = [
+        (ref, c["xmax"] - c["xmin"], c["ymax"] - c["ymin"])
+        for ref, c in courtyards.items()
+    ]
+    for ref in no_courtyard:
+        parts.append((ref, 5.0, 5.0))
+        warnings.append({
+            "ref": ref, "type": "no_courtyard",
+            "message": f"{ref}: no courtyard, assumed 5x5mm",
+        })
+
+    courtyard_area = sum(w * h for _, w, h in parts)
+
+    # Mounting-hole / fiducial keepout discs (classification needs the lib_id).
+    components = FileBoardOps(project_dir=str(board_path.parent)).get_components(board_path)
+    mh = sum(1 for c in components
+             if is_mounting_hole(c.get("reference", ""), c.get("footprint", "")))
+    fid = sum(1 for c in components
+              if is_fiducial(c.get("reference", ""), c.get("footprint", "")))
+    mh_area = mh * math.pi * tol.mounting_hole_keepout_mm ** 2
+    fid_area = fid * math.pi * tol.fiducial_keepout_mm ** 2
+
+    k = tol.panel_keepout_mm
+    inner_w = max(0.0, width - 2 * k)
+    inner_h = max(0.0, height - 2 * k)
+    edge_band_area = outline_area - inner_w * inner_h
+    usable = max(0.0, outline_area - edge_band_area - mh_area - fid_area)
+    required = courtyard_area * (1 + tol.routing_channel_pct / 100.0)
+
+    area_ok = required <= usable
+
+    # Dimensional check (REQ-CHECK-005): the single largest part must fit.
+    if parts:
+        max_w = max(w for _, w, _ in parts)
+        max_h = max(h for _, _, h in parts)
+        big_ref, big_w, big_h = max(parts, key=lambda p: p[1] * p[2])
+    else:
+        max_w = max_h = big_w = big_h = 0.0
+        big_ref = None
+    dim_ok = (width >= max_w + 2 * k) and (height >= max_h + 2 * k)
+
+    passed = area_ok and dim_ok
+
+    aspect = width / height if height > 0 else 1.4
+    suggested = suggest_dimensions(required, max_w, max_h, mh_area, fid_area, tol, aspect)
+
+    if passed and usable > 0 and required / usable > tol.utilization_ceiling_pct / 100.0:
+        warnings.append({
+            "type": "high_utilization",
+            "utilization_pct": round(100 * required / usable, 1),
+            "message": "Board is tight; less than 20% area margin remains.",
+        })
+
+    shortfall = {
+        "outline_mm2": round(outline_area, 1),
+        "edge_keepout_mm2": round(edge_band_area, 1),
+        "mounting_hole_keepout_mm2": round(mh_area, 1),
+        "fiducial_keepout_mm2": round(fid_area, 1),
+        "courtyard_mm2": round(courtyard_area, 1),
+        "routing_channel_mm2": round(required - courtyard_area, 1),
+        "required_mm2": round(required, 1),
+        "usable_mm2": round(usable, 1),
+        "shortfall_mm2": round(max(0.0, required - usable), 1),
+    }
+    if big_ref is not None:
+        shortfall["largest_part"] = {
+            "ref": big_ref,
+            "width_mm": round(big_w, 2),
+            "height_mm": round(big_h, 2),
+        }
+
+    result = {
+        "passed": passed,
+        "parts_counted": len(parts),
+        "total_required_mm2": round(required, 1),
+        "available_mm2": round(outline_area, 1),
+        "usable_mm2": round(usable, 1),
+        "shortfall_breakdown": shortfall,
+        "suggested_min_dimensions": suggested,
+        "warnings": warnings,
+    }
+    record_validation(
+        board_path, "verify_board_size",
+        {"passed": passed, "shortfall_breakdown": shortfall,
+         "suggested_min_dimensions": suggested},
+    )
+    return result
+
+
+def _board_size_refusal_message(cached: dict) -> str:
+    """Build the auto_place refusal message from a cached verify_board_size
+    failure (REQ-DIAG-003: shortfall + suggested dims inline)."""
+    sb = cached.get("shortfall_breakdown", {})
+    if sb.get("reason") == "no_board_outline":
+        return (
+            "auto_place blocked: the board has no Edge.Cuts outline. Add one "
+            "(add_board_outline), then run verify_board_size(path)."
+        )
+    sug = cached.get("suggested_min_dimensions", {})
+    msg = (
+        "auto_place blocked: verify_board_size failed — required "
+        f"{sb.get('required_mm2')} mm² exceeds usable {sb.get('usable_mm2')} mm² "
+        f"(short {sb.get('shortfall_mm2')} mm²)."
+    )
+    big = sb.get("largest_part")
+    if big:
+        msg += f" Largest part {big['ref']} is {big['width_mm']}×{big['height_mm']} mm."
+    if sug:
+        msg += (
+            f" Enlarge the board to at least {sug.get('width_mm')}×"
+            f"{sug.get('height_mm')} mm (add_board_outline), then re-verify."
+        )
+    return msg
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register PCB board tools on the MCP server."""
 
@@ -501,6 +678,31 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON with components_placed, rows, total_area_mm2, and any warnings.
         """
         p = validate_kicad_path(path, ".kicad_pcb")
+
+        # ── §6.5 board-size gate ─────────────────────────────────────────────
+        # Recorded verify_board_size FAILURE → hard refuse (placing into a board
+        # too small for its parts is futile). Never verified → proceed, but warn
+        # (placement is iterative/cheap; an unverified board is a nudge, not a
+        # block — mirrors the §6.3 sync warn-gate, contrast autoroute).
+        from kicad_mcp.utils.gates import check_gate
+        from kicad_mcp.utils.validation_cache import get_validation
+        gate_warnings: list[dict] = []
+        gap = check_gate(p, "verify_board_size")
+        if gap is not None and gap["ran"] and not gap["passed"]:
+            cached = get_validation(p, "verify_board_size") or {}
+            return json.dumps({
+                "status": "blocked",
+                "reason": "verify_board_size_gate",
+                "shortfall_breakdown": cached.get("shortfall_breakdown", {}),
+                "suggested_min_dimensions": cached.get("suggested_min_dimensions", {}),
+                "message": _board_size_refusal_message(cached),
+            }, indent=2)
+        if gap is not None and not gap["ran"]:
+            gate_warnings.append({
+                "type": "board_size_unverified",
+                "message": "Run verify_board_size(board_path) before placement.",
+            })
+
         board_ops = backend.get_board_modify_ops()
 
         if not board_ops.get_components(p):
@@ -536,7 +738,49 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 "Consider enlarging the board with add_board_outline before autoroute."
             )
 
+        if gate_warnings:
+            result.setdefault("warnings", []).extend(gate_warnings)
+
         return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def verify_board_size(
+        board_path: str,
+        panel_keepout_mm: float = 3.0,
+        mounting_hole_keepout_mm: float = 3.0,
+        fiducial_keepout_mm: float = 1.0,
+        routing_channel_pct: float = 20.0,
+    ) -> str:
+        """Verify the board outline fits all placed parts plus fab tolerances.
+
+        Run after parts are synced to the PCB and before auto_place. Computes
+        usable area (board outline minus panelization edge keepout, mounting-hole
+        and fiducial keepout discs) versus required area (component courtyards +
+        routing channels), plus a single-largest-part dimensional check. A
+        recorded failure blocks auto_place. Read-only; records its verdict to the
+        validation cache.
+
+        Args:
+            board_path: Path to .kicad_pcb file.
+            panel_keepout_mm: Panelization edge keepout band, all edges (default 3.0).
+            mounting_hole_keepout_mm: Keepout radius per mounting hole (default 3.0).
+            fiducial_keepout_mm: Keepout radius per fiducial (default 1.0).
+            routing_channel_pct: Routing area as % of courtyard area (default 20.0).
+
+        Returns:
+            JSON: {passed, parts_counted, total_required_mm2, available_mm2,
+            usable_mm2, shortfall_breakdown, suggested_min_dimensions, warnings}.
+        """
+        p = validate_kicad_path(board_path, ".kicad_pcb")
+        result = run_verify_board_size(
+            p,
+            panel_keepout_mm=panel_keepout_mm,
+            mounting_hole_keepout_mm=mounting_hole_keepout_mm,
+            fiducial_keepout_mm=fiducial_keepout_mm,
+            routing_channel_pct=routing_channel_pct,
+        )
+        change_log.record("verify_board_size", {"board_path": board_path, "passed": result["passed"]})
+        return json.dumps(result, indent=2)
 
     @mcp.tool()
     def pcb_pipeline(

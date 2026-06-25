@@ -386,18 +386,24 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
     return result
 
 
-def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
-    """File-based courtyard overlap check — extracted for use by pcb_pipeline.
+def _parse_placed_courtyards(
+    content: str,
+) -> tuple[dict[str, dict[str, float]], list[str]]:
+    """Parse every real footprint's courtyard bounding box from board text.
 
-    Returns the same structure as the check_courtyard_overlaps MCP tool
-    (without the JSON serialisation step).
+    Returns ``(courtyards, no_courtyard)`` where ``courtyards`` maps each real
+    ref (non-``#``) that carries an ``F.CrtYd``/``B.CrtYd`` rectangle to its
+    board-frame ``{xmin, ymin, xmax, ymax}`` (rotation applied), and
+    ``no_courtyard`` lists real refs that have no courtyard geometry. Shared by
+    ``check_courtyard_overlaps`` (overlap detection) and ``verify_board_size``
+    (§6.5 area/dimension sizing).
     """
     import math as _math
 
     from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
 
-    content = pcb_path.read_text(encoding="utf-8")
     courtyards: dict[str, dict[str, float]] = {}
+    no_courtyard: list[str] = []
 
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
     ref_pat = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
@@ -474,10 +480,26 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
                     "xmax": origin_x + max(cyd_xs),
                     "ymax": origin_y + max(cyd_ys),
                 }
+            else:
+                no_courtyard.append(ref)
 
             i = end_idx + 1
             continue
         i += 1
+
+    return courtyards, no_courtyard
+
+
+def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
+    """File-based courtyard overlap check — extracted for use by pcb_pipeline.
+
+    Returns the same structure as the check_courtyard_overlaps MCP tool
+    (without the JSON serialisation step).
+    """
+    import math as _math
+
+    content = pcb_path.read_text(encoding="utf-8")
+    courtyards, _ = _parse_placed_courtyards(content)
 
     overlaps: list[dict[str, Any]] = []
     refs = sorted(courtyards.keys())

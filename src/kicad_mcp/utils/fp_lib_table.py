@@ -100,6 +100,36 @@ def _default_var_value(var: str) -> str | None:
                 return str(base)
         return None
 
+    # ${KICAD9_3DMODEL_DIR} → the system 3dmodels library dir (§6.6).
+    if re.fullmatch(r"KICAD\d*_3DMODEL_DIR", var):
+        from kicad_mcp.utils.kicad_paths import get_system_library_paths
+
+        for base in get_system_library_paths():
+            if base.name == "3dmodels":
+                return str(base)
+        return None
+
+    # ${KICAD_USER_3DMODEL_DIR} → user 3rdparty 3dmodels dir, mirroring the
+    # KICAD\d+_3RD_PARTY candidate search below but ending in /3dmodels.
+    if var == "KICAD_USER_3DMODEL_DIR":
+        for version in ("9.0", "8.0", "7.0"):
+            candidates: list[Path] = []
+            onedrive = os.environ.get("OneDrive")
+            if onedrive:
+                candidates.append(
+                    Path(onedrive) / "Documents" / "KiCad" / version / "3rdparty" / "3dmodels"
+                )
+            candidates.append(
+                Path.home() / "Documents" / "KiCad" / version / "3rdparty" / "3dmodels"
+            )
+            candidates.append(
+                Path.home() / ".local" / "share" / "kicad" / version / "3rdparty" / "3dmodels"
+            )
+            for c in candidates:
+                if c.is_dir():
+                    return str(c)
+        return None
+
     m = re.fullmatch(r"KICAD(\d+)_3RD_PARTY", var)
     if m:
         version = f"{m.group(1)}.0"

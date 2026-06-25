@@ -38,6 +38,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON with list of generated files and output directory.
         """
         p = validate_kicad_path(path, ".kicad_pcb")
+
+        # §6.3 gate: refuse to ship fab files until DRC has passed against the
+        # current board content. Prevents exporting gerbers from a board with
+        # known clearance/short violations.
+        from kicad_mcp.utils.gates import refuse_if_ungated
+        refusal = refuse_if_ungated(
+            p, "run_drc", "export_gerbers",
+            fix_hint="Run run_drc(path), fix the violations, then re-export.",
+        )
+        if refusal is not None:
+            return refusal
+
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 

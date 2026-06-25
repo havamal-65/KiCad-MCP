@@ -865,11 +865,12 @@ def register_tools(
         # been run against the current board state, or its most recent result
         # was a failure. This closes the "routes around inward-facing connector"
         # bug at the tool level rather than relying on skill discipline.
+        from kicad_mcp.utils.gates import check_gate
         from kicad_mcp.utils.validation_cache import get_validation
-        cached = get_validation(p, "validate_connector_orientations")
-        if cached is None or not cached.get("passed"):
+        gap = check_gate(p, "validate_connector_orientations")
+        if gap is not None:
             report["status"] = "error"
-            if cached is None:
+            if not gap["ran"]:
                 report["message"] = (
                     "autoroute refuses to start: validate_connector_orientations "
                     "has not been run on the current board state. "
@@ -882,18 +883,19 @@ def register_tools(
                     "mcp__kicad__place_at_edge(...) for each violating ref, "
                     "then re-run mcp__kicad__validate_connector_orientations."
                 )
-                report["violations"] = cached.get("violations", [])
+                report["violations"] = gap["violations"]
             report["steps"].append({
                 "step": "connector_orientation_gate",
                 "status": "error",
-                "cache_hit": cached is not None,
-                "violations": (cached.get("violations") if cached else None),
+                "cache_hit": gap["ran"],
+                "violations": (gap["violations"] if gap["ran"] else None),
             })
             return json.dumps(report, indent=2)
+        cached = get_validation(p, "validate_connector_orientations")
         report["steps"].append({
             "step": "connector_orientation_gate",
             "status": "success",
-            "checked": cached.get("checked", 0),
+            "checked": (cached or {}).get("checked", 0),
         })
 
         # Step 1: Clean board (optional)

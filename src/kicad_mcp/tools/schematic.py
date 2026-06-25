@@ -21,6 +21,29 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.schematic")
 
 
+def _format_validator_refusal_message(sf: dict) -> str:
+    """One-line summary of a §6.2 validator failure naming up to 3 problems.
+
+    Avoids dumping a large blob into the tool result (the full lists are still
+    returned under ``mismatches``/``unresolvable``).
+    """
+    items: list[str] = []
+    for mm in sf.get("mismatches", []):
+        items.append(f"{mm['ref']} ({mm['footprint']}) missing pads {mm['missing']}")
+    for un in sf.get("unresolvable", []):
+        items.append(f"{un['ref']} {un['footprint']!r}: {un['reason']}")
+    shown = items[:3]
+    overflow = len(items) - len(shown)
+    summary = "; ".join(shown)
+    if overflow > 0:
+        summary += f"; ...and {overflow} more"
+    return (
+        f"sync_schematic_to_pcb refused: symbol-footprint validation failed. "
+        f"{summary}. Run validate_symbol_footprint_pairs to see all issues, then "
+        f"fix the symbol's Footprint field or pick a different footprint."
+    )
+
+
 def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str, board_ops=None) -> dict:
     """Swap a PCB footprint for *new_fp*, preserving position/rotation/layer/nets.
 
@@ -1360,6 +1383,20 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
 
+        # §6.2 precondition: refuse before any PCB work when a symbol's Footprint
+        # is unresolvable or its pin set isn't a subset of the footprint's pads —
+        # otherwise sync silently produces a board with unassigned pads.
+        from kicad_mcp.tools.drc import run_validate_symbol_footprint_pairs
+        sf = run_validate_symbol_footprint_pairs(sch_p)
+        if not sf["passed"]:
+            return json.dumps({
+                "status": "blocked",
+                "reason": "symbol_footprint_validator_failed",
+                "mismatches": sf["mismatches"],
+                "unresolvable": sf["unresolvable"],
+                "message": _format_validator_refusal_message(sf),
+            }, indent=2)
+
         from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
         # Try the configured backend first; fall back to file ops if IPC times out
@@ -1407,6 +1444,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         actions: list[dict] = []
         warnings: list[dict] = []
+
+        # §6.3 soft gate: nudge (don't block — sync is iterative) when the
+        # schematic hasn't passed validate_schematic_for_pcb against its current
+        # content. The §6.2 footprint check above is the hard gate; this surfaces
+        # the broader ERC/connectivity validation the user may have skipped.
+        from kicad_mcp.utils.gates import warn_if_ungated
+        gate_warning = warn_if_ungated(
+            sch_p, "validate_schematic_for_pcb", "sync_schematic_to_pcb",
+            fix_hint="Run validate_schematic_for_pcb(schematic_path) and resolve blocking issues.",
+        )
+        if gate_warning is not None:
+            warnings.append(gate_warning)
 
         # Select board modify ops based on whether the earlier read succeeded via the
         # plugin backend.  If the read had to fall back to FileBoardOps (bridge down or

@@ -66,10 +66,10 @@ def _collect_all_real_symbols(root_sch_path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _classify_fp_resolution_failure(lib_name: str) -> str:
+def _classify_fp_resolution_failure(lib_name: str, project_dir: str | Path | None = None) -> str:
     """Distinguish a missing footprint library from a missing footprint file inside one."""
     from kicad_mcp.utils.kicad_paths import find_footprint_libraries
-    for lib_dir in find_footprint_libraries():
+    for lib_dir in find_footprint_libraries(project_dir):
         if lib_dir.stem == lib_name or lib_dir.stem.replace(".pretty", "") == lib_name:
             return "footprint file not found"
     return "library not found"
@@ -98,6 +98,10 @@ def run_validate_symbol_footprint_pairs(sch_path: Path) -> dict[str, Any]:
 
     symbols = _collect_all_real_symbols(sch_path)
     lib_ops = FileLibraryOps()
+    # Resolve footprints with the project dir so project-local .pretty libraries
+    # (registered in the project fp-lib-table, S1) resolve — otherwise they'd be
+    # mis-reported as unresolvable and falsely block sync.
+    project_dir = sch_path.parent
 
     seen_refs: set[str] = set()
     checked = 0
@@ -112,10 +116,10 @@ def run_validate_symbol_footprint_pairs(sch_path: Path) -> dict[str, Any]:
         if not fp_lib_id:
             continue
 
-        fp_text = _load_kicad_mod(fp_lib_id)
+        fp_text = _load_kicad_mod(fp_lib_id, project_dir)
         if fp_text is None:
             lib_name = fp_lib_id.split(":", 1)[0] if ":" in fp_lib_id else fp_lib_id
-            reason = _classify_fp_resolution_failure(lib_name)
+            reason = _classify_fp_resolution_failure(lib_name, project_dir)
             unresolvable.append({
                 "ref": ref, "footprint": fp_lib_id, "reason": reason,
             })
@@ -303,6 +307,37 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
         blocking.append({
             "type": "no_nets",
             "detail": "Schematic has no nets. Add wires and labels to connect components.",
+        })
+
+    # ── Check 7: Symbol pins ⊆ footprint pads (§6.2 sub-gate) ────────────────
+    # A symbol whose pin numbers aren't all present on its Footprint produces a
+    # board with unassigned pads — caught here before sync rather than at DRC.
+    sf_result = run_validate_symbol_footprint_pairs(sch_path)
+    for mm in sf_result.get("mismatches", []):
+        blocking.append({
+            "type": "footprint_pad_mismatch",
+            "reference": mm["ref"],
+            "detail": (
+                f"{mm['ref']} ({mm['footprint']}) symbol expects pad(s) "
+                f"{mm['missing']} which don't exist on the footprint. "
+                f"Symbol pins: {mm['symbol_pins']}; footprint pads: {mm['footprint_pads']}."
+            ),
+        })
+    for un in sf_result.get("unresolvable", []):
+        blocking.append({
+            "type": "unresolvable_footprint",
+            "reference": un["ref"],
+            "detail": f"{un['ref']} footprint {un['footprint']!r}: {un['reason']}.",
+        })
+    for w in sf_result.get("warnings", []):
+        warnings.append({
+            "type": "extra_footprint_pads",
+            "reference": w["ref"],
+            "detail": (
+                f"{w['ref']} ({w['footprint']}) has extra pads {w['extra_pads']} "
+                f"not referenced by the symbol — usually mechanical / thermal / NC. "
+                f"Not blocking."
+            ),
         })
 
     # ── Check 6: Run ERC via kicad-cli if available ──────────────────────────
@@ -1238,6 +1273,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             drc_ops = backend.get_drc_ops()
             result = drc_ops.run_drc(p, out)
             change_log.record("run_drc", {"path": path, "output": output})
+            # Stamp the result so export_gerbers can gate on a clean DRC against
+            # the current board content (§6.3).
+            try:
+                from kicad_mcp.utils.validation_cache import record_validation
+                record_validation(p, "run_drc", {"passed": bool(result.get("passed"))})
+            except Exception as cache_exc:
+                logger.warning("run_drc: validation-cache stamp failed (non-fatal): %s", cache_exc)
             return json.dumps({"status": "success", **limit_response(result)}, indent=2)
         except Exception as e:
             return json.dumps({
@@ -1489,6 +1531,19 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         p = validate_kicad_path(path, ".kicad_sch")
         result = run_validate_schematic_for_pcb(p)
         change_log.record("validate_schematic_for_pcb", {"path": path})
+        # Stamp the result so sync_schematic_to_pcb can note when the schematic
+        # hasn't been validated against its current content (§6.3).
+        try:
+            from kicad_mcp.utils.validation_cache import record_validation
+            record_validation(
+                p, "validate_schematic_for_pcb",
+                {"passed": bool(result.get("ready_for_pcb_sync"))},
+            )
+        except Exception as cache_exc:
+            logger.warning(
+                "validate_schematic_for_pcb: validation-cache stamp failed (non-fatal): %s",
+                cache_exc,
+            )
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()

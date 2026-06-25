@@ -10,6 +10,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _pass_symbol_footprint_validator():
+    """These tests exercise placement-intent wiring, not the §6.2 sync
+    precondition (which has its own test). Mock the validator to pass so it
+    doesn't short-circuit sync before the behavior under test runs."""
+    with patch(
+        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
+        return_value={
+            "passed": True, "checked": 0, "mismatches": [],
+            "unresolvable": [], "warnings": [], "over_limit": False,
+        },
+    ):
+        yield
+
+
 # A minimal JST PH Horizontal .kicad_mod with the "PCB edge" marker on
 # Dwgs.User and a courtyard rectangle. Used to mock _load_kicad_mod so
 # tests don't depend on a system KiCad install (CI runs without one).

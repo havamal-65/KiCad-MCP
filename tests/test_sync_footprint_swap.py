@@ -21,6 +21,21 @@ from kicad_mcp.tools import schematic
 from kicad_mcp.utils.change_log import ChangeLog
 
 
+@pytest.fixture(autouse=True)
+def _pass_symbol_footprint_validator():
+    """These tests exercise swap/value/net logic, not the §6.2 sync precondition
+    (which has its own test). Mock the validator to pass so it never short-circuits
+    sync before the behavior under test runs."""
+    with patch(
+        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
+        return_value={
+            "passed": True, "checked": 0, "mismatches": [],
+            "unresolvable": [], "warnings": [], "over_limit": False,
+        },
+    ):
+        yield
+
+
 _SCH_TEMPLATE = textwrap.dedent("""\
     (kicad_sch
       (version 20231120)

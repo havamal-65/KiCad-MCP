@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -42,6 +43,66 @@ def _format_validator_refusal_message(sf: dict) -> str:
         f"{summary}. Run validate_symbol_footprint_pairs to see all issues, then "
         f"fix the symbol's Footprint field or pick a different footprint."
     )
+
+
+def suggest_footprint_candidates(
+    footprint_lib_id: str,
+    *,
+    library_ops: Any,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Rank replacement footprints for an unresolvable ``lib_id`` by name (§6.8).
+
+    Derives a search query from the footprint-name part of *footprint_lib_id* and
+    ranks ``library_ops.search_footprints`` hits: exact name → prefix → substring
+    (REQ-RANK-002), excluding the input ``lib_id`` itself (REQ-RANK-003), stable
+    by ``lib_id`` (REQ-RANK-004), truncated to *limit* (REQ-RANK-003).
+
+    Pure and never raises: any error from the underlying search yields ``[]``
+    (REQ-HELP-003), so enriching a sync refusal can never turn it into an error.
+    Pad count is captured implicitly via the package-encoded KiCad name, so no
+    candidate ``.kicad_mod`` is loaded (Q8-a).
+    """
+    try:
+        name = footprint_lib_id.split(":", 1)[1] if ":" in footprint_lib_id else footprint_lib_id
+        name = name.strip()
+        query = name
+
+        results = library_ops.search_footprints(query)
+        # Package-prefix retry: a wrong metric/handsolder variant still finds its
+        # family, e.g. "SOIC-8_3.9x4.9mm_P1.27mm_HandSolder" → also try "SOIC-8".
+        if len(results) < limit and "_" in name:
+            prefix = name.split("_", 1)[0]
+            if prefix and prefix != query:
+                seen = {c.get("lib_id") for c in results}
+                for c in library_ops.search_footprints(prefix):
+                    if c.get("lib_id") not in seen:
+                        results.append(c)
+                        seen.add(c.get("lib_id"))
+
+        name_l = name.lower()
+        query_l = query.lower()
+
+        def tier(c: dict[str, Any]) -> tuple[int, str]:
+            n = c.get("name", "").lower()
+            if n == name_l:
+                return (0, "exact_name")
+            if n.startswith(query_l):
+                return (1, "prefix")
+            return (2, "substring")
+
+        ranked = sorted(
+            (c for c in results if c.get("lib_id") != footprint_lib_id),
+            key=lambda c: (tier(c)[0], c.get("lib_id", "")),
+        )
+        return [
+            {"lib_id": c["lib_id"], "name": c["name"], "library": c["library"],
+             "match_reason": tier(c)[1]}
+            for c in ranked[:limit]
+        ]
+    except Exception as exc:  # noqa: BLE001 — never raise into a sync refusal
+        logger.warning("suggest_footprint_candidates failed for %r: %s", footprint_lib_id, exc)
+        return []
 
 
 def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str, board_ops=None) -> dict:
@@ -1389,12 +1450,27 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         from kicad_mcp.tools.drc import run_validate_symbol_footprint_pairs
         sf = run_validate_symbol_footprint_pairs(sch_p)
         if not sf["passed"]:
+            # §6.8: enrich each unresolvable footprint with ranked replacement
+            # candidates so recovery is one call, not a search loop. Purely
+            # additive — only the new `candidates` key is added (REQ-WIRE-003).
+            unresolvable = sf["unresolvable"]
+            if unresolvable:
+                from kicad_mcp.backends.file_backend import FileLibraryOps
+                lib_ops = FileLibraryOps(project_dir=str(sch_p.parent))
+                for entry in unresolvable:
+                    entry["candidates"] = suggest_footprint_candidates(
+                        entry["footprint"], library_ops=lib_ops, limit=5,
+                    )
+            msg = _format_validator_refusal_message(sf)
+            if any(e.get("candidates") for e in unresolvable):
+                msg += ("\nRanked replacement footprints are attached per "
+                        "unresolvable symbol (`candidates`).")
             return json.dumps({
                 "status": "blocked",
                 "reason": "symbol_footprint_validator_failed",
                 "mismatches": sf["mismatches"],
-                "unresolvable": sf["unresolvable"],
-                "message": _format_validator_refusal_message(sf),
+                "unresolvable": unresolvable,
+                "message": msg,
             }, indent=2)
 
         from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps

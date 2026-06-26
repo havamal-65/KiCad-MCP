@@ -13,7 +13,18 @@ from kicad_mcp import __version__
 from kicad_mcp.backends.plugin_backend import _get_ping_timeout, _get_port, _tcp_call  # noqa: PLC2701
 from kicad_mcp.logging_config import get_logger, setup_logging
 from kicad_mcp.resources.definitions import register_resources
-from kicad_mcp.tools import board, drc, export, library, library_manage, parts, project, routing, schematic
+from kicad_mcp.tools import (
+    board,
+    drc,
+    export,
+    library,
+    library_manage,
+    manufacturing,
+    parts,
+    project,
+    routing,
+    schematic,
+)
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.platform_helper import (
     cleanup_stale_session_files,
@@ -350,6 +361,9 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     parts.register_tools(mcp, backend, change_log)
     drc.register_tools(mcp, backend, change_log)
     export.register_tools(mcp, backend, change_log)
+    # §6.7 manufacturing-readiness audit — pure orchestration over the file-side
+    # checks + the same CLI export/DRC ops as export.py; no bridge required.
+    manufacturing.register_tools(mcp, backend, change_log)
 
     # Install bridge guard for board and routing tools — the only two modules whose
     # every tool requires BOARD_READ / BOARD_MODIFY / ZONE_REFILL / BOARD_STACKUP,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -31,7 +32,7 @@ def run_verify_board_size(
     mounting_hole_keepout_mm: float = 3.0,
     fiducial_keepout_mm: float = 1.0,
     routing_channel_pct: float = 20.0,
-) -> dict:
+) -> dict[str, Any]:
     """Verify the board outline accommodates all placed parts plus manufacturing
     tolerances. Read-only. Records {passed, shortfall_breakdown,
     suggested_min_dimensions} to the validation cache so auto_place can gate on
@@ -81,7 +82,7 @@ def run_verify_board_size(
     outline_area = width * height
 
     courtyards, no_courtyard = _parse_placed_courtyards(content)
-    warnings: list[dict] = []
+    warnings: list[dict[str, Any]] = []
 
     # Per-part dimensions; footprints with no courtyard contribute a 5x5 default.
     parts: list[tuple[str, float, float]] = [
@@ -137,7 +138,7 @@ def run_verify_board_size(
             "message": "Board is tight; less than 20% area margin remains.",
         })
 
-    shortfall = {
+    shortfall: dict[str, Any] = {
         "outline_mm2": round(outline_area, 1),
         "edge_keepout_mm2": round(edge_band_area, 1),
         "mounting_hole_keepout_mm2": round(mh_area, 1),
@@ -173,7 +174,7 @@ def run_verify_board_size(
     return result
 
 
-def _board_size_refusal_message(cached: dict) -> str:
+def _board_size_refusal_message(cached: dict[str, Any]) -> str:
     """Build the auto_place refusal message from a cached verify_board_size
     failure (REQ-DIAG-003: shortfall + suggested dims inline)."""
     sb = cached.get("shortfall_breakdown", {})
@@ -560,7 +561,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps(ops.get_stackup(board_path), indent=2)
 
     @mcp.tool()
-    def set_board_design_rules(path: str, preset: str = "class2") -> str:
+    def set_board_design_rules(
+        path: str,
+        preset: str = "class2",
+        differential_pairs: list[dict[str, Any]] | None = None,
+        length_matching: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Write IPC-2221 design rules into a board's setup section.
 
         Encodes manufacturing-enforceable design constraints so DRC catches
@@ -578,23 +584,103 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Preset "fab_jlcpcb" applies JLCPCB 2-layer standard design rules
         (tighter than IPC-2221 Class 2 in some parameters).
 
+        Differential pairs (§6.4): pass ``differential_pairs`` to declare named
+        netclasses with controlled width/gap and assign their nets, e.g.::
+
+            differential_pairs=[{"name": "USB", "nets": ["USB_D+", "USB_D-"],
+                                 "width_mm": 0.20, "gap_mm": 0.13}]
+
+        Each entry needs a unique non-empty ``name``, ``width_mm > 0``,
+        ``gap_mm > 0``, and either ``nets`` (exactly 2) or a ``net_pattern``
+        glob; ``via_gap_mm`` is optional (defaults to ``gap_mm``). Pairs compose
+        with a preset in one call.
+
+        Length matching (§6.4): pass ``length_matching`` to write length
+        constraints to the sibling ``.kicad_dru`` file, e.g.::
+
+            length_matching=[{"group": "USB", "target_mm": 50.0,
+                              "tolerance_mm": 0.5}]
+
+        Each entry needs a non-empty ``group`` (the netclass the constraint
+        keys on) and a positive ``target_mm``; ``tolerance_mm`` is optional.
+
         Args:
             path: Path to .kicad_pcb file.
             preset: Rule preset — "class2" (default) or "fab_jlcpcb".
+            differential_pairs: Optional diff-pair declarations (see above).
+            length_matching: Optional length-match groups (see above).
 
         Returns:
-            JSON with applied preset name and rule values.
+            JSON with applied preset name and rule values, plus
+            ``differential_pairs_applied`` / ``length_matching_applied`` when
+            supplied. On invalid input, ``{"status": "error", ...}`` and
+            nothing is written.
         """
+        # ── Validation (REQ-API-003) — before any write ──────────────────────
+        try:
+            seen_names: set[str] = set()
+            for dp in differential_pairs or []:
+                name = dp.get("name")
+                if not name:
+                    raise ValueError("each differential pair needs a non-empty 'name'")
+                if name in seen_names:
+                    raise ValueError(f"duplicate differential-pair name '{name}'")
+                seen_names.add(name)
+                if dp.get("width_mm", 0) <= 0:
+                    raise ValueError(f"{name}: width_mm must be > 0")
+                if dp.get("gap_mm", 0) <= 0:
+                    raise ValueError(f"{name}: gap_mm must be > 0")
+                via_gap = dp.get("via_gap_mm")
+                if via_gap is not None and via_gap <= 0:
+                    raise ValueError(f"{name}: via_gap_mm must be > 0 when given")
+                nets = dp.get("nets")
+                if nets is not None:
+                    if len(nets) != 2:
+                        raise ValueError(f"{name}: 'nets' must be exactly 2 entries")
+                elif not dp.get("net_pattern"):
+                    raise ValueError(f"{name}: need either 'nets' or 'net_pattern'")
+            for lm in length_matching or []:
+                if not lm.get("group"):
+                    raise ValueError("each length-matching entry needs a 'group'")
+                if lm.get("target_mm", 0) <= 0:
+                    raise ValueError(
+                        f"{lm.get('group')}: target_mm must be > 0"
+                    )
+                tol = lm.get("tolerance_mm")
+                if tol is not None and tol < 0:
+                    raise ValueError(
+                        f"{lm.get('group')}: tolerance_mm must be >= 0 when given"
+                    )
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, indent=2)
+
         p = validate_kicad_path(path, ".kicad_pcb")
         backup = create_backup(p)
         from kicad_mcp.backends.file_backend import FileBoardOps
-        result = FileBoardOps().set_board_design_rules(p, preset)
+        result = FileBoardOps().set_board_design_rules(
+            p, preset,
+            differential_pairs=differential_pairs,
+            length_matching=length_matching,
+        )
         change_log.record(
             "set_board_design_rules",
-            {"path": path, "preset": preset},
+            {
+                "path": path,
+                "preset": preset,
+                "differential_pairs": differential_pairs,
+                "length_matching": length_matching,
+            },
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
+        # The .kicad_dru is a separate write surface — record it too (REQ-API-004).
+        if result.get("dru_path"):
+            change_log.record(
+                "set_board_design_rules:length_matching",
+                {"path": path, "length_matching": length_matching},
+                file_modified=result["dru_path"],
+                backup_path=result.get("dru_backup_path"),
+            )
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
@@ -686,7 +772,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # block — mirrors the §6.3 sync warn-gate, contrast autoroute).
         from kicad_mcp.utils.gates import check_gate
         from kicad_mcp.utils.validation_cache import get_validation
-        gate_warnings: list[dict] = []
+        gate_warnings: list[dict[str, Any]] = []
         gap = check_gate(p, "verify_board_size")
         if gap is not None and gap["ran"] and not gap["passed"]:
             cached = get_validation(p, "verify_board_size") or {}
@@ -829,11 +915,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
         config = KiCadMCPConfig()
 
-        pipeline_steps: list[dict] = []
+        pipeline_steps: list[dict[str, Any]] = []
         overall_status = "success"
 
-        def _step(name: str, result_json: str) -> dict:
-            r = json.loads(result_json)
+        def _step(name: str, result_json: str) -> dict[str, Any]:
+            r: dict[str, Any] = json.loads(result_json)
             pipeline_steps.append({"step": name, **r})
             return r
 
@@ -908,7 +994,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     _ra = _comp_area * 1.20  # 20% routing overhead
                     _ew = _math.sqrt(_ra * 1.4) + 6  # + 2×edge_clearance
                     _eh = _math.sqrt(_ra / 1.4) + 6
-                    _ceil5 = lambda v: _math.ceil(v / 5.0) * 5.0
+                    def _ceil5(v: float) -> float:
+                        return _math.ceil(v / 5.0) * 5.0
                     _est_w = _ceil5(_ceil5(_ew) * 1.25)
                     _est_h = _ceil5(_ceil5(_eh) * 1.25)
                     if board_width_mm < _est_w * 0.85 or board_height_mm < _est_h * 0.85:
@@ -938,7 +1025,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             pcb_ops = backend.get_board_ops()
             pcb_data = pcb_ops.read_board(pcb_p)
 
-            sch_by_ref: dict[str, dict] = {}
+            sch_by_ref: dict[str, dict[str, Any]] = {}
             for sym in sch_data.get("symbols", []):
                 ref = sym.get("reference", "")
                 if not ref or ref.startswith("#") or sym.get("is_power"):
@@ -954,7 +1041,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             place_x, place_y = 50.0, 50.0
             placed: list[str] = []
             sync_warnings: list[str] = []
-            to_place: list[dict] = []
+            to_place: list[dict[str, Any]] = []
 
             for ref, sym in sch_by_ref.items():
                 fp = sym.get("footprint", "")
@@ -1163,7 +1250,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         # ── Step 6: run_drc ──────────────────────────────────────────────────
         drc_passed = False
-        violations: list = []
+        violations: list[dict[str, Any]] = []
         try:
             drc_ops = backend.get_drc_ops()
             drc_result = drc_ops.run_drc(pcb_p, None)

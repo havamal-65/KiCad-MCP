@@ -895,6 +895,8 @@ class FileBoardOps(BoardOps):
 
     def set_board_design_rules(
         self, path: Path, preset: str = "class2",
+        differential_pairs: list[dict] | None = None,
+        length_matching: list[dict] | None = None,
     ) -> dict[str, Any]:
         """Write design rules into the project's Default netclass.
 
@@ -903,15 +905,28 @@ class FileBoardOps(BoardOps):
         method updates the ``Default`` netclass entry in the sibling
         ``.kicad_pro`` file so that DRC and the router use the preset limits.
 
+        When ``differential_pairs`` is given, each entry additionally upserts a
+        named netclass carrying ``diff_pair_width``/``diff_pair_gap``/
+        ``diff_pair_via_gap`` and assigns its nets via
+        ``net_settings.netclass_patterns`` (§6.4).  When ``length_matching`` is
+        given, length constraints are written to the sibling ``.kicad_dru``
+        custom-rules file (an approved write surface, REQ-LEN-003).
+
         The ``.kicad_pcb`` file is NOT modified.
 
         Args:
             path: Path to .kicad_pcb file (the sibling .kicad_pro is derived
                   from this path automatically).
             preset: One of "class2" (IPC-2221 Class 2) or "fab_jlcpcb".
+            differential_pairs: Optional list of
+                ``{name, nets|net_pattern, width_mm, gap_mm, via_gap_mm?}``.
+            length_matching: Optional list of
+                ``{group, nets?, target_mm, tolerance_mm?}`` → ``.kicad_dru``.
 
         Returns:
-            Dict with applied preset name and rule values.
+            Dict with applied preset name and rule values, plus
+            ``differential_pairs_applied`` / ``length_matching_applied`` when
+            those parameters are provided.
         """
         import json
 
@@ -971,14 +986,188 @@ class FileBoardOps(BoardOps):
         drc_rules["min_hole_clearance"]         = rules.get("hole_clearance", 0.22)
         drc_rules["min_copper_edge_clearance"]  = rules.get("copper_edge_clearance", 0.50)
 
+        # §6.4 — upsert named differential-pair netclasses + assign their nets.
+        diff_applied: list[dict[str, Any]] = []
+        if differential_pairs:
+            seed = dict(default_cls)  # schema-complete seed from the Default class
+            for dp in differential_pairs:
+                name = dp["name"]
+                width = dp["width_mm"]
+                gap = dp["gap_mm"]
+                via_gap = dp.get("via_gap_mm")
+                via_gap = gap if via_gap is None else via_gap
+                self._upsert_netclass(
+                    classes, name, width=width, gap=gap, via_gap=via_gap, seed=seed
+                )
+                nets = dp.get("nets")
+                net_pattern = dp.get("net_pattern")
+                self._assign_nets_to_class(net_settings, name, nets, net_pattern)
+                diff_applied.append({
+                    "name": name,
+                    "diff_pair_width": width,
+                    "diff_pair_gap": gap,
+                    "diff_pair_via_gap": via_gap,
+                    "nets": list(nets) if nets else [net_pattern],
+                })
+
         pro_path.write_text(
             json.dumps(pro, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
 
-        return {
+        result: dict[str, Any] = {
             "preset": preset,
             "rules_applied": rules,
+        }
+        if differential_pairs:
+            result["differential_pairs_applied"] = diff_applied
+
+        # §6.4 — length matching writes the sibling .kicad_dru (approved surface).
+        if length_matching:
+            dru = self._apply_length_matching(path, length_matching)
+            result["length_matching_applied"] = dru["applied"]
+            result["dru_path"] = dru["dru_path"]
+            if dru["backup_path"]:
+                result["dru_backup_path"] = dru["backup_path"]
+
+        return result
+
+    @staticmethod
+    def _upsert_netclass(
+        classes: list, name: str, *, width: float, gap: float, via_gap: float, seed: dict
+    ) -> dict:
+        """Upsert a named netclass with diff-pair fields (idempotent by name).
+
+        New named classes are seeded from the ``Default`` netclass shape and
+        given a distinct ascending ``priority`` (``Default`` keeps its
+        sentinel ``2147483647``). The ``Default`` class is never touched here.
+        """
+        cls = next((c for c in classes if c.get("name") == name), None)
+        if cls is None:
+            cls = dict(seed)
+            cls["name"] = name
+            used = {
+                c.get("priority") for c in classes if c.get("name") != "Default"
+            }
+            prio = 0
+            while prio in used:
+                prio += 1
+            cls["priority"] = prio
+            classes.append(cls)
+        cls["diff_pair_width"] = width
+        cls["diff_pair_gap"] = gap
+        cls["diff_pair_via_gap"] = via_gap
+        return cls
+
+    @staticmethod
+    def _assign_nets_to_class(
+        net_settings: dict, netclass: str, nets: list | None, net_pattern: str | None
+    ) -> None:
+        """Map nets to a netclass via ``net_settings.netclass_patterns``.
+
+        Last-write-wins: an existing entry for the same pattern is dropped
+        before the new mapping is appended (REQ-ASSIGN-003).
+        """
+        patterns = net_settings.setdefault("netclass_patterns", [])
+        targets = list(nets) if nets else [net_pattern]
+        for t in targets:
+            patterns[:] = [p for p in patterns if p.get("pattern") != t]
+            patterns.append({"netclass": netclass, "pattern": t})
+
+    @staticmethod
+    def _fmt_mm(value: float) -> str:
+        """Format a mm value compactly (no trailing zeros), KiCad ``.kicad_dru`` style."""
+        return f"{value:g}mm"
+
+    @classmethod
+    def _length_constraint(cls, target: float | None, tol: float | None) -> str:
+        """Build a ``(constraint length …)`` clause from target ± tolerance."""
+        parts = []
+        if target is not None and tol is not None:
+            parts.append(f"(min {cls._fmt_mm(target - tol)})")
+            parts.append(f"(max {cls._fmt_mm(target + tol)})")
+            parts.append(f"(opt {cls._fmt_mm(target)})")
+        elif target is not None:
+            parts.append(f"(opt {cls._fmt_mm(target)})")
+        return "(constraint length " + " ".join(parts) + ")"
+
+    @staticmethod
+    def _remove_dru_rule(text: str, name: str) -> str:
+        """Remove a top-level ``(rule "name" …)`` block via balanced-paren scan.
+
+        Parens inside double-quoted strings (e.g. ``A.fromTo('a','b')`` inside a
+        condition) are skipped so the matcher counts only structural parens.
+        """
+        marker = f'(rule "{name}"'
+        idx = text.find(marker)
+        if idx == -1:
+            return text
+        depth = 0
+        in_str = False
+        i = idx
+        end = -1
+        while i < len(text):
+            c = text[i]
+            if c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            i += 1
+        if end == -1:
+            return text
+        return text[:idx] + text[end:]
+
+    def _apply_length_matching(
+        self, path: Path, length_matching: list[dict]
+    ) -> dict[str, Any]:
+        """Write length constraints to the sibling ``.kicad_dru`` (approved surface).
+
+        Existing rules are preserved; a rule sharing a generated name is
+        replaced (idempotent). The file is backed up before modification.
+        """
+        from kicad_mcp.utils.change_log import create_backup
+
+        dru_path = path.with_suffix(".kicad_dru")
+        backup_path = create_backup(dru_path) if dru_path.exists() else None
+        text = dru_path.read_text(encoding="utf-8") if dru_path.exists() else ""
+
+        applied: list[dict[str, Any]] = []
+        for lm in length_matching:
+            group = lm["group"]
+            rule_name = f"length_{group}"
+            target = lm.get("target_mm")
+            tol = lm.get("tolerance_mm")
+            rule = (
+                f'(rule "{rule_name}"\n'
+                f"\t{self._length_constraint(target, tol)}\n"
+                f"\t(condition \"A.NetClass == '{group}'\")\n"
+                f")"
+            )
+            text = self._remove_dru_rule(text, rule_name)
+            text = text.rstrip()
+            text = (text + "\n\n") if text else ""
+            text += rule + "\n"
+            applied.append({
+                "group": group,
+                "rule": rule_name,
+                "target_mm": target,
+                "tolerance_mm": tol,
+                "nets": lm.get("nets"),
+            })
+
+        if "(version" not in text:
+            text = "(version 1)\n\n" + text.lstrip()
+        dru_path.write_text(text, encoding="utf-8")
+        return {
+            "applied": applied,
+            "dru_path": str(dru_path),
+            "backup_path": str(backup_path) if backup_path else None,
         }
 
     @staticmethod

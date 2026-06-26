@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings
@@ -79,7 +79,7 @@ class KiCadMCPConfig(BaseSettings):
     sse_host: str = Field(default="127.0.0.1", description="SSE server host")
     sse_port: int = Field(default=8765, description="SSE server port")
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         if self.kicad_cli_path is not None:
             p = Path(self.kicad_cli_path)

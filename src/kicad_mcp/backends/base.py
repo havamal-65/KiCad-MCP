@@ -98,6 +98,14 @@ class BoardOps(ABC):
         """Get the board's design rules."""
         raise NotImplementedError("This backend does not support design rule reading")
 
+    def refill_zones(self, path: Path) -> dict[str, Any]:
+        """Refill all copper zones (requires a live pcbnew/IPC backend)."""
+        raise NotImplementedError("This backend does not support zone refill")
+
+    def get_stackup(self, path: Path) -> dict[str, Any]:
+        """Return the board's layer stackup (requires a live pcbnew/IPC backend)."""
+        raise NotImplementedError("This backend does not support stackup queries")
+
     def save_board(self, path: Path) -> dict[str, Any]:
         """Save the board to disk (flush pcbnew in-memory state)."""
         raise NotImplementedError("This backend does not support explicit board save")

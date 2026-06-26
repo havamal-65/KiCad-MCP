@@ -60,5 +60,18 @@ line-length = 100
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
-# Strict mode is aspirational — not yet enforced across the whole codebase.
+# Whole-repo run stays lenient + informational (CI `typecheck` job).
 # Run: python -m mypy src/ to see current status.
+
+# §6.9 — strict on the three "hot" files where frame-convention bugs surface.
+# Enforced as a BLOCKING CI check (typecheck-strict). Reproduce locally with:
+#   python -m mypy --strict src/kicad_mcp/tools/drc.py \
+#       src/kicad_mcp/tools/board.py \
+#       src/kicad_mcp_plugin/backends/plugin_direct.py
+[[tool.mypy.overrides]]
+module = [
+    "kicad_mcp.tools.drc",
+    "kicad_mcp.tools.board",
+    "kicad_mcp_plugin.backends.plugin_direct",
+]
+strict = true

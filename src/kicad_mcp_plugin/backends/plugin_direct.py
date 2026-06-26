@@ -58,7 +58,7 @@ class PluginDirectBackend(BackendProtocol):
     Never falls back silently to any other board path after startup.
     """
 
-    def __init__(self, cli_path: str | None = None) -> None:
+    def __init__(self, cli_path: Path | None = None) -> None:
         self._bridge_available = self._probe_bridge()
         self._board_ops = PluginBoardOps()
         self._board_ops._on_disconnect = self._on_bridge_disconnect
@@ -161,7 +161,7 @@ class PluginDirectBackend(BackendProtocol):
             )
             return False
 
-    def export_dsn(self, path: Path, dsn_path: Path) -> dict:
+    def export_dsn(self, path: Path, dsn_path: Path) -> dict[str, Any]:
         """Export DSN from live in-memory board via bridge. Always executes."""
         try:
             return self._board_ops.export_dsn(path, dsn_path)
@@ -169,7 +169,7 @@ class PluginDirectBackend(BackendProtocol):
             self._on_bridge_disconnect()
             raise
 
-    def import_ses(self, path: Path, ses_path: Path) -> dict:
+    def import_ses(self, path: Path, ses_path: Path) -> dict[str, Any]:
         """Import FreeRouting SES into live in-memory board via bridge. Always executes."""
         try:
             return self._board_ops.import_ses(path, ses_path)
@@ -244,7 +244,8 @@ class PluginDirectBackend(BackendProtocol):
 
     def get_active_project(self) -> dict[str, Any]:
         try:
-            return _tcp_call("get_active_project", _get_op_timeout())
+            result: dict[str, Any] = _tcp_call("get_active_project", _get_op_timeout())
+            return result
         except BridgeTemporarilyUnavailableError:
             self._on_bridge_disconnect()
             raise

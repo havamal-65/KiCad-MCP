@@ -681,6 +681,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 file_modified=result["dru_path"],
                 backup_path=result.get("dru_backup_path"),
             )
+        # Coherence advisory: these rules live in the .kicad_pro/.kicad_dru files,
+        # not the in-memory board. pcbnew does NOT reload external project edits
+        # while open, and saving the board in pcbnew can overwrite them. Apply
+        # design rules with pcbnew closed, or close/reopen the project afterward.
+        result["coherence_note"] = (
+            "Design rules were written to the project files on disk. If this "
+            "project is open in pcbnew, close and reopen it so the change takes "
+            "effect — pcbnew does not pick up external project edits, and saving "
+            "in pcbnew can overwrite them."
+        )
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()

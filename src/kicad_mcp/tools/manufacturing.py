@@ -194,7 +194,11 @@ def run_manufacturing_readiness_audit(
                   "files", "output_files")
         _artifact("drill", lambda: export.export_drill(board_path, output_dir / "drill"),
                   "output_path", "output_dir")
-        _artifact("bom", lambda: export.export_bom(board_path, output_dir / "bom.csv", "csv"),
+        # BOM is generated from the schematic (kicad-cli `sch export bom`); the
+        # sibling .kicad_sch is the canonical source — the board path is not.
+        sch_path = board_path.with_suffix(".kicad_sch")
+        bom_source = sch_path if sch_path.exists() else board_path
+        _artifact("bom", lambda: export.export_bom(bom_source, output_dir / "bom.csv", "csv"),
                   "output_path", "_first_file")
         _artifact("pos", lambda: export.export_pick_and_place(board_path, output_dir / "pos.csv"),
                   "output_path", "_first_file")

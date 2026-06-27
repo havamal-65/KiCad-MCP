@@ -166,6 +166,43 @@ def test_one_export_raises_others_still_run(tmp_path, monkeypatch):
     assert result["ready_to_ship"] is False
 
 
+# ── BOM source regression — must export from the sibling .kicad_sch ──────────
+
+def test_bom_exported_from_sibling_schematic(tmp_path, monkeypatch):
+    """The BOM artifact must come from the sibling .kicad_sch, never the board
+    path (regression: `kicad-cli pcb export bom` fails; `sch export bom` is the
+    canonical source — surfaced by the live end-to-end build, 2026-06-27)."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    backend = _backend(_DRC_PASS, export_ops=ops)
+    board = _board(tmp_path)
+    sch = board.with_suffix(".kicad_sch")
+    sch.write_text("(kicad_sch (version 20240101))", encoding="utf-8")
+
+    result = run_manufacturing_readiness_audit(backend, board, tmp_path / "out")
+
+    assert ops.export_bom.called
+    bom_arg = Path(ops.export_bom.call_args.args[0])
+    assert bom_arg.suffix == ".kicad_sch", bom_arg
+    assert bom_arg == sch
+    bom = next(a for a in result["artifacts"] if a["name"] == "bom")
+    assert bom["generated"] is True
+
+
+def test_bom_falls_back_to_board_when_no_schematic(tmp_path, monkeypatch):
+    """With no sibling .kicad_sch, the BOM call falls back to the board path
+    (no crash; the export op decides the outcome)."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    backend = _backend(_DRC_PASS, export_ops=ops)
+    board = _board(tmp_path)  # no sibling schematic written
+
+    run_manufacturing_readiness_audit(backend, board, tmp_path / "out")
+
+    bom_arg = Path(ops.export_bom.call_args.args[0])
+    assert bom_arg.suffix == ".kicad_pcb", bom_arg
+
+
 # ── REQ-TEST-006 — skip_artifacts ────────────────────────────────────────────
 
 def test_skip_artifacts(tmp_path, monkeypatch):

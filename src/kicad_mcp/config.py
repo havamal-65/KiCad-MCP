@@ -22,6 +22,7 @@ class BackendType(str, Enum):
 class TransportType(str, Enum):
     STDIO = "stdio"
     SSE = "sse"
+    STREAMABLE_HTTP = "streamable-http"
 
 
 class LogLevel(str, Enum):
@@ -42,7 +43,7 @@ class KiCadMCPConfig(BaseSettings):
     )
     transport: TransportType = Field(
         default=TransportType.STDIO,
-        description="MCP transport: stdio or sse",
+        description="MCP transport: stdio, sse, or streamable-http",
     )
     log_level: LogLevel = Field(
         default=LogLevel.INFO,
@@ -76,8 +77,14 @@ class KiCadMCPConfig(BaseSettings):
         default=None,
         description="Path to java executable for running FreeRouting",
     )
-    sse_host: str = Field(default="127.0.0.1", description="SSE server host")
-    sse_port: int = Field(default=8765, description="SSE server port")
+    sse_host: str = Field(
+        default="127.0.0.1",
+        description="Network bind host for sse / streamable-http transports",
+    )
+    sse_port: int = Field(
+        default=8765,
+        description="Network bind port for sse / streamable-http transports",
+    )
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

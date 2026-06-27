@@ -127,7 +127,7 @@ python -m kicad_mcp_plugin --transport sse --sse-host 127.0.0.1 --sse-port 8765
 ### Environment Variables
 
 ```bash
-# Transport: stdio, sse
+# Transport: stdio, sse, streamable-http
 KICAD_MCP_TRANSPORT=stdio
 
 # Logging level: DEBUG, INFO, WARNING, ERROR
@@ -145,7 +145,7 @@ KICAD_MCP_BACKUP_ENABLED=true
 # Bridge port (default: 9760)
 KICAD_MCP_PLUGIN_PORT=9760
 
-# SSE server settings (only used with --transport sse)
+# Network bind (only used with --transport sse / streamable-http)
 KICAD_MCP_SSE_HOST=127.0.0.1
 KICAD_MCP_SSE_PORT=8765
 ```
@@ -440,6 +440,28 @@ ruff format .
 # Type checking
 mypy src
 ```
+
+### Hot-reload dev server (no manual `/mcp`)
+
+The committed `.mcp.json` uses **stdio**, which Claude Code spawns and owns — so
+editing server code normally means killing the process and running `/mcp`. To
+iterate without that, run the server over **streamable-http** under a
+file-watcher and point Claude Code at the URL. Claude Code auto-reconnects to an
+HTTP/SSE server when it restarts (exponential backoff), so a save just works.
+
+```bash
+# 1. one terminal: watch src/ and auto-restart the server on save
+scripts/dev_server.sh          # or:  pwsh -File scripts/dev_server.ps1
+#    → serves http://127.0.0.1:8765/mcp, restarts on any src/ change
+
+# 2. launch Claude scoped to the dev (http) config instead of stdio
+claude --strict-mcp-config --mcp-config .mcp.dev.json
+```
+
+Now edit a tool, save, and the next tool call uses the new code — no `/mcp`, no
+process kill. End users are unaffected (the default `.mcp.json` stays stdio).
+Bridge edits (`kicad_plugin/kicad_mcp_bridge.py`) are separate — see
+"After Any Bridge Change" in `src/CLAUDE.md`.
 
 ### Project Structure
 

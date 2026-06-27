@@ -171,8 +171,9 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     )
     logger.info("KiCad MCP Plugin Server v%s starting", __version__)
 
-    cli_path = str(config.kicad_cli_path) if config.kicad_cli_path else None
-    backend = PluginDirectBackend(cli_path=cli_path)
+    # config.kicad_cli_path is already Optional[Path]; pass it through as-is
+    # (CLIBackend expects Path | None and calls .exists() on it).
+    backend = PluginDirectBackend(cli_path=config.kicad_cli_path)
 
     change_log = ChangeLog(config.get_change_log_path())
 
@@ -365,16 +366,28 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     # checks + the same CLI export/DRC ops as export.py; no bridge required.
     manufacturing.register_tools(mcp, backend, change_log)
 
-    # Install bridge guard for board and routing tools — the only two modules whose
-    # every tool requires BOARD_READ / BOARD_MODIFY / ZONE_REFILL / BOARD_STACKUP,
-    # all of which route exclusively to the plugin backend (pcbnew must be open).
-    # There is no silent fallback to any other backend for these tools.
+    # Install bridge guard for board and routing tools — most require
+    # BOARD_READ / BOARD_MODIFY / ZONE_REFILL / BOARD_STACKUP, all of which route
+    # exclusively to the plugin backend (pcbnew must be open). There is no silent
+    # fallback to any other backend for these tools.
+    #
+    # Exception: a few board tools only read/write the project files (no pcbnew
+    # in-memory state), so they must work with pcbnew CLOSED. Gating them behind
+    # the bridge made set_board_design_rules unusable in exactly the situation
+    # where it is safest (pcbnew closed → no stale in-memory project to clobber
+    # the .kicad_pro edit). They bypass the bridge ping by name.
+    _BRIDGE_EXEMPT_TOOLS = frozenset({
+        "set_board_design_rules",  # edits the sibling .kicad_pro / .kicad_dru (file-side)
+    })
     _original_tool = mcp.tool
 
     def _guarded_tool(*args, **kwargs):
         decorator = _original_tool(*args, **kwargs)
 
         def wrapper(func):
+            if func.__name__ in _BRIDGE_EXEMPT_TOOLS:
+                return decorator(func)  # file-side tool — no bridge required
+
             @functools.wraps(func)
             def guarded(*fargs, **fkwargs):
                 try:

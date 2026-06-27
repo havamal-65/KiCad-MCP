@@ -34,6 +34,7 @@ dev = [
     "pytest-mock>=3.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    "watchfiles>=0.21",  # dev hot-reload server (scripts/dev_server.*)
 ]
 
 [project.scripts]

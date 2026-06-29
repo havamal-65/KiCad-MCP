@@ -1685,6 +1685,40 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
+    def placement_quality(path: str) -> str:
+        """Score a placed board's quality — Total HPWL + legality (read-only).
+
+        Computes the placement-quality metric bundle for a ``.kicad_pcb``: the
+        headline ``total_hpwl_mm`` (half-perimeter wire length summed over signal
+        nets — lower is a tighter, more routable placement), plus ``overlap_count``
+        and ``out_of_outline_count`` legality figures and an
+        ``orientation_consistency`` readability score.
+
+        Connectivity is read from the *placed board* (the pad->net clauses written
+        by sync_schematic_to_pcb), so it needs no schematic and reflects exactly
+        what the router will see. Power/ground nets are excluded from HPWL; nets on
+        more than 16 footprints are treated as a bus and ignored for proximity.
+
+        Pure reporting tool: no backup, no change-log entry, no mutation. Call it
+        to compare two layouts of the same netlist, or to score a board before a
+        placement gate is wired in.
+
+        Args:
+            path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON bundle: total_hpwl_mm, overlap_count, out_of_outline_count,
+            decap_max_mm (null until P2), decap_mean_mm (null until P2),
+            orientation_consistency (0..1), signal_net_count, scored_parts, and
+            an optional warnings list.
+        """
+        from kicad_mcp.utils.placement_metrics import placement_metric
+
+        p = validate_kicad_path(path, ".kicad_pcb")
+        bundle = placement_metric(p)
+        return json.dumps({"status": "success", **bundle}, indent=2)
+
+    @mcp.tool()
     def get_board_design_rules(path: str) -> str:
         """Get the design rules configured for a PCB board.
 

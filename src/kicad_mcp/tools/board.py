@@ -743,22 +743,23 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         board_height: float = 80.0,
         clearance_mm: float = 1.5,
         anchors: list[str] | None = None,
+        strategy: str = "net_aware",
     ) -> str:
-        """Automatically place all board components using geometry-driven bin-packing.
+        """Automatically place all board components (net-aware by default, P2).
 
-        Reads the courtyard extents for every footprint, sorts components by
-        class (connectors → ICs → discretes → transistors → LEDs → others),
-        then bin-packs them into rows within the board outline with a guaranteed
-        courtyard-to-courtyard gap ≥ clearance_mm.
+        strategy="net_aware" (default): classifies parts, clusters them by
+        connectivity, hugs decoupling caps to their ICs, and positions everything
+        to minimise Total HPWL (half-perimeter wire length — a tighter, more
+        routable layout), then legalizes courtyards. The resulting
+        placement_metric bundle is returned so you can see the score.
 
-        This replaces trial-and-error manual placement and eliminates courtyard
-        overlap violations.
+        strategy="row": the legacy geometry-driven row packer (connectors → ICs →
+        discretes → … bin-packed into rows). Byte-identical to the pre-P2
+        behaviour; use it only to reproduce an old layout.
 
         Use the anchors parameter to keep specific refs in place — typically
         connectors that place_at_edge has already anchored at the board edge.
-        Anchored refs are skipped during bulk placement but their courtyards
-        are not considered as obstacles (a known simplification — pass them
-        a generous clearance_mm if bulk placement crowds the edges).
+        Anchored refs are skipped during placement under both strategies.
 
         Args:
             path: Path to .kicad_pcb file.
@@ -766,13 +767,21 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             board_y: Top edge of the placement area in mm (default 3.0).
             board_width: Width of the placement area in mm (default 100.0).
             board_height: Height of the placement area in mm (default 80.0).
-            clearance_mm: Minimum courtyard-to-courtyard gap in mm (default 0.5).
+            clearance_mm: Minimum courtyard-to-courtyard gap in mm (default 1.5).
             anchors: Optional list of refs whose positions must not be modified
                 (e.g. ["J1", "J2", "J3"] for connectors placed by place_at_edge).
+            strategy: "net_aware" (default) or "row".
 
         Returns:
-            JSON with components_placed, rows, total_area_mm2, and any warnings.
+            JSON with components_placed, rows, total_area_mm2, warnings, and
+            (net_aware) a placement_metric bundle.
         """
+        if strategy not in ("net_aware", "row"):
+            return json.dumps({
+                "status": "error",
+                "message": "strategy must be one of: net_aware, row",
+            }, indent=2)
+
         p = validate_kicad_path(path, ".kicad_pcb")
 
         # ── §6.5 board-size gate ─────────────────────────────────────────────
@@ -812,7 +821,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         backup = create_backup(p)
         result = board_ops.auto_place(
             p, board_x, board_y, board_width, board_height, clearance_mm,
-            anchors=anchors,
+            anchors=anchors, strategy=strategy,
         )
 
         for placement in result.get("placements", []):
@@ -822,6 +831,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 file_modified=path,
                 backup_path=str(backup) if backup else None,
             )
+
+        # Embed the P1 placement-quality bundle on the resulting board so the
+        # caller sees the score net-aware placement achieved (REQ-API-004).
+        if strategy == "net_aware":
+            from kicad_mcp.utils.placement_metrics import placement_metric
+            result["placement_metric"] = placement_metric(p)
 
         # Compute board utilization and warn if routing will be difficult
         board_area = board_width * board_height

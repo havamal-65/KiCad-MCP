@@ -84,11 +84,12 @@ def test_anchor_offset_aligns_courtyard_top_left_to_cursor(asymmetric_board: Pat
 
     ops = FileBoardOps()
     with patch("kicad_mcp.backends.file_backend._load_kicad_mod", side_effect=fake_load):
+        # Bug 4a is a row-packer anchor-offset guard (spec-p2 §8.3 pins it to row).
         result = ops.auto_place(
             asymmetric_board,
             board_x=10.0, board_y=10.0,
             board_width=100.0, board_height=80.0,
-            clearance_mm=0.5,
+            clearance_mm=0.5, strategy="row",
         )
 
     placements = {p["reference"]: p for p in result["placements"]}
@@ -126,7 +127,7 @@ def test_no_overlap_after_placement_with_asymmetric_neighbour(tmp_path: Path):
             board_file,
             board_x=10.0, board_y=10.0,
             board_width=50.0, board_height=50.0,
-            clearance_mm=0.5,
+            clearance_mm=0.5, strategy="row",
         )
 
     # Now run check_courtyard_overlaps and verify passed

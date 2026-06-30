@@ -125,8 +125,9 @@ class BoardOps(ABC):
         self, path: Path, board_x: float, board_y: float,
         board_width: float, board_height: float, clearance_mm: float = 1.5,
         anchors: list[str] | None = None,
+        strategy: str = "net_aware",
     ) -> dict[str, Any]:
-        """Place all components using geometry-driven bin-packing."""
+        """Place all components (net-aware by default; "row" = legacy packer)."""
         raise NotImplementedError("This backend does not support auto_place")
 
     def place_components_bulk(

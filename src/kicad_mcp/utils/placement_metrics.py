@@ -315,12 +315,32 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
 
     orientation_consistency = _orientation_consistency(footprints)
 
+    # Decoupling-cap proximity (P2). Reuse the engine's classifier + pairing on
+    # the board's own records so "which cap decouples which IC" is defined once.
+    # Lazy import: placement_engine imports this module at top level.
+    decap_max_mm: float | None
+    decap_mean_mm: float | None
+    from kicad_mcp.utils.placement_engine import (
+        classify_parts,
+        measure_decap_distances,
+        pair_decaps,
+        read_part_records,
+    )
+
+    parts = read_part_records(content)
+    roles = classify_parts(parts)
+    decap_pairing, _decap_warn = pair_decaps(parts, roles)
+    positions = {pt["ref"]: pt["pos"] for pt in parts}
+    decap_max_mm, decap_mean_mm = measure_decap_distances(
+        parts, roles, decap_pairing, positions,
+    )
+
     bundle: dict[str, Any] = {
         "total_hpwl_mm": total_hpwl_mm,
         "overlap_count": overlap_count,
         "out_of_outline_count": out_of_outline_count,
-        "decap_max_mm": None,   # P2 fills
-        "decap_mean_mm": None,  # P2 fills
+        "decap_max_mm": decap_max_mm,
+        "decap_mean_mm": decap_mean_mm,
         "orientation_consistency": orientation_consistency,
         "signal_net_count": signal_net_count,
         "scored_parts": scored_parts,

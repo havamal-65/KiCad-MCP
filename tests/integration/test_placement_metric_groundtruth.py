@@ -52,8 +52,11 @@ def test_metric_on_real_board_geometry(board_name: str) -> None:
 
     assert isinstance(bundle["total_hpwl_mm"], float)
     assert bundle["total_hpwl_mm"] >= 0.0
-    assert bundle["decap_max_mm"] is None      # P1: not yet populated
-    assert bundle["decap_mean_mm"] is None
+    # P2 populates decap proximity: either None (no decoupling caps on the board)
+    # or a non-negative float (max/mean cap→IC centre distance, mm).
+    for key in ("decap_max_mm", "decap_mean_mm"):
+        val = bundle[key]
+        assert val is None or (isinstance(val, float) and val >= 0.0), (key, val)
     assert 0.0 <= bundle["orientation_consistency"] <= 1.0
     assert bundle["scored_parts"] >= 0
 

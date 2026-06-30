@@ -307,12 +307,62 @@ class PluginBoardOps(BoardOps):
         self, path: Path, board_x: float, board_y: float,
         board_width: float, board_height: float, clearance_mm: float = 1.5,
         anchors: list[str] | None = None,
+        strategy: str = "net_aware",
     ) -> dict[str, Any]:
-        return self._call("auto_place", path,
-                          board_x=board_x, board_y=board_y,
-                          board_width=board_width, board_height=board_height,
-                          clearance_mm=clearance_mm,
-                          anchors=anchors or [])
+        if strategy == "row":
+            # Legacy geometry packer runs inside pcbnew (bridge), unchanged.
+            return self._call("auto_place", path,
+                              board_x=board_x, board_y=board_y,
+                              board_width=board_width, board_height=board_height,
+                              clearance_mm=clearance_mm,
+                              anchors=anchors or [])
+
+        # Net-aware: the engine is pure Python and lives here on the server side.
+        # We refresh the on-disk board from the live session, compute the plan
+        # from it, then apply each position through the *existing* bridge
+        # move_component path (no new bridge handler, no reinstall). Anchored refs
+        # are never moved (AC7).
+        from kicad_mcp.backends.file_backend import build_engine_parts
+        from kicad_mcp.utils import placement_engine as engine
+
+        try:
+            self._call("save_board", path)  # live board -> disk, so the plan is current
+        except Exception:  # noqa: BLE001 — proceed with whatever is on disk
+            pass
+
+        parts = build_engine_parts(path, path.parent)
+        if not parts:
+            return {
+                "components_placed": 0, "rows": 0, "total_area_mm2": 0.0,
+                "placements": [], "warnings": [], "strategy": "net_aware",
+            }
+
+        items, warnings, total_area = engine.compute_net_aware_plan(
+            parts, board_x, board_y, board_width, board_height,
+            clearance_mm, anchors,
+        )
+        placements: list[dict[str, Any]] = []
+        applied_warnings: list[Any] = list(warnings)
+        for ref, x, y, rot in items:
+            try:
+                self.move_component(path, ref, x, y, rotation=rot)
+                placements.append({"reference": ref, "x": x, "y": y})
+            except Exception as exc:  # noqa: BLE001
+                applied_warnings.append(f"{ref}: move failed — {exc}")
+
+        try:
+            self._call("save_board", path)
+        except Exception:  # noqa: BLE001
+            pass
+
+        return {
+            "components_placed": len(placements),
+            "rows": 0,
+            "total_area_mm2": total_area,
+            "placements": placements,
+            "warnings": applied_warnings,
+            "strategy": "net_aware",
+        }
 
     def place_components_bulk(
         self, path: Path, components: list[dict],

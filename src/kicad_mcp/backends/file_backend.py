@@ -237,6 +237,51 @@ def _parse_footprint_bounds(kicad_mod_text: str) -> dict[str, Any]:
     return result
 
 
+def build_engine_parts(
+    path: Path, project_dir: str | Path | None = None,
+) -> list[Any]:
+    """Build placement-engine ``PartRecord``s from a board file (P2).
+
+    Net assignment per pad comes from the board; pad *geometry* (local offsets +
+    courtyard) prefers the library ``.kicad_mod`` — the same source and 5×5
+    fallback the row packer uses, so geometry matches when a test patches
+    ``_load_kicad_mod`` — and falls back to the board block's own geometry when
+    the library footprint is unavailable. Shared by both the file backend and the
+    plugin backend so net-aware placement is identical regardless of write path.
+    """
+    from kicad_mcp.utils.placement_engine import PadLocal, read_part_records
+
+    content = path.read_text(encoding="utf-8")
+    recs = read_part_records(content)
+    for rec in recs:
+        mod = _load_kicad_mod(rec["lib_id"], project_dir)
+        if mod is not None:
+            bounds = _parse_footprint_bounds(mod)
+            cy = bounds.get("courtyard")
+            if cy:
+                rec["courtyard"] = (
+                    cy["xmin"], cy["ymin"], cy["xmax"], cy["ymax"],
+                )
+            mod_pads = bounds.get("pads") or []
+            if mod_pads:
+                netmap = {
+                    p["pad"]: (p["net_id"], p["net_name"]) for p in rec["pads"]
+                }
+                rec["pads"] = [
+                    PadLocal(
+                        pad=str(mp["number"]),
+                        net_id=netmap.get(str(mp["number"]), (0, ""))[0],
+                        net_name=netmap.get(str(mp["number"]), (0, ""))[1],
+                        dx=mp["x"], dy=mp["y"],
+                    )
+                    for mp in mod_pads
+                ]
+                rec["pad_count"] = len(mod_pads)
+        if rec["courtyard"] is None:
+            rec["courtyard"] = (-2.5, -2.5, 2.5, 2.5)  # 5×5 default (row parity)
+    return recs
+
+
 def _add_uuids_to_fp_elements(inner: str) -> str:
     """Inject ``(uuid "…")`` into every sub-element of a footprint body that
     does not already carry one.
@@ -1263,6 +1308,43 @@ class FileBoardOps(BoardOps):
         board_width: float = 100.0, board_height: float = 80.0,
         clearance_mm: float = 0.5,
         anchors: list[str] | None = None,
+        strategy: str = "net_aware",
+    ) -> dict[str, Any]:
+        """Place all components, dispatching on ``strategy`` (P2 — REQ-API-001).
+
+        - ``strategy="net_aware"`` (default): the net-aware constructive placer —
+          classifies parts, clusters by connectivity, pairs decoupling caps to
+          their ICs, places to minimise Total HPWL, then legalizes courtyards.
+        - ``strategy="row"``: the legacy geometry-driven row packer, byte-for-byte
+          unchanged (``_auto_place_row``).
+
+        Both honour ``anchors`` identically (anchored refs are never moved). The
+        caller creates the backup and records change_log entries.
+
+        Returns the same result shape for both strategies (components_placed,
+        rows, total_area_mm2, placements, warnings); the net-aware branch may add
+        structured ``warnings`` entries (decap/legalize/outline).
+        """
+        if strategy == "net_aware":
+            return self._auto_place_net_aware(
+                path, board_x, board_y, board_width, board_height,
+                clearance_mm, anchors=anchors,
+            )
+        if strategy == "row":
+            return self._auto_place_row(
+                path, board_x, board_y, board_width, board_height,
+                clearance_mm, anchors=anchors,
+            )
+        raise ValueError(
+            f"strategy must be one of: net_aware, row (got {strategy!r})"
+        )
+
+    def _auto_place_row(
+        self, path: Path,
+        board_x: float = 3.0, board_y: float = 3.0,
+        board_width: float = 100.0, board_height: float = 80.0,
+        clearance_mm: float = 0.5,
+        anchors: list[str] | None = None,
     ) -> dict[str, Any]:
         """Place all components using geometry-driven bin-packing.
 
@@ -1413,6 +1495,51 @@ class FileBoardOps(BoardOps):
             "total_area_mm2": round(total_area, 2),
             "placements": placements,
             "warnings": warnings,
+        }
+
+    def _auto_place_net_aware(
+        self, path: Path,
+        board_x: float = 3.0, board_y: float = 3.0,
+        board_width: float = 100.0, board_height: float = 80.0,
+        clearance_mm: float = 0.5,
+        anchors: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Net-aware constructive placement (P2 — REQ-API-001, REQ-PROX-*).
+
+        Reads the board into engine records, builds a plan that classifies parts,
+        clusters by connectivity, hugs decoupling caps to their ICs, minimises
+        Total HPWL and legalizes courtyards, then applies the plan through the
+        existing ``move_component`` loop. Anchored refs are never moved (AC7).
+        """
+        from kicad_mcp.utils import placement_engine as engine
+
+        parts = build_engine_parts(path, self._project_dir)
+        items, warnings, total_area = engine.compute_net_aware_plan(
+            parts, board_x, board_y, board_width, board_height,
+            clearance_mm, anchors,
+        )
+        if not parts:
+            return {
+                "components_placed": 0, "rows": 0, "total_area_mm2": 0.0,
+                "placements": [], "warnings": [], "strategy": "net_aware",
+            }
+
+        placements: list[dict[str, Any]] = []
+        applied_warnings: list[Any] = list(warnings)
+        for ref, x, y, rot in items:
+            try:
+                self.move_component(path, ref, x, y, rotation=rot)
+                placements.append({"reference": ref, "x": x, "y": y})
+            except Exception as exc:  # noqa: BLE001 — surface as a warning, keep going
+                applied_warnings.append(f"{ref}: move failed — {exc}")
+
+        return {
+            "components_placed": len(placements),
+            "rows": 0,
+            "total_area_mm2": total_area,
+            "placements": placements,
+            "warnings": applied_warnings,
+            "strategy": "net_aware",
         }
 
     def validate_board(self, path: Path) -> dict[str, Any]:

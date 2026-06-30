@@ -66,10 +66,12 @@ def test_components_from_same_sheet_are_placed_consecutively(tmp_path: Path):
 
     ops = FileBoardOps()
     with patch("kicad_mcp.backends.file_backend._load_kicad_mod", return_value=SQUARE_5MM_MOD):
+        # REQ-BACK-002: same-sheet adjacency is a legacy row-packer property; the
+        # net-aware default reorders by connectivity, so this test pins strategy.
         result = ops.auto_place(
             board, board_x=0, board_y=0,
             board_width=100, board_height=100,
-            clearance_mm=0.5,
+            clearance_mm=0.5, strategy="row",
         )
 
     placed_order = [p["reference"] for p in result["placements"]]
@@ -215,10 +217,11 @@ def test_cluster_id_groups_independent_of_sheet(tmp_path: Path):
 
     ops = FileBoardOps()
     with patch("kicad_mcp.backends.file_backend._load_kicad_mod", return_value=SQUARE_5MM_MOD):
+        # REQ-BACK-002: ClusterId adjacency is a legacy row-packer property.
         result = ops.auto_place(
             board, board_x=0, board_y=0,
             board_width=100, board_height=100,
-            clearance_mm=0.5,
+            clearance_mm=0.5, strategy="row",
         )
 
     placed_order = [p["reference"] for p in result["placements"]]

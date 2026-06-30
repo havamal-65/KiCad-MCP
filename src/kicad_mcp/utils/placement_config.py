@@ -12,6 +12,10 @@ module (project rule, REQ-CFG-001).
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from typing import SupportsFloat, SupportsInt
 
 # ---------------------------------------------------------------------------
 # Net classification (REQ-GRAPH-003)
@@ -47,19 +51,109 @@ MAX_NET_FANOUT: int = 16
 #: orientation-consistency metric and (in P3) when normalising orientations.
 ORIENT_ROTATION_QUANTUM_DEG: float = 90.0
 
+# ---------------------------------------------------------------------------
+# Part classification tunables (P2 — REQ-CLASS-002/003)
+# ---------------------------------------------------------------------------
+
+#: A non-connector footprint with at least this many pads is classified as an
+#: integrated circuit (the anchor of a decoupling-cap cluster).
+IC_PAD_THRESHOLD: int = 4
+
+#: Reference-designator prefixes that mark a part as a connector. Connectors are
+#: never reclassified as ICs regardless of pad count (REQ-CLASS-002).
+CONNECTOR_PREFIXES: tuple[str, ...] = ("J", "P", "CN", "X")
+
+#: Reference-designator prefixes that mark a part as a crystal / oscillator
+#: (REQ-CLASS-003). ``X`` is only a crystal when it is not already a connector.
+CRYSTAL_PREFIXES: tuple[str, ...] = ("Y",)
+
+# ---------------------------------------------------------------------------
+# Clustering tunables (P2 — REQ-CLUSTER-002)
+# ---------------------------------------------------------------------------
+
+#: A part-graph edge below this weight does not bind two footprints into the
+#: same connectivity cluster (weak/incidental connections do not group blocks).
+CLUSTER_WEIGHT_FLOOR: float = 0.25
+
+# ---------------------------------------------------------------------------
+# Decoupling-cap pairing tunables (P2 — REQ-DECAP-003)
+# ---------------------------------------------------------------------------
+
+#: Maximum centre-to-centre distance (mm) a decoupling cap may sit from the IC
+#: it decouples. Beyond this the cap falls back to ordinary proximity placement
+#: (never-worse fallback, REQ-DECAP-005).
+DECAP_MAX_MM: float = 3.0
+
+# ---------------------------------------------------------------------------
+# Constructive-placement / legalizer tunables (P2 — REQ-PROX-003, REQ-LEGAL-002)
+# ---------------------------------------------------------------------------
+
+#: Number of bounded local-improvement passes after constructive placement. Each
+#: pass only accepts a move on a strict HPWL decrease, so the search terminates.
+PROX_IMPROVE_PASSES: int = 2
+
+#: Candidate-offset grid step (mm) for the constructive / improvement search.
+PROX_CANDIDATE_GRID_MM: float = 0.5
+
+#: Maximum legalizer passes before it stops and reports any residual overlaps as
+#: a structured warning rather than looping (REQ-LEGAL-002).
+LEGALIZE_MAX_PASSES: int = 40
+
 
 # ---------------------------------------------------------------------------
 # Override hook (REQ-CFG-002)
 # ---------------------------------------------------------------------------
 
+#: Tunables that ``load_overrides`` is allowed to replace at run time. Only these
+#: keys are honoured; anything else in the override mapping is ignored so a typo
+#: cannot silently disable a gate. Values must match the module-level type.
+_OVERRIDABLE: frozenset[str] = frozenset({
+    "MAX_NET_FANOUT",
+    "IC_PAD_THRESHOLD",
+    "CLUSTER_WEIGHT_FLOOR",
+    "DECAP_MAX_MM",
+    "PROX_IMPROVE_PASSES",
+    "PROX_CANDIDATE_GRID_MM",
+    "LEGALIZE_MAX_PASSES",
+})
+
+
 def load_overrides() -> dict[str, object]:
     """Return per-board overrides for the placement tunables.
 
-    P1 default: a no-op that returns an empty mapping. The hook exists so P2 can
-    wire it to the existing config mechanism when placement first consumes
-    config; until then the module-level constants above are authoritative.
+    Default: a no-op that returns an empty mapping — the module-level constants
+    above are authoritative. A deployment can monkeypatch this function (or a
+    future config loader can replace it) to return a mapping of constant name ->
+    value; ``get_tunable`` consults it, restricted to ``_OVERRIDABLE`` keys.
     """
     return {}
+
+
+def get_tunable(name: str) -> object:
+    """Resolve a placement tunable, honouring ``load_overrides`` (REQ-CFG-002).
+
+    Looks the override mapping up first (only for keys in ``_OVERRIDABLE``);
+    falls back to the module-level constant of the same name. Raises
+    ``KeyError`` if ``name`` is not a defined tunable, so a typo fails loudly
+    rather than returning ``None``.
+    """
+    if name in _OVERRIDABLE:
+        overrides = load_overrides()
+        if name in overrides:
+            return overrides[name]
+    if name not in globals():
+        raise KeyError(f"unknown placement tunable: {name!r}")
+    return globals()[name]
+
+
+def get_int(name: str) -> int:
+    """``get_tunable`` narrowed to ``int`` (for numeric tunables)."""
+    return int(cast("SupportsInt", get_tunable(name)))
+
+
+def get_float(name: str) -> float:
+    """``get_tunable`` narrowed to ``float`` (for distance/weight tunables)."""
+    return float(cast("SupportsFloat", get_tunable(name)))
 
 
 def classify_net(net_name: str) -> str:

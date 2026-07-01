@@ -60,6 +60,46 @@ def test_real_board_net_aware_beats_row(board_name: str, tmp_path: Path) -> None
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("board_name", _REAL_BOARDS)
+def test_real_board_p3_orientation_and_legality(
+    board_name: str, tmp_path: Path,
+) -> None:
+    """REQ-TEST-P3-002 (V-A, real geometry) — P3 orientation normalization runs
+    inside net-aware placement on real KiCad boards without breaking legality.
+
+    Rotating a passive changes its courtyard footprint, so the normalization pass
+    re-checks overlap/outline; on real geometry the result MUST stay overlap-free
+    (REQ-ORIENT/FLOW legality guarantee) and no worse than the row packer on
+    outline fit, while remaining a tighter layout than that packer (AC1).
+    ``orientation_consistency`` is a valid fraction reflecting the
+    family-normalized result. The visual input→output block arrangement is the
+    V-M leg documented in the build report. (``out_of_outline_count`` is measured
+    against the board's real outline, which is smaller than the 160×120 placement
+    area used here — hence the comparison is net-aware-vs-row, not an absolute 0.)
+    """
+    src = Path(__file__).parent.parent / "fixtures" / "boards" / board_name
+    if not src.exists():
+        pytest.skip(f"fixture {board_name} not present")
+
+    scores = {}
+    for strat in ("row", "net_aware"):
+        dst = tmp_path / f"{strat}_{board_name}"
+        shutil.copy(src, dst)
+        FileBoardOps().auto_place(dst, 0.0, 0.0, 160.0, 120.0, 1.5, strategy=strat)
+        scores[strat] = placement_metric(dst)
+
+    na, row = scores["net_aware"], scores["row"]
+    # Orientation normalization preserved overlap-freedom on real geometry.
+    assert na["overlap_count"] == 0, scores
+    # P3 did not worsen outline fit or wire length vs the row packer.
+    assert na["out_of_outline_count"] <= row["out_of_outline_count"], scores
+    assert na["total_hpwl_mm"] <= row["total_hpwl_mm"], scores
+    # The consistency metric reflects the normalized result (a valid fraction).
+    oc = na["orientation_consistency"]
+    assert isinstance(oc, float) and 0.0 <= oc <= 1.0, scores
+
+
+@pytest.mark.integration
 def test_live_board_net_aware(bridge_session: object, tmp_path: Path) -> None:
     """Score the board open in pcbnew after a net-aware placement (opt-in)."""
     from kicad_mcp.backends.plugin_backend import _tcp_call

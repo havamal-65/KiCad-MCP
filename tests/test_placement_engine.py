@@ -381,3 +381,217 @@ def test_read_part_records_skips_pseudo_refs() -> None:
     )
     recs = e.read_part_records(board)
     assert [r["ref"] for r in recs] == ["R1"]
+
+
+# ---------------------------------------------------------------------------
+# P3 — orientation normalization (REQ-ORIENT-001..004)
+# ---------------------------------------------------------------------------
+
+_RES_LIB = "Resistor_SMD:R_0402"
+
+
+def _family_consistency(
+    parts: list[PartRecord], plan: dict[str, tuple[float, float, float]],
+) -> float:
+    """Local mirror of placement_metrics._orientation_consistency over a plan."""
+    by_ref = {p["ref"]: p for p in parts}
+    families: dict[str, list[float]] = {}
+    for ref, (_x, _y, rot) in plan.items():
+        families.setdefault(by_ref[ref]["lib_id"], []).append(rot)
+    weighted = 0
+    total = 0
+    for rots in families.values():
+        if len(rots) < 2:
+            continue
+        buckets: dict[float, int] = {}
+        for r in rots:
+            q = round((r % 360.0) / 90.0) * 90.0 % 360.0
+            buckets[q] = buckets.get(q, 0) + 1
+        weighted += max(buckets.values())
+        total += len(rots)
+    return 1.0 if total == 0 else weighted / total
+
+
+def _iso_res(ref: str, x: float, rot: float) -> PartRecord:
+    """A resistor on unique (isolated) nets → zero HPWL contribution."""
+    return _part(
+        ref, _RES_LIB,
+        [_pad("1", hash(ref) % 9000 + 100, ref + "A", -0.5, 0),
+         _pad("2", hash(ref) % 9000 + 101, ref + "B", 0.5, 0)],
+        pos=(x, 10.0, rot),
+    )
+
+
+def _vertical_res(ref: str, rot: float) -> tuple[
+    list[PartRecord], dict[str, tuple[float, float, float]],
+]:
+    """A resistor whose two nets pull vertically: rot=90 is strictly lower HPWL.
+
+    Returns ``([r], anchors)`` — two connector anchors above/below hold the far
+    ends of the resistor's two signal nets, so a horizontal (rot 0) placement is
+    longer than a vertical (rot 90) one.
+    """
+    r = _part(
+        ref, _RES_LIB,
+        [_pad("1", 200, "NA", -0.5, 0), _pad("2", 201, "NB", 0.5, 0)],
+        pos=(50.0, 20.0, rot),
+    )
+    top = _part("J8", "Connector:Conn", [_pad("1", 200, "NA", 0, 0)])
+    bot = _part("J9", "Connector:Conn", [_pad("1", 201, "NB", 0, 0)])
+    anchors = {"J8": (50.0, 5.0, 0.0), "J9": (50.0, 35.0, 0.0)}
+    return [r, top, bot], anchors
+
+
+def test_orientation_normalization_improves_consistency() -> None:
+    """(b) snaps an off-modal family member to the mode, HPWL-neutral (REQ-ORIENT
+    -001/004): consistency strictly increases, no new overlap, HPWL not raised."""
+    parts = [_iso_res("R1", 10.0, 90.0), _iso_res("R2", 20.0, 90.0),
+             _iso_res("R3", 30.0, 0.0)]
+    plan = {p["ref"]: p["pos"] for p in parts}
+    roles = e.classify_parts(parts)
+    board = (0.0, 0.0, 100.0, 50.0)
+
+    before = _family_consistency(parts, plan)
+    h_before = e._total_hpwl_of(parts, plan, {})
+    new_plan, _w = e.normalize_orientations(parts, plan, roles, {}, board)
+    after = _family_consistency(parts, new_plan)
+
+    assert after > before          # 2/3 → 1.0 (REQ-ORIENT-004)
+    assert after == 1.0
+    assert new_plan["R3"][2] == 90.0
+    assert e._total_hpwl_of(parts, new_plan, {}) <= h_before + 1e-9
+    assert _count_overlaps(parts, new_plan) == 0
+
+
+def test_orientation_rotation_for_hpwl() -> None:
+    """(a) accepts a quantized rotation on a strict HPWL decrease (REQ-ORIENT-001)."""
+    parts, anchors = _vertical_res("R7", 0.0)
+    plan = {"R7": (50.0, 20.0, 0.0)}
+    roles = e.classify_parts(parts)
+    board = (0.0, 0.0, 100.0, 50.0)
+
+    h_before = e._total_hpwl_of(parts, plan, anchors)
+    new_plan, _w = e.normalize_orientations(parts, plan, roles, anchors, board)
+
+    assert new_plan["R7"][2] == 90.0  # rotated to the low-HPWL orientation
+    assert e._total_hpwl_of(parts, new_plan, anchors) < h_before
+
+
+def test_orientation_never_worse_rejects_snap() -> None:
+    """A snap to the family mode that would raise HPWL is rejected (REQ-ORIENT-004
+    never-worse): the HPWL-optimal off-modal member keeps its rotation."""
+    vparts, anchors = _vertical_res("R3", 90.0)   # R3 optimal at 90
+    parts = [_iso_res("R1", 10.0, 0.0), _iso_res("R2", 20.0, 0.0)] + vparts
+    plan = {"R1": (10.0, 10.0, 0.0), "R2": (20.0, 10.0, 0.0),
+            "R3": (50.0, 20.0, 90.0)}
+    roles = e.classify_parts(parts)
+    board = (0.0, 0.0, 100.0, 50.0)
+
+    new_plan, _w = e.normalize_orientations(parts, plan, roles, anchors, board)
+
+    # modal is 0 (R1,R2) but snapping R3 to 0 raises HPWL → R3 stays at 90.
+    assert new_plan["R3"][2] == 90.0
+    assert new_plan["R1"][2] == 0.0 and new_plan["R2"][2] == 0.0
+
+
+def test_orientation_leaves_connectors_and_anchors(  # REQ-ORIENT-002
+) -> None:
+    parts, anchors = _vertical_res("R7", 0.0)
+    plan = {"R7": (50.0, 20.0, 0.0)}
+    roles = e.classify_parts(parts)
+    board = (0.0, 0.0, 100.0, 50.0)
+    new_plan, _w = e.normalize_orientations(parts, plan, roles, anchors, board)
+    # Connectors are anchors here — never in the plan, never rotated.
+    assert "J8" not in new_plan and "J9" not in new_plan
+
+
+# ---------------------------------------------------------------------------
+# P3 — signal-flow cluster ordering (REQ-FLOW-001..003)
+# ---------------------------------------------------------------------------
+
+def _flow_fixture() -> tuple[
+    list[PartRecord], dict[str, tuple[float, float, float]],
+]:
+    """Input connector (USB) at the left edge, output (SPK) at the right edge.
+
+    ``R20``'s cluster has the larger courtyard, so the P2 area order would place
+    it first; flow ordering must override that and place the input-biased ``R10``
+    first.
+    """
+    r10 = _part("R10", "R_x",
+                [_pad("1", 10, "SIG_IN", -0.5, 0), _pad("2", 11, "NA", 0.5, 0)])
+    r20 = _part("R20", "R_y",
+                [_pad("1", 12, "SIG_OUT", -0.5, 0), _pad("2", 13, "NB", 0.5, 0)],
+                courtyard=(-3, -3, 3, 3))
+    j1 = _part("J1", "Connector:USB",
+               [_pad("1", 10, "SIG_IN", 0, 0), _pad("2", 14, "USB_DP", 0, 1)])
+    j2 = _part("J2", "Connector:Audio",
+               [_pad("1", 12, "SIG_OUT", 0, 0), _pad("2", 15, "SPK_OUT", 0, 1)])
+    anchors = {"J1": (5.0, 25.0, 0.0), "J2": (95.0, 25.0, 0.0)}
+    return [r10, r20, j1, j2], anchors
+
+
+def test_flow_orders_input_to_output() -> None:
+    parts, anchors = _flow_fixture()
+    board = (0.0, 0.0, 100.0, 50.0)
+    roles = e.classify_parts(parts)
+    pairing, _ = e.pair_decaps(parts, roles)
+    clusters = e.cluster_parts(parts, roles, pairing, frozenset(anchors))
+    graph = e._part_graph(parts)
+
+    order = e.order_clusters_by_flow(
+        clusters, parts, roles, anchors, graph, board,
+    )
+    assert order is not None
+    # Input-biased cluster first, despite R20's larger courtyard (area order
+    # would be the reverse) — REQ-FLOW-001.
+    assert order[0] == ["R10"]
+    assert order[1] == ["R20"]
+
+    # And the placed centroids run input(left) → output(right) along x.
+    res = e.plan_placement(parts, board, 0.5, anchors=anchors)
+    assert res["plan"]["R10"][0] < res["plan"]["R20"][0]
+
+
+def test_flow_graceful_degradation_single_connector() -> None:
+    """<2 distinguishable endpoints → order_clusters_by_flow is a no-op (None),
+    so plan_placement keeps the exact P2 area order (REQ-FLOW-002)."""
+    parts, anchors = _flow_fixture()
+    anchors = {"J1": (5.0, 25.0, 0.0)}   # drop the output connector
+    board = (0.0, 0.0, 100.0, 50.0)
+    roles = e.classify_parts(parts)
+    pairing, _ = e.pair_decaps(parts, roles)
+    clusters = e.cluster_parts(parts, roles, pairing, frozenset(anchors))
+    graph = e._part_graph(parts)
+
+    assert e.order_clusters_by_flow(
+        clusters, parts, roles, anchors, graph, board,
+    ) is None
+    # Still produces a legal, overlap-free layout.
+    res = e.plan_placement(parts, board, 0.5, anchors=anchors)
+    assert _count_overlaps(parts, res["plan"]) == 0
+
+
+def test_p3_pipeline_deterministic() -> None:
+    """Two full runs with flow ordering + orientation active are identical."""
+    parts, anchors = _flow_fixture()
+    board = (0.0, 0.0, 100.0, 50.0)
+    r1 = e.plan_placement(parts, board, 0.5, anchors=anchors)
+    r2 = e.plan_placement(parts, board, 0.5, anchors=anchors)
+    assert r1["plan"] == r2["plan"]
+    assert r1["warnings"] == r2["warnings"]
+
+
+def test_place_default_order_unchanged_without_cluster_order() -> None:
+    """place() called without cluster_order keeps P2 area behavior (REQ-BACK)."""
+    parts = _ic_conn_decap_fixture()
+    roles = e.classify_parts(parts)
+    pairing, _ = e.pair_decaps(parts, roles)
+    clusters = e.cluster_parts(parts, roles, pairing)
+    board = (0.0, 0.0, 100.0, 80.0)
+    p_default, _w1 = e.place(parts, roles, clusters, pairing, {}, board, 0.5)
+    area = e._order_clusters_by_area(clusters, {p["ref"]: p for p in parts})
+    p_explicit, _w2 = e.place(
+        parts, roles, clusters, pairing, {}, board, 0.5, cluster_order=area,
+    )
+    assert p_default == p_explicit

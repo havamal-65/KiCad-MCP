@@ -29,6 +29,7 @@ from kicad_mcp.utils.placement_config import (
     classify_net,
     get_float,
     get_int,
+    get_str,
     get_tunable,
 )
 from kicad_mcp.utils.placement_metrics import build_part_graph
@@ -854,6 +855,143 @@ class _Placer:
         return dist
 
 
+# ---------------------------------------------------------------------------
+# Cluster ordering (P2 area-descending; P3 signal-flow, REQ-FLOW-001..003)
+# ---------------------------------------------------------------------------
+
+def _order_clusters_by_area(
+    clusters: list[list[str]], by_ref: dict[str, PartRecord],
+) -> list[list[str]]:
+    """P2 order: total courtyard area descending, tie-broken by min ref."""
+    def cluster_area(c: list[str]) -> float:
+        return sum(_courtyard_area(by_ref[r]) for r in c if r in by_ref)
+
+    return sorted(
+        clusters,
+        key=lambda c: (-cluster_area(c), _ref_key(min(c, key=_ref_key))),
+    )
+
+
+def _anchor_centre(
+    p: PartRecord, pos: tuple[float, float, float],
+) -> tuple[float, float]:
+    """Board-frame courtyard centre of an anchored part at *pos*."""
+    box = _board_box(p, (pos[0], pos[1]), pos[2])
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _connector_flow_kind(p: PartRecord) -> str:
+    """Label a connector ``"input"`` / ``"output"`` / ``""`` from its pad nets.
+
+    Input-ish tokens win over output-ish only when they are the *sole* match, so
+    a connector carrying both an input and an output token stays ambiguous
+    (``""``) and is resolved by the physical-edge fallback instead.
+    """
+    in_tokens = get_tunable("FLOW_INPUT_NET_TOKENS")
+    out_tokens = get_tunable("FLOW_OUTPUT_NET_TOKENS")
+    assert isinstance(in_tokens, tuple)
+    assert isinstance(out_tokens, tuple)
+    names = [pad["net_name"].upper() for pad in p["pads"] if pad["net_name"]]
+    has_in = any(tok.upper() in nn for nn in names for tok in in_tokens)
+    has_out = any(tok.upper() in nn for nn in names for tok in out_tokens)
+    if has_in and not has_out:
+        return "input"
+    if has_out and not has_in:
+        return "output"
+    return ""
+
+
+def order_clusters_by_flow(
+    clusters: list[list[str]],
+    parts: list[PartRecord],
+    roles: dict[str, str],
+    anchors: dict[str, tuple[float, float, float]],
+    graph: dict[frozenset[str], float],
+    board_rect: tuple[float, float, float, float],
+) -> list[list[str]] | None:
+    """Order clusters input→output along the flow axis (REQ-FLOW-001).
+
+    Returns ``None`` when there are fewer than two distinguishable endpoints, so
+    the caller keeps the exact P2 area order (graceful no-op, REQ-FLOW-002).
+    """
+    by_ref = {p["ref"]: p for p in parts}
+    conns = sorted(
+        (
+            r for r in anchors
+            if roles.get(r) == ROLE_CONNECTOR and r in by_ref
+        ),
+        key=_ref_key,
+    )
+    if len(conns) < 2:
+        return None
+
+    centre = {c: _anchor_centre(by_ref[c], anchors[c]) for c in conns}
+    kinds = {c: _connector_flow_kind(by_ref[c]) for c in conns}
+    inputs = [c for c in conns if kinds[c] == "input"]
+    outputs = [c for c in conns if kinds[c] == "output"]
+
+    in_ep: str | None = None
+    out_ep: str | None = None
+    if len(inputs) == 1 and len(outputs) == 1 and inputs[0] != outputs[0]:
+        in_ep, out_ep = inputs[0], outputs[0]
+    else:
+        # Physical-edge fallback: the two connectors furthest apart. Input is the
+        # one at the lower coordinate on the flow axis (decided just below).
+        best_pair: tuple[float, str, str] | None = None
+        for i in range(len(conns)):
+            for j in range(i + 1, len(conns)):
+                a, b = conns[i], conns[j]
+                d = math.hypot(
+                    centre[a][0] - centre[b][0], centre[a][1] - centre[b][1],
+                )
+                cand = (-d, a, b)
+                if best_pair is None or cand < best_pair:
+                    best_pair = cand
+        if best_pair is None:
+            return None
+        _neg_d, a, b = best_pair
+        in_ep, out_ep = a, b  # orientation fixed after the axis is known
+
+    ic, oc = centre[in_ep], centre[out_ep]
+    bxmin, bymin, bxmax, bymax = board_rect
+    bw, bh = bxmax - bxmin, bymax - bymin
+    dx, dy = abs(ic[0] - oc[0]), abs(ic[1] - oc[1])
+    if dx > dy:
+        axis = 0
+    elif dy > dx:
+        axis = 1
+    else:
+        axis = 0 if bw > bh else (1 if bh > bw else (
+            0 if get_str("FLOW_AXIS_TIE_BREAK").lower() == "x" else 1
+        ))
+
+    # Fallback endpoints: on the chosen axis, input is the lower coordinate.
+    if not (len(inputs) == 1 and len(outputs) == 1 and inputs[0] != outputs[0]):
+        if centre[in_ep][axis] > centre[out_ep][axis]:
+            in_ep, out_ep = out_ep, in_ep
+
+    def weight_to(cluster: list[str], endpoint: str) -> float:
+        return sum(
+            graph.get(frozenset((m, endpoint)), 0.0)
+            for m in cluster if m != endpoint
+        )
+
+    def cluster_area(c: list[str]) -> float:
+        return sum(_courtyard_area(by_ref[r]) for r in c if r in by_ref)
+
+    # Input-biased clusters first: descending (w_in - w_out); ties keep the P2
+    # area order so equal-flow clusters do not reshuffle (determinism).
+    ordered = sorted(
+        clusters,
+        key=lambda c: (
+            -(weight_to(c, in_ep) - weight_to(c, out_ep)),
+            -cluster_area(c),
+            _ref_key(min(c, key=_ref_key)),
+        ),
+    )
+    return ordered
+
+
 def place(
     parts: list[PartRecord],
     roles: dict[str, str],
@@ -862,11 +1000,14 @@ def place(
     anchors: dict[str, tuple[float, float, float]],
     board_rect: tuple[float, float, float, float],
     clearance: float,
+    cluster_order: list[list[str]] | None = None,
 ) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, str]]]:
     """Constructive net-aware placement + bounded local improvement.
 
     Returns ``(plan, warnings)``. ``plan`` maps every non-anchor ref to
-    ``(x, y, 0.0)``; anchors are not in the plan (they never move).
+    ``(x, y, 0.0)``; anchors are not in the plan (they never move). When
+    ``cluster_order`` is given it fixes the cluster placement sequence (P3 flow
+    ordering); otherwise the P2 area-descending order is used (REQ-BACK).
     """
     placer = _Placer(parts, anchors, board_rect, clearance)
     warnings: list[dict[str, str]] = []
@@ -874,13 +1015,9 @@ def place(
     graph = _part_graph(parts)
     decap_max = get_float("DECAP_MAX_MM")
 
-    # Order clusters by total courtyard area desc, tie-broken by min ref.
-    def cluster_area(c: list[str]) -> float:
-        return sum(_courtyard_area(by_ref[r]) for r in c if r in by_ref)
-
-    ordered = sorted(
-        clusters,
-        key=lambda c: (-cluster_area(c), _ref_key(min(c, key=_ref_key))),
+    ordered = (
+        cluster_order if cluster_order is not None
+        else _order_clusters_by_area(clusters, by_ref)
     )
 
     # --- Phase A: constructive placement, IC then its decaps. -------------
@@ -1209,6 +1346,115 @@ def legalize(
 
 
 # ---------------------------------------------------------------------------
+# Orientation normalization (P3 — REQ-ORIENT-001..004)
+# ---------------------------------------------------------------------------
+
+def _quantize_rot(rot: float, quantum: float) -> float:
+    """Rotation snapped to the nearest quantum, folded into ``[0, 360)``."""
+    return round((rot % 360.0) / quantum) * quantum % 360.0
+
+
+def _orientation_eligible(ref: str, roles: dict[str, str]) -> bool:
+    """Passives / unclassified parts may be rotated; ICs/connectors/crystals/
+    decaps keep their placed orientation (REQ-ORIENT-002)."""
+    return roles.get(ref) in (ROLE_PASSIVE, ROLE_OTHER)
+
+
+def normalize_orientations(
+    parts: list[PartRecord],
+    plan: dict[str, tuple[float, float, float]],
+    roles: dict[str, str],
+    anchors: dict[str, tuple[float, float, float]],
+    board_rect: tuple[float, float, float, float],
+) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, object]]]:
+    """Rotate-for-HPWL then normalize like footprints to one orientation.
+
+    (a) For each eligible part, accept a quantized rotation only on a **strict**
+    Total-HPWL decrease that stays legal — this may leave a footprint family at
+    mixed orientations. (b) Snap off-modal family members to the family's modal
+    rotation when it does **not increase** HPWL and stays legal, lifting
+    ``orientation_consistency`` without regressing HPWL (REQ-ORIENT-004). Both
+    passes are bounded, deterministic, and never-worse; anchors/ICs/connectors/
+    crystals are never rotated (REQ-ORIENT-002).
+    """
+    by_ref = {p["ref"]: p for p in parts}
+    plan = dict(plan)
+    bxmin, bymin, bxmax, bymax = board_rect
+    quantum = get_float("ORIENT_ROTATION_QUANTUM_DEG")
+    n_cand = max(1, int(round(360.0 / quantum)))
+    candidates = [round((i * quantum) % 360.0, 4) for i in range(n_cand)]
+    warnings: list[dict[str, object]] = []
+
+    def legal_single(ref: str, x: float, y: float, rot: float) -> bool:
+        nb = _board_box(by_ref[ref], (x, y), rot)
+        if nb[0] < bxmin - 1e-6 or nb[1] < bymin - 1e-6 or \
+           nb[2] > bxmax + 1e-6 or nb[3] > bymax + 1e-6:
+            return False
+        pos_all = dict(plan)
+        pos_all.update(anchors)
+        for other, opos in pos_all.items():
+            if other == ref:
+                continue
+            obox = _board_box(by_ref[other], (opos[0], opos[1]), opos[2])
+            if _boxes_overlap(nb, obox, gap=0.0):
+                return False
+        return True
+
+    eligible = sorted(
+        (r for r in plan if r in by_ref and _orientation_eligible(r, roles)),
+        key=_ref_key,
+    )
+
+    # (a) Rotation-for-HPWL: strict-decrease, legality-preserving, greedy.
+    for ref in eligible:
+        x, y, cur = plan[ref]
+        best_h = _total_hpwl_of(parts, plan, anchors)
+        best_rot: float | None = None
+        for rot in candidates:
+            if rot == cur or not legal_single(ref, x, y, rot):
+                continue
+            trial = dict(plan)
+            trial[ref] = (x, y, rot)
+            h = _total_hpwl_of(parts, trial, anchors)
+            if h < best_h - 1e-9:
+                best_h = h
+                best_rot = rot
+        if best_rot is not None:
+            plan[ref] = (x, y, best_rot)
+
+    # (b) Family normalization: snap off-modal members to the modal rotation
+    # when HPWL does not increase (families iterated by sorted lib id).
+    families: dict[str, list[str]] = {}
+    for ref in eligible:
+        families.setdefault(by_ref[ref]["lib_id"], []).append(ref)
+
+    for lib_id in sorted(families):
+        members = sorted(families[lib_id], key=_ref_key)
+        if len(members) < 2:
+            continue
+        buckets: dict[float, int] = {}
+        for ref in members:
+            q = _quantize_rot(plan[ref][2], quantum)
+            buckets[q] = buckets.get(q, 0) + 1
+        # Modal rotation; tie broken toward the smallest rotation value.
+        modal = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        for ref in members:
+            x, y, cur = plan[ref]
+            if _quantize_rot(cur, quantum) == modal:
+                continue
+            if not legal_single(ref, x, y, modal):
+                continue
+            base_h = _total_hpwl_of(parts, plan, anchors)
+            trial = dict(plan)
+            trial[ref] = (x, y, modal)
+            h = _total_hpwl_of(parts, trial, anchors)
+            if h <= base_h + 1e-9:
+                plan[ref] = (x, y, modal)
+
+    return plan, warnings
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1227,21 +1473,49 @@ def plan_placement(
     anchors: dict[str, tuple[float, float, float]] | None = None,
     edge_connector_refs: frozenset[str] = frozenset(),
 ) -> PlacementPlan:
-    """Full net-aware plan: classify → pair → cluster → place → legalize."""
+    """Full net-aware plan: classify → pair → cluster → order-by-flow → place →
+    legalize → normalize-orientations (P3 pipeline)."""
     anchors = dict(anchors or {})
     roles = classify_parts(parts, edge_connector_refs)
     decap_pairing, decap_warnings = pair_decaps(parts, roles)
     clusters = cluster_parts(parts, roles, decap_pairing, frozenset(anchors))
-    plan, place_warnings = place(
-        parts, roles, clusters, decap_pairing, anchors, board_rect, clearance,
+
+    def _run(order: list[list[str]] | None) -> tuple[
+        dict[str, tuple[float, float, float]], list[dict[str, str]],
+        list[dict[str, object]],
+    ]:
+        pl, pw = place(
+            parts, roles, clusters, decap_pairing, anchors, board_rect,
+            clearance, cluster_order=order,
+        )
+        pl, lw = legalize(parts, pl, anchors, board_rect, clearance)
+        return pl, pw, lw
+
+    # Flow ordering (P3 §4). None → graceful no-op (P2 area order). When flow
+    # order is available, keep it only if its Total HPWL is no worse than the
+    # area order — a strict never-worse guard vs P2 (spec §5).
+    graph = _part_graph(parts)
+    flow_order = order_clusters_by_flow(
+        clusters, parts, roles, anchors, graph, board_rect,
     )
-    plan, legal_warnings = legalize(
-        parts, plan, anchors, board_rect, clearance,
+    plan, place_warnings, legal_warnings = _run(None)
+    if flow_order is not None:
+        f_plan, f_pw, f_lw = _run(flow_order)
+        if _total_hpwl_of(parts, f_plan, anchors) <= _total_hpwl_of(
+            parts, plan, anchors,
+        ):
+            plan, place_warnings, legal_warnings = f_plan, f_pw, f_lw
+
+    # Orientation normalization (P3 §3) — refine the legal layout, never-worse.
+    plan, orient_warnings = normalize_orientations(
+        parts, plan, roles, anchors, board_rect,
     )
+
     warnings: list[dict[str, object]] = []
     warnings.extend({k: v for k, v in w.items()} for w in decap_warnings)
     warnings.extend(place_warnings)  # type: ignore[arg-type]
     warnings.extend(legal_warnings)
+    warnings.extend(orient_warnings)
     return PlacementPlan(
         plan=plan,
         roles=roles,

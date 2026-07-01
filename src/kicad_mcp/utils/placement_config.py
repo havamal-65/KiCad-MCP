@@ -99,6 +99,32 @@ PROX_CANDIDATE_GRID_MM: float = 0.5
 #: a structured warning rather than looping (REQ-LEGAL-002).
 LEGALIZE_MAX_PASSES: int = 40
 
+# ---------------------------------------------------------------------------
+# Signal-flow ordering tunables (P3 — REQ-FLOW-001)
+# ---------------------------------------------------------------------------
+
+#: Which board axis carries signal flow when the board is square / the anchored
+#: input+output connectors do not clearly imply an axis. ``"x"`` = flow left→
+#: right (the wider board default), ``"y"`` = flow top→bottom.
+FLOW_AXIS_TIE_BREAK: str = "x"
+
+#: Case-insensitive substrings that mark a connector's net as a **board input**
+#: (power-in / primary source). A connector whose pads carry any of these is an
+#: input endpoint for flow ordering (REQ-FLOW-001). Named, overridable — no inline
+#: magic strings.
+FLOW_INPUT_NET_TOKENS: tuple[str, ...] = (
+    "USB", "VBUS", "VIN", "DCIN", "DC_IN", "PWR_IN", "PWRIN", "SOURCE", "LINE_IN",
+    "LINEIN",
+)
+
+#: Case-insensitive substrings that mark a connector's net as a **board output**
+#: (load / sink). A connector whose pads carry any of these is an output endpoint
+#: for flow ordering (REQ-FLOW-001).
+FLOW_OUTPUT_NET_TOKENS: tuple[str, ...] = (
+    "VOUT", "OUT", "LOAD", "SPK", "SPEAKER", "HP", "HEADPHONE", "LINE_OUT",
+    "LINEOUT",
+)
+
 
 # ---------------------------------------------------------------------------
 # Override hook (REQ-CFG-002)
@@ -115,6 +141,9 @@ _OVERRIDABLE: frozenset[str] = frozenset({
     "PROX_IMPROVE_PASSES",
     "PROX_CANDIDATE_GRID_MM",
     "LEGALIZE_MAX_PASSES",
+    "FLOW_AXIS_TIE_BREAK",
+    "FLOW_INPUT_NET_TOKENS",
+    "FLOW_OUTPUT_NET_TOKENS",
 })
 
 
@@ -154,6 +183,11 @@ def get_int(name: str) -> int:
 def get_float(name: str) -> float:
     """``get_tunable`` narrowed to ``float`` (for distance/weight tunables)."""
     return float(cast("SupportsFloat", get_tunable(name)))
+
+
+def get_str(name: str) -> str:
+    """``get_tunable`` narrowed to ``str`` (for the flow-axis tie-break)."""
+    return str(get_tunable(name))
 
 
 def classify_net(net_name: str) -> str:

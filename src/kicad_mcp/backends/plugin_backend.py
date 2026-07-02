@@ -340,6 +340,7 @@ class PluginBoardOps(BoardOps):
         items, warnings, total_area = engine.compute_net_aware_plan(
             parts, board_x, board_y, board_width, board_height,
             clearance_mm, anchors,
+            diff_pair_nets=engine.read_diff_pair_nets(path),
         )
         placements: list[dict[str, Any]] = []
         applied_warnings: list[Any] = list(warnings)

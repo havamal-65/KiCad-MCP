@@ -21,8 +21,11 @@ input yields byte-identical plans across runs.
 
 from __future__ import annotations
 
+import fnmatch
+import json
 import math
 import re
+from pathlib import Path
 from typing import TypedDict
 
 from kicad_mcp.utils.placement_config import (
@@ -31,6 +34,7 @@ from kicad_mcp.utils.placement_config import (
     get_int,
     get_str,
     get_tunable,
+    is_clock_net,
 )
 from kicad_mcp.utils.placement_metrics import build_part_graph
 from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
@@ -284,8 +288,36 @@ def build_net_index(parts: list[PartRecord]) -> dict[str, list[tuple[str, float,
     return index
 
 
-def _part_graph(parts: list[PartRecord]) -> dict[frozenset[str], float]:
-    """Weighted footprint-pair graph, reusing the P1 weighting (REQ-GRAPH-004)."""
+def _net_weight_multipliers(
+    net_names: frozenset[str], diff_pair_nets: frozenset[str],
+) -> dict[str, float]:
+    """Per-net proximity-weight multipliers for the part graph (P4).
+
+    A declared differential-pair net gets ``DIFFPAIR_WEIGHT_MULT``; a clock-like
+    net (``CLOCK_NET_PATTERN``) gets ``CLOCK_WEIGHT_MULT``. Diff-pair wins when a
+    net is both. Nets with the default ×1 weight are omitted (REQ-SENSE-002/003).
+    """
+    diff_mult = get_float("DIFFPAIR_WEIGHT_MULT")
+    clock_mult = get_float("CLOCK_WEIGHT_MULT")
+    out: dict[str, float] = {}
+    for nn in net_names:
+        if nn in diff_pair_nets:
+            out[nn] = diff_mult
+        elif is_clock_net(nn):
+            out[nn] = clock_mult
+    return out
+
+
+def _part_graph(
+    parts: list[PartRecord],
+    diff_pair_nets: frozenset[str] = frozenset(),
+) -> dict[frozenset[str], float]:
+    """Weighted footprint-pair graph, reusing the P1 weighting (REQ-GRAPH-004).
+
+    ``diff_pair_nets`` (P4) names nets declared as differential pairs; together
+    with clock-like nets they receive an extra proximity multiplier so their
+    endpoints pull tight (REQ-SENSE-002/003).
+    """
     from kicad_mcp.utils.placement_metrics import PadRecord
 
     net_pads: dict[str, list[PadRecord]] = {}
@@ -297,7 +329,86 @@ def _part_graph(parts: list[PartRecord]) -> dict[frozenset[str], float]:
                 ref=p["ref"], pad=pad["pad"], net_id=pad["net_id"],
                 net_name=pad["net_name"], x_mm=0.0, y_mm=0.0,
             ))
-    return build_part_graph(net_pads)
+    mult = _net_weight_multipliers(frozenset(net_pads), diff_pair_nets)
+    return build_part_graph(net_pads, net_weight_mult=mult)
+
+
+#: Netclass fields that mark a class as a differential pair (REQ-SENSE-002).
+_PRO_DIFF_KEYS = ("diff_pair_width", "diff_pair_gap", "diff_pair_via_gap")
+
+
+def _is_pos_num(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _board_net_names(pcb_path: Path) -> frozenset[str]:
+    """Every distinct pad-net name in the board file (for glob expansion)."""
+    try:
+        content = pcb_path.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    return frozenset(
+        m.group(2) for m in _NET_PAT.finditer(content) if m.group(2)
+    )
+
+
+def read_diff_pair_nets(pcb_path: Path) -> frozenset[str]:
+    """Net names declared as differential pairs in the sibling ``.kicad_pro``.
+
+    Reads the ``net_settings`` written by ``set_board_design_rules`` (§6.4): a
+    named (non-``Default``) netclass carrying a positive ``diff_pair_*`` field is
+    a differential-pair class, and the nets mapped to it via ``netclass_patterns``
+    are its pair nets. Exact patterns are taken verbatim; glob patterns are
+    expanded against the board's actual net names. P4 only *reads* this — no new
+    declaration surface (REQ-SENSE-002). Returns an empty set when no diff pairs
+    are declared or the ``.kicad_pro`` is missing / unreadable.
+    """
+    pro = pcb_path.with_suffix(".kicad_pro")
+    if not pro.exists():
+        return frozenset()
+    try:
+        data = json.loads(pro.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset()
+    net_settings = data.get("net_settings")
+    if not isinstance(net_settings, dict):
+        return frozenset()
+
+    diff_classes: set[str] = set()
+    classes = net_settings.get("classes")
+    if isinstance(classes, list):
+        for cls in classes:
+            if not isinstance(cls, dict):
+                continue
+            name = cls.get("name")
+            if not isinstance(name, str) or not name or name == "Default":
+                continue
+            if any(_is_pos_num(cls.get(k)) for k in _PRO_DIFF_KEYS):
+                diff_classes.add(name)
+    if not diff_classes:
+        return frozenset()
+
+    exact: set[str] = set()
+    globs: list[str] = []
+    patterns = net_settings.get("netclass_patterns")
+    if isinstance(patterns, list):
+        for pat in patterns:
+            if not isinstance(pat, dict) or pat.get("netclass") not in diff_classes:
+                continue
+            pattern = pat.get("pattern")
+            if not isinstance(pattern, str) or not pattern:
+                continue
+            if any(ch in pattern for ch in "*?["):
+                globs.append(pattern)
+            else:
+                exact.add(pattern)
+
+    result = set(exact)
+    if globs:
+        for net in _board_net_names(pcb_path):
+            if any(fnmatch.fnmatchcase(net, g) for g in globs):
+                result.add(net)
+    return frozenset(result)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +536,73 @@ def pair_decaps(
 
 
 # ---------------------------------------------------------------------------
+# Crystal pairing + load caps (P4 — REQ-SENSE-001)
+# ---------------------------------------------------------------------------
+
+def pair_crystals(
+    parts: list[PartRecord],
+    roles: dict[str, str],
+    graph: dict[frozenset[str], float],
+) -> dict[str, str | None]:
+    """Pair each crystal to the IC it shares the most signal weight with.
+
+    Deterministic: crystals iterated numeric-aware; the chosen IC is the highest
+    graph weight, tie-broken by lowest reference designator. A crystal sharing no
+    signal weight with any IC maps to ``None`` (placed as an ordinary part).
+    """
+    ic_refs = {r for r, role in roles.items() if role == ROLE_IC}
+    crystals = sorted(
+        (r for r, role in roles.items() if role == ROLE_CRYSTAL), key=_ref_key,
+    )
+    mapping: dict[str, str | None] = {}
+    for y in crystals:
+        candidates = sorted(
+            (ic for ic in ic_refs if graph.get(frozenset((y, ic)), 0.0) > 0.0),
+            key=lambda ic: (-graph.get(frozenset((y, ic)), 0.0), _ref_key(ic)),
+        )
+        mapping[y] = candidates[0] if candidates else None
+    return mapping
+
+
+def crystal_load_caps(
+    parts: list[PartRecord],
+    roles: dict[str, str],
+    crystal_pairing: dict[str, str | None],
+) -> dict[str, list[str]]:
+    """Map each crystal to its load caps — 2-pad ``C`` parts sharing a crystal net.
+
+    These are pulled in with the crystal (REQ-SENSE-001). Decoupling caps are
+    excluded (a load cap bridges the oscillator net to ground, not a power rail,
+    so it never classifies as a decap).
+    """
+    by_ref = {p["ref"]: p for p in parts}
+    out: dict[str, list[str]] = {}
+    for y in crystal_pairing:
+        yp = by_ref.get(y)
+        if yp is None:
+            continue
+        y_nets = {
+            pad["net_name"] for pad in yp["pads"]
+            if pad["net_id"] != 0 and pad["net_name"]
+        }
+        caps: list[str] = []
+        for p in parts:
+            ref = p["ref"]
+            if ref == y or roles.get(ref) == ROLE_DECOUPLING_CAP:
+                continue
+            if _ref_prefix(ref) != "C" or p["pad_count"] != 2:
+                continue
+            p_nets = {
+                pad["net_name"] for pad in p["pads"]
+                if pad["net_id"] != 0 and pad["net_name"]
+            }
+            if p_nets & y_nets:
+                caps.append(ref)
+        out[y] = sorted(caps, key=_ref_key)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Clustering (REQ-CLUSTER-001..003)
 # ---------------------------------------------------------------------------
 
@@ -433,10 +611,16 @@ def cluster_parts(
     roles: dict[str, str],
     decap_pairing: dict[str, str | None],
     anchor_refs: frozenset[str] = frozenset(),
+    diff_pair_nets: frozenset[str] = frozenset(),
 ) -> list[list[str]]:
-    """Group non-anchor parts into connectivity clusters (deterministic)."""
+    """Group non-anchor parts into connectivity clusters (deterministic).
+
+    ``diff_pair_nets`` (P4) boosts declared diff-pair nets in the clustering
+    graph, so a pair too weak to bind on its own still clusters its endpoints
+    together (REQ-SENSE-002 steers the whole pipeline, not just placement).
+    """
     weight_floor = get_float("CLUSTER_WEIGHT_FLOOR")
-    graph = _part_graph(parts)
+    graph = _part_graph(parts, diff_pair_nets)
 
     members = [p for p in parts if p["ref"] not in anchor_refs]
     member_refs = {p["ref"] for p in members}
@@ -774,22 +958,93 @@ class _Placer:
             y += step
         return best[3] if best is not None else None
 
-    def place_decap(self, cap_ref: str, ic_ref: str) -> float | None:
-        """Place a cap hugging its IC, preferring the power-pad side.
+    def _hug_to_ic(
+        self, mover_ref: str, host_ref: str, target_mm: float,
+        ddx: float, ddy: float,
+    ) -> float | None:
+        """Place *mover_ref* adjacent to *host_ref*, preferring the (ddx, ddy) side.
 
-        Returns the achieved centre-to-centre distance (mm) if the cap was placed
-        adjacent to the IC, or ``None`` if no non-overlapping slot exists on any
-        side inside the outline (the caller then scan-places it). A returned
-        distance greater than ``DECAP_MAX_MM`` means "placed near the IC but not
-        within target" — the caller flags it but keeps the near position rather
-        than flinging the cap into a scan row (never-worse, REQ-DECAP-005).
+        Shared core of decap hugging (REQ-DECAP-003) and crystal hugging
+        (REQ-SENSE-001). Searches cardinal sides ordered by alignment to the
+        preferred direction and takes the first non-overlapping, in-outline slot;
+        returns the achieved centre-to-centre distance (mm), or ``None`` when no
+        adjacent slot exists (the caller then scan-places — never-worse). A
+        returned distance greater than *target_mm* means "placed near the host but
+        not within target"; the caller flags it but keeps the near position rather
+        than flinging the part into a scan row (never-worse, REQ-DECAP-005).
         """
-        cap = self.by_ref[cap_ref]
+        mover = self.by_ref[mover_ref]
+        if host_ref not in self.plan:
+            return None
+        host = self.by_ref[host_ref]
+        hox, hoy, hrot = self.plan[host_ref]
+
+        host_box = _board_box(host, (hox, hoy), hrot)
+        hcx = (host_box[0] + host_box[2]) / 2.0
+        hcy = (host_box[1] + host_box[3]) / 2.0
+
+        mw, mh = _courtyard_size(mover)
+        mcxmin, mcymin, mcxmax, mcymax = _courtyard_of(mover)
+        m_cx_local = (mcxmin + mcxmax) / 2.0
+        m_cy_local = (mcymin + mcymax) / 2.0
+        host_half_x = (host_box[2] - host_box[0]) / 2.0
+        host_half_y = (host_box[3] - host_box[1]) / 2.0
+        step = self.grid
+
+        # Cardinal sides ordered: preferred-direction side first, then by the
+        # fixed list index (deterministic tie-break).
+        cardinals = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+        sides = sorted(
+            enumerate(cardinals),
+            key=lambda it: (-(it[1][0] * ddx + it[1][1] * ddy), it[0]),
+        )
+
+        best: tuple[float, tuple[float, float]] | None = None
+        for _idx, side in sides:
+            # Hug tighter than the general clearance: shrink the host-to-mover gap
+            # (down to courtyards just touching) so the part can land within
+            # target_mm when geometrically possible, but never exceed the board
+            # clearance when there is slack.
+            ax_half = host_half_x if side[0] != 0.0 else host_half_y
+            mov_half = mw / 2.0 if side[0] != 0.0 else mh / 2.0
+            gap = min(self.clearance, max(0.0, target_mm - ax_half - mov_half))
+            for k in range(0, 128):
+                base = ax_half + gap + mov_half + k * step
+                if side[0] != 0.0:
+                    mvx, mvy = hcx + side[0] * base, hcy
+                else:
+                    mvx, mvy = hcx, hcy + side[1] * base
+                origin = (mvx - m_cx_local, mvy - m_cy_local)
+                clamped = self._clamp_into_outline(mover, origin)
+                if clamped is None:
+                    break
+                box = _board_box(mover, clamped, 0.0)
+                if self._overlaps_placed(mover_ref, box):
+                    continue
+                amx = clamped[0] + m_cx_local
+                amy = clamped[1] + m_cy_local
+                dist = round(math.hypot(amx - hcx, amy - hcy), 6)
+                # Strictly-closer only: on a distance tie the earlier (preferred)
+                # side keeps the slot, honouring the (ddx, ddy) side ordering.
+                if best is None or dist < best[0]:
+                    best = (dist, clamped)
+                break  # first non-overlapping slot on this side
+        if best is None:
+            return None
+        dist, clamped = best
+        self._commit(mover_ref, (clamped[0], clamped[1], 0.0))
+        return dist
+
+    def place_decap(self, cap_ref: str, ic_ref: str) -> float | None:
+        """Place a cap hugging its IC, preferring the power-pad side (REQ-DECAP-003).
+
+        Returns the achieved centre-to-centre distance (mm) or ``None`` when no
+        adjacent slot exists (never-worse fallback, REQ-DECAP-005).
+        """
         if ic_ref not in self.plan:
             return None
         ic = self.by_ref[ic_ref]
         iox, ioy, irot = self.plan[ic_ref]
-
         ic_box = _board_box(ic, (iox, ioy), irot)
         icx = (ic_box[0] + ic_box[2]) / 2.0
         icy = (ic_box[1] + ic_box[3]) / 2.0
@@ -801,58 +1056,45 @@ class _Placer:
                 rail_xy = (iox + rx, ioy + ry)
                 break
         ddx, ddy = rail_xy[0] - icx, rail_xy[1] - icy
-
-        cw, ch = _courtyard_size(cap)
-        ccxmin, ccymin, ccxmax, ccymax = _courtyard_of(cap)
-        cap_cx_local = (ccxmin + ccxmax) / 2.0
-        cap_cy_local = (ccymin + ccymax) / 2.0
-        ic_half_x = (ic_box[2] - ic_box[0]) / 2.0
-        ic_half_y = (ic_box[3] - ic_box[1]) / 2.0
-        decap_max = get_float("DECAP_MAX_MM")
-        step = self.grid
-
-        # Cardinal sides ordered: power-pad side first, then by alignment to the
-        # pad direction (deterministic tie-break by the fixed list index).
-        cardinals = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
-        sides = sorted(
-            enumerate(cardinals),
-            key=lambda it: (-(it[1][0] * ddx + it[1][1] * ddy), it[0]),
+        return self._hug_to_ic(
+            cap_ref, ic_ref, get_float("DECAP_MAX_MM"), ddx, ddy,
         )
 
-        best: tuple[float, tuple[float, float]] | None = None
-        for _idx, side in sides:
-            # Decaps hug tighter than the general clearance: shrink the IC-to-cap
-            # gap (down to courtyards just touching) so the cap can land within
-            # DECAP_MAX_MM when geometrically possible, but never exceed the board
-            # clearance when there is slack.
-            ax_half = ic_half_x if side[0] != 0.0 else ic_half_y
-            cap_half = cw / 2.0 if side[0] != 0.0 else ch / 2.0
-            gap = min(self.clearance, max(0.0, decap_max - ax_half - cap_half))
-            for k in range(0, 128):
-                base = ax_half + gap + cap_half + k * step
-                if side[0] != 0.0:
-                    ccx, ccy = icx + side[0] * base, icy
-                else:
-                    ccx, ccy = icx, icy + side[1] * base
-                origin = (ccx - cap_cx_local, ccy - cap_cy_local)
-                clamped = self._clamp_into_outline(cap, origin)
-                if clamped is None:
-                    break
-                box = _board_box(cap, clamped, 0.0)
-                if self._overlaps_placed(cap_ref, box):
-                    continue
-                acx = clamped[0] + cap_cx_local
-                acy = clamped[1] + cap_cy_local
-                dist = math.hypot(acx - icx, acy - icy)
-                cand = (round(dist, 6), clamped)
-                if best is None or cand < best:
-                    best = cand
-                break  # first non-overlapping slot on this side
-        if best is None:
+    def place_crystal(self, crystal_ref: str, ic_ref: str) -> float | None:
+        """Place a crystal adjacent to the IC it clocks (REQ-SENSE-001).
+
+        Prefers the IC side holding the oscillator pins — the centroid of the IC
+        pads sharing a net with the crystal. Returns the achieved centre-to-centre
+        distance (mm) or ``None`` when no adjacent slot exists (never-worse).
+        """
+        if ic_ref not in self.plan:
             return None
-        dist, clamped = best
-        self._commit(cap_ref, (clamped[0], clamped[1], 0.0))
-        return dist
+        crystal = self.by_ref[crystal_ref]
+        ic = self.by_ref[ic_ref]
+        iox, ioy, irot = self.plan[ic_ref]
+        ic_box = _board_box(ic, (iox, ioy), irot)
+        icx = (ic_box[0] + ic_box[2]) / 2.0
+        icy = (ic_box[1] + ic_box[3]) / 2.0
+
+        xtal_nets = {
+            pad["net_name"] for pad in crystal["pads"]
+            if pad["net_id"] != 0 and pad["net_name"]
+        }
+        sxs: list[float] = []
+        sys: list[float] = []
+        for pad in ic["pads"]:
+            if pad["net_id"] != 0 and pad["net_name"] in xtal_nets:
+                rx, ry = _rotate(pad["dx"], pad["dy"], irot)
+                sxs.append(iox + rx)
+                sys.append(ioy + ry)
+        if sxs:
+            ddx = sum(sxs) / len(sxs) - icx
+            ddy = sum(sys) / len(sys) - icy
+        else:
+            ddx, ddy = 0.0, 0.0
+        return self._hug_to_ic(
+            crystal_ref, ic_ref, get_float("SENSE_MAX_MM"), ddx, ddy,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1243,7 @@ def place(
     board_rect: tuple[float, float, float, float],
     clearance: float,
     cluster_order: list[list[str]] | None = None,
+    diff_pair_nets: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, str]]]:
     """Constructive net-aware placement + bounded local improvement.
 
@@ -1008,12 +1251,14 @@ def place(
     ``(x, y, 0.0)``; anchors are not in the plan (they never move). When
     ``cluster_order`` is given it fixes the cluster placement sequence (P3 flow
     ordering); otherwise the P2 area-descending order is used (REQ-BACK).
+    ``diff_pair_nets`` (P4) steers the graph weighting toward declared diff pairs.
     """
     placer = _Placer(parts, anchors, board_rect, clearance)
     warnings: list[dict[str, str]] = []
     by_ref = placer.by_ref
-    graph = _part_graph(parts)
+    graph = _part_graph(parts, diff_pair_nets)
     decap_max = get_float("DECAP_MAX_MM")
+    sense_max = get_float("SENSE_MAX_MM")
 
     ordered = (
         cluster_order if cluster_order is not None
@@ -1033,6 +1278,21 @@ def place(
     for ic in caps_of_ic:
         caps_of_ic[ic].sort(key=_ref_key)
 
+    # Sensitive placement (P4 — REQ-SENSE-001): a crystal hugs the IC it clocks
+    # right after the IC lands, and its load caps ride the crystal — mirroring
+    # decap hugging, with the same never-worse fallback.
+    crystal_pairing = pair_crystals(parts, roles, graph)
+    cryst_caps = crystal_load_caps(parts, roles, crystal_pairing)
+    crystals_of_ic: dict[str, list[str]] = {}
+    for y, ic in crystal_pairing.items():
+        if ic is not None:
+            crystals_of_ic.setdefault(ic, []).append(y)
+    for ic in crystals_of_ic:
+        crystals_of_ic[ic].sort(key=_ref_key)
+    all_crystals = set(crystal_pairing)
+    crystal_cap_set = {c for caps in cryst_caps.values() for c in caps}
+    special = all_caps | all_crystals | crystal_cap_set
+
     def _hug_decaps(ic_ref: str, present_caps: set[str]) -> None:
         for cap in caps_of_ic.get(ic_ref, []):
             if cap not in present_caps or cap in anchors or cap in placer.plan:
@@ -1050,10 +1310,42 @@ def place(
                     "reason": "nearest non-overlapping slot exceeds DECAP_MAX_MM",
                 })
 
+    def _hug_load_caps(crystal_ref: str, present_caps: set[str]) -> None:
+        for cap in cryst_caps.get(crystal_ref, []):
+            if cap not in present_caps or cap in anchors or cap in placer.plan:
+                continue
+            # Load caps ride the crystal (crystal is the host); scan fallback if
+            # no adjacent slot — an attractor on the shared XTAL net still pulls
+            # them close (never-worse).
+            if placer._hug_to_ic(cap, crystal_ref, sense_max, 0.0, 0.0) is None:
+                placer.place_part(cap)
+
+    def _hug_crystals(
+        ic_ref: str, present_crystals: set[str], present_caps: set[str],
+    ) -> None:
+        for y in crystals_of_ic.get(ic_ref, []):
+            if y not in present_crystals or y in anchors or y in placer.plan:
+                continue
+            dist = placer.place_crystal(y, ic_ref)
+            if dist is None:
+                placer.place_part(y)  # no adjacent slot — scan fallback
+                warnings.append({
+                    "type": "sense_fallback", "part": y, "ic": ic_ref,
+                    "reason": "no adjacent slot near the IC inside the outline",
+                })
+            elif dist > sense_max:
+                warnings.append({
+                    "type": "sense_fallback", "part": y, "ic": ic_ref,
+                    "reason": "nearest non-overlapping slot exceeds SENSE_MAX_MM",
+                })
+            _hug_load_caps(y, present_caps)
+
     for cluster in ordered:
         present = [r for r in cluster if r in by_ref and r not in anchors]
         present_caps = {r for r in present if r in all_caps}
-        non_caps = [r for r in present if r not in all_caps]
+        present_crystals = {r for r in present if r in all_crystals}
+        present_load_caps = {r for r in present if r in crystal_cap_set}
+        non_caps = [r for r in present if r not in special]
         member_set = set(present)
 
         def degree(r: str, members: set[str]) -> float:
@@ -1067,13 +1359,43 @@ def place(
             placer.place_part(ref)
             if roles.get(ref) == ROLE_IC:
                 _hug_decaps(ref, present_caps)
+                _hug_crystals(ref, present_crystals, present_load_caps)
 
-    # Safety net: any non-cap part not in a cluster (defensive).
+    # Safety net: any ordinary (non-special) part not in a cluster (defensive).
     for p in sorted(parts, key=lambda q: _ref_key(q["ref"])):
         ref = p["ref"]
-        if ref in anchors or ref in placer.plan or ref in all_caps:
+        if ref in anchors or ref in placer.plan or ref in special:
             continue
         placer.place_part(ref)
+
+    # Crystals whose IC was an anchor or in another cluster, plus any left over.
+    for y in sorted(all_crystals, key=_ref_key):
+        if y in anchors or y in placer.plan:
+            continue
+        ic = crystal_pairing.get(y)
+        dist = (
+            placer.place_crystal(y, ic)
+            if ic is not None and ic in placer.plan else None
+        )
+        if dist is None:
+            placer.place_part(y)
+            if ic is not None:
+                warnings.append({
+                    "type": "sense_fallback", "part": y, "ic": ic,
+                    "reason": "paired IC unavailable for adjacent placement",
+                })
+        elif dist > sense_max:
+            warnings.append({
+                "type": "sense_fallback", "part": y, "ic": ic or "",
+                "reason": "nearest non-overlapping slot exceeds SENSE_MAX_MM",
+            })
+        _hug_load_caps(y, set(cryst_caps.get(y, [])))
+
+    # Any load caps whose crystal never landed adjacent — ordinary placement.
+    for cap in sorted(crystal_cap_set, key=_ref_key):
+        if cap in anchors or cap in placer.plan:
+            continue
+        placer.place_part(cap)
 
     # Caps whose IC was an anchor or in another cluster, plus any left over.
     for cap in sorted(all_caps, key=_ref_key):
@@ -1094,13 +1416,22 @@ def place(
                 "reason": "nearest non-overlapping slot exceeds DECAP_MAX_MM",
             })
 
-    # --- Phase B: bounded local improvement (moves an IC with its caps). ---
+    # --- Phase B: bounded local improvement (moves an IC with its group). ---
+    # The rigid move group keeps a crystal + its load caps hugging their IC (and
+    # decaps hugging theirs) through improvement (REQ-SENSE-001 never-worse).
+    group_of_ic: dict[str, list[str]] = {
+        ic: list(caps) for ic, caps in caps_of_ic.items()
+    }
+    for ic, ys in crystals_of_ic.items():
+        for y in ys:
+            group_of_ic.setdefault(ic, []).append(y)
+            group_of_ic[ic].extend(cryst_caps.get(y, []))
     improved = _improve(
         parts,
         {r: pos for r, pos in placer.plan.items() if r not in anchors},
         anchors,
         board_rect,
-        caps_of_ic,
+        group_of_ic,
     )
     for ref, pos in improved.items():
         placer.plan[ref] = pos
@@ -1472,13 +1803,17 @@ def plan_placement(
     clearance: float,
     anchors: dict[str, tuple[float, float, float]] | None = None,
     edge_connector_refs: frozenset[str] = frozenset(),
+    diff_pair_nets: frozenset[str] = frozenset(),
 ) -> PlacementPlan:
     """Full net-aware plan: classify → pair → cluster → order-by-flow → place →
-    legalize → normalize-orientations (P3 pipeline)."""
+    legalize → normalize-orientations (P3 pipeline). ``diff_pair_nets`` (P4)
+    boosts the graph weight of declared differential pairs (REQ-SENSE-002)."""
     anchors = dict(anchors or {})
     roles = classify_parts(parts, edge_connector_refs)
     decap_pairing, decap_warnings = pair_decaps(parts, roles)
-    clusters = cluster_parts(parts, roles, decap_pairing, frozenset(anchors))
+    clusters = cluster_parts(
+        parts, roles, decap_pairing, frozenset(anchors), diff_pair_nets,
+    )
 
     def _run(order: list[list[str]] | None) -> tuple[
         dict[str, tuple[float, float, float]], list[dict[str, str]],
@@ -1486,7 +1821,7 @@ def plan_placement(
     ]:
         pl, pw = place(
             parts, roles, clusters, decap_pairing, anchors, board_rect,
-            clearance, cluster_order=order,
+            clearance, cluster_order=order, diff_pair_nets=diff_pair_nets,
         )
         pl, lw = legalize(parts, pl, anchors, board_rect, clearance)
         return pl, pw, lw
@@ -1494,7 +1829,7 @@ def plan_placement(
     # Flow ordering (P3 §4). None → graceful no-op (P2 area order). When flow
     # order is available, keep it only if its Total HPWL is no worse than the
     # area order — a strict never-worse guard vs P2 (spec §5).
-    graph = _part_graph(parts)
+    graph = _part_graph(parts, diff_pair_nets)
     flow_order = order_clusters_by_flow(
         clusters, parts, roles, anchors, graph, board_rect,
     )
@@ -1533,13 +1868,15 @@ def compute_net_aware_plan(
     board_height: float,
     clearance: float,
     anchors: list[str] | None = None,
+    diff_pair_nets: frozenset[str] = frozenset(),
 ) -> tuple[list[tuple[str, float, float, float]], list[dict[str, object]], float]:
     """Plan a net-aware layout for a board area; backend-agnostic apply contract.
 
     Returns ``(items, warnings, total_area_mm2)`` where ``items`` is the sorted
     list of ``(ref, x, y, rot)`` to apply (non-anchor refs only), so any backend
     can apply it through its own ``move_component``. The usable region is inset by
-    ``clearance`` on every side (row-packer parity).
+    ``clearance`` on every side (row-packer parity). ``diff_pair_nets`` comes from
+    :func:`read_diff_pair_nets` on the caller's board path (REQ-SENSE-002).
     """
     by_ref = {p["ref"]: p for p in parts}
     anchor_set = set(anchors or [])
@@ -1550,7 +1887,10 @@ def compute_net_aware_plan(
         board_x + board_width - clearance,
         board_y + board_height - clearance,
     )
-    res = plan_placement(parts, board_rect, clearance, anchors=anchor_pos)
+    res = plan_placement(
+        parts, board_rect, clearance, anchors=anchor_pos,
+        diff_pair_nets=diff_pair_nets,
+    )
     plan = res["plan"]
     items = [
         (ref, round(plan[ref][0], 4), round(plan[ref][1], 4), plan[ref][2])

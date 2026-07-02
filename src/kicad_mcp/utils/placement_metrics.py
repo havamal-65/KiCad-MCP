@@ -189,6 +189,7 @@ def build_net_pads(pads: list[PadRecord]) -> dict[str, list[PadRecord]]:
 
 def build_part_graph(
     net_pads: dict[str, list[PadRecord]],
+    net_weight_mult: dict[str, float] | None = None,
 ) -> dict[frozenset[str], float]:
     """Weighted footprint-pair graph (REQ-GRAPH-004/005).
 
@@ -198,7 +199,13 @@ def build_part_graph(
       - otherwise -> add ``1 / (m - 1)`` to every unordered distinct pair.
     Power/ground nets contribute zero. Deterministic: nets iterated by sorted
     name, pairs by sorted (ref, ref).
+
+    ``net_weight_mult`` (P4, optional) scales a specific net's per-pair
+    contribution — a differential pair or clock net contributes more so its
+    endpoints pull tight (REQ-SENSE-002/003). Absent / a net not in the mapping
+    ⇒ multiplier ``1.0`` (unchanged P1 behaviour).
     """
+    mult = net_weight_mult or {}
     edges: dict[frozenset[str], float] = {}
     for net_name in sorted(net_pads):
         if classify_net(net_name) != "signal":
@@ -207,7 +214,7 @@ def build_part_graph(
         m = len(refs)
         if m < 2 or m > MAX_NET_FANOUT:
             continue
-        weight = 1.0 / (m - 1)
+        weight = (1.0 / (m - 1)) * mult.get(net_name, 1.0)
         for a_i in range(m):
             for b_i in range(a_i + 1, m):
                 key = frozenset((refs[a_i], refs[b_i]))

@@ -75,10 +75,10 @@ def test_live_board_ranks_tight_better(bridge_session: object) -> None:
     """
     from kicad_mcp.backends.plugin_backend import _tcp_call
 
-    info = _tcp_call("get_board_info", timeout=5.0)
-    board_path = None
-    if isinstance(info, dict):
-        board_path = info.get("file_path") or info.get("path")
+    # ping carries the open board's path (identity handshake); get_board_info
+    # requires a path argument on the installed bridge, so it can't discover it.
+    info = _tcp_call("ping", timeout=5.0)
+    board_path = info.get("board_path") if isinstance(info, dict) else None
     if not board_path or not Path(board_path).exists():
         pytest.skip("no live board path available from the bridge")
 

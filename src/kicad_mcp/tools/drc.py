@@ -1270,6 +1270,108 @@ def run_validate_connector_orientations(pcb_path: Path) -> dict[str, Any]:
     return result
 
 
+def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
+    """Compute the placement metric and apply the quality-gate policy (P4).
+
+    Gate policy (REQ-GATE-001, resolves Q5):
+
+    - ``overlap_count > 0`` and ``out_of_outline_count > 0`` are **blocking**
+      violations — placement must never proceed to routing with either.
+    - Total HPWL over ``GATE_HPWL_MAX_MM`` (when set; default ``None`` = no
+      ceiling) and decap distance over ``GATE_DECAP_MAX_MM`` are **advisory**
+      violations: reported, but the gate still passes unless
+      ``GATE_PROMOTE_ADVISORY`` promotes them to blocking (REQ-CFG-002).
+
+    Side effect: the result is recorded to the board's sidecar validation cache
+    (same mechanism as ``validate_connector_orientations``), which is what lets
+    ``autoroute`` refuse when this gate has not passed on the current board
+    state (REQ-GATE-002).
+
+    Returns:
+        ``{"passed": bool, "placement_metric": {...}, "violations": [...],
+        "required_actions": [...]}``.
+    """
+    from kicad_mcp.utils.placement_config import (
+        get_bool,
+        get_float,
+        get_float_or_none,
+    )
+    from kicad_mcp.utils.placement_metrics import placement_metric
+    from kicad_mcp.utils.validation_cache import record_validation
+
+    metric = placement_metric(pcb_path)
+    violations: list[dict[str, Any]] = []
+    required_actions: list[str] = []
+
+    overlap_count = int(metric.get("overlap_count") or 0)
+    if overlap_count > 0:
+        violations.append({
+            "type": "courtyard_overlap",
+            "severity": "blocking",
+            "count": overlap_count,
+            "detail": "Overlapping courtyards must be separated before routing.",
+        })
+        required_actions.append(
+            "Resolve courtyard overlaps (check_courtyard_overlaps lists the "
+            "pairs; fix with move_component or re-run auto_place), then re-run "
+            "validate_placement_quality."
+        )
+
+    out_count = metric.get("out_of_outline_count")
+    if isinstance(out_count, int) and out_count > 0:
+        violations.append({
+            "type": "out_of_outline",
+            "severity": "blocking",
+            "count": out_count,
+            "detail": "Footprint courtyards extend outside the Edge.Cuts outline.",
+        })
+        required_actions.append(
+            "Move the out-of-outline footprints inside the board outline (or "
+            "enlarge the outline), then re-run validate_placement_quality."
+        )
+
+    hpwl_budget = get_float_or_none("GATE_HPWL_MAX_MM")
+    total_hpwl = float(metric.get("total_hpwl_mm") or 0.0)
+    if hpwl_budget is not None and total_hpwl > hpwl_budget:
+        violations.append({
+            "type": "hpwl_exceeds_budget",
+            "severity": "advisory",
+            "total_hpwl_mm": total_hpwl,
+            "budget_mm": hpwl_budget,
+        })
+
+    decap_target = get_float("GATE_DECAP_MAX_MM")
+    decap_max = metric.get("decap_max_mm")
+    if isinstance(decap_max, (int, float)) and float(decap_max) > decap_target:
+        violations.append({
+            "type": "decap_distance_exceeds_target",
+            "severity": "advisory",
+            "decap_max_mm": float(decap_max),
+            "target_mm": decap_target,
+        })
+
+    promote = get_bool("GATE_PROMOTE_ADVISORY")
+    blocking = [v for v in violations if v["severity"] == "blocking"]
+    advisory = [v for v in violations if v["severity"] == "advisory"]
+    passed = not blocking and not (promote and advisory)
+    if promote and advisory and not blocking:
+        required_actions.append(
+            "Advisory thresholds are promoted to blocking "
+            "(GATE_PROMOTE_ADVISORY): tighten the placement below the "
+            "configured HPWL / decap ceilings, then re-run "
+            "validate_placement_quality."
+        )
+
+    result: dict[str, Any] = {
+        "passed": passed,
+        "placement_metric": metric,
+        "violations": violations,
+        "required_actions": required_actions,
+    }
+    record_validation(pcb_path, "validate_placement_quality", result)
+    return result
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register DRC/ERC tools on the MCP server."""
 
@@ -1717,6 +1819,40 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         p = validate_kicad_path(path, ".kicad_pcb")
         bundle = placement_metric(p)
         return json.dumps({"status": "success", **bundle}, indent=2)
+
+    @mcp.tool()
+    def validate_placement_quality(path: str) -> str:
+        """Gate a board's placement quality before routing (P4 quality gate).
+
+        Computes the placement metric bundle (Total HPWL, courtyard overlaps,
+        out-of-outline count, decap distances, orientation consistency) and
+        applies the gate policy:
+
+        - Courtyard overlaps or out-of-outline footprints → passed=false
+          (blocking — routing over an illegal placement is never allowed).
+        - Total HPWL over GATE_HPWL_MAX_MM (unset by default) or decap distance
+          over GATE_DECAP_MAX_MM → advisory violations: reported with
+          severity "advisory" but non-blocking, unless GATE_PROMOTE_ADVISORY
+          promotes them to hard fails (operator-configurable wire-length /
+          decoupling budget).
+
+        Side effect: the result is written to <board>.validation_cache.json —
+        the same mechanism as validate_connector_orientations — so autoroute
+        refuses to start when this gate has not passed on the current board
+        state. The model MUST NOT call autoroute if passed is false; read the
+        violations and required_actions to remediate first.
+
+        Args:
+            path: Path to .kicad_pcb file.
+
+        Returns:
+            JSON with passed bool, placement_metric bundle, violations list
+            (each with type, severity, and figures), and required_actions.
+        """
+        p = validate_kicad_path(path, ".kicad_pcb")
+        result = run_validate_placement_quality(p)
+        change_log.record("validate_placement_quality", {"path": path})
+        return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
     def get_board_design_rules(path: str) -> str:

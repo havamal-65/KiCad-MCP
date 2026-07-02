@@ -595,3 +595,237 @@ def test_place_default_order_unchanged_without_cluster_order() -> None:
         parts, roles, clusters, pairing, {}, board, 0.5, cluster_order=area,
     )
     assert p_default == p_explicit
+
+
+# ---------------------------------------------------------------------------
+# P4 — sensitive-net proximity (REQ-SENSE-001..003, REQ-TEST-P4-001)
+# ---------------------------------------------------------------------------
+
+import math  # noqa: E402 — grouped with the P4 helpers that need it
+
+from kicad_mcp.utils.placement_config import is_clock_net  # noqa: E402
+
+
+def _xtal_ic(ref: str = "U1") -> PartRecord:
+    """An IC whose oscillator (XIN/XOUT) pads sit on its east side (x = +1)."""
+    return _part(
+        ref, "Package_QFP:LQFP-32",
+        [
+            _pad("1", 1, "IN0", -1, -0.5), _pad("2", 2, "IN1", -1, 0.5),
+            _pad("5", 5, "VCC", -1, 1), _pad("4", 6, "GND", 0, 1),
+            _pad("7", 20, "XIN", 1, -0.5), _pad("8", 21, "XOUT", 1, 0.5),
+        ],
+        courtyard=(-2, -2, 2, 2),
+    )
+
+
+def _crystal(
+    ref: str = "Y1",
+    courtyard: tuple[float, float, float, float] = (-0.9, -0.9, 0.9, 0.9),
+) -> PartRecord:
+    return _part(
+        ref, "Crystal:Crystal_SMD_3225-4Pin",
+        [_pad("1", 20, "XIN", -0.6, 0), _pad("2", 21, "XOUT", 0.6, 0)],
+        courtyard=courtyard,
+    )
+
+
+def _load_cap(ref: str, net: str, nid: int) -> PartRecord:
+    """A crystal load cap: oscillator net to GND (never a decap — no rail)."""
+    return _part(
+        ref, "Capacitor_SMD:C_0402",
+        [_pad("1", nid, net, -0.5, 0), _pad("2", 6, "GND", 0.5, 0)],
+        courtyard=(-0.5, -0.5, 0.5, 0.5),
+    )
+
+
+def _crystal_fixture() -> list[PartRecord]:
+    return [
+        _xtal_ic("U1"), _crystal("Y1"),
+        _load_cap("C10", "XIN", 20), _load_cap("C11", "XOUT", 21),
+        _decap("C1"),
+    ]
+
+
+def _centre_dist(
+    parts: list[PartRecord],
+    pos_of: dict[str, tuple[float, float, float]],
+    a: str, b: str,
+) -> float:
+    by_ref = {p["ref"]: p for p in parts}
+
+    def centre(r: str) -> tuple[float, float]:
+        box = e._board_box(by_ref[r], (pos_of[r][0], pos_of[r][1]), pos_of[r][2])
+        return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+    (ax, ay), (bx, by) = centre(a), centre(b)
+    return math.hypot(ax - bx, ay - by)
+
+
+def test_crystal_classification_and_pairing() -> None:
+    """Crystal pairs to the IC it shares the most signal weight with; a crystal
+    sharing nothing with any IC maps to None (REQ-SENSE-001)."""
+    parts = _crystal_fixture()
+    roles = e.classify_parts(parts)
+    assert roles["Y1"] == ROLE_CRYSTAL
+    assert roles["C10"] == ROLE_PASSIVE and roles["C11"] == ROLE_PASSIVE
+    graph = e._part_graph(parts)
+    assert e.pair_crystals(parts, roles, graph) == {"Y1": "U1"}
+
+    lonely = _part("Y9", "Crystal:Crystal_SMD",
+                   [_pad("1", 90, "FLOAT_A", 0, 0), _pad("2", 91, "FLOAT_B", 1, 0)])
+    parts2 = [_xtal_ic("U1"), lonely]
+    roles2 = e.classify_parts(parts2)
+    assert e.pair_crystals(parts2, roles2, e._part_graph(parts2)) == {"Y9": None}
+
+
+def test_crystal_load_caps_found_decap_excluded() -> None:
+    """Load caps = 2-pad C parts sharing a crystal net; decaps never counted."""
+    parts = _crystal_fixture()
+    roles = e.classify_parts(parts)
+    pairing = e.pair_crystals(parts, roles, e._part_graph(parts))
+    assert e.crystal_load_caps(parts, roles, pairing) == {"Y1": ["C10", "C11"]}
+
+
+def test_crystal_hugs_ic_with_load_caps() -> None:
+    """Crystal lands within SENSE_MAX_MM of its IC, load caps within reach of the
+    crystal, no fallback warnings, plan stays legal (REQ-SENSE-001)."""
+    parts = _crystal_fixture()
+    res = e.plan_placement(parts, (0.0, 0.0, 100.0, 80.0), 0.5)
+    plan = res["plan"]
+    sense_max = e.get_float("SENSE_MAX_MM")
+    assert _centre_dist(parts, plan, "Y1", "U1") <= sense_max
+    assert _centre_dist(parts, plan, "C10", "Y1") <= sense_max
+    assert _centre_dist(parts, plan, "C11", "Y1") <= sense_max
+    assert not any(w["type"] == "sense_fallback" for w in res["warnings"])
+    assert _count_overlaps(parts, plan) == 0
+
+
+def test_crystal_prefers_oscillator_pin_side() -> None:
+    """With all four sides free and equidistant (square crystal courtyard), the
+    crystal takes the side holding the IC's oscillator pads — east here."""
+    parts = _crystal_fixture()
+    res = e.plan_placement(parts, (0.0, 0.0, 100.0, 80.0), 0.5)
+    plan = res["plan"]
+    by_ref = {p["ref"]: p for p in parts}
+    u1_box = e._board_box(by_ref["U1"], (plan["U1"][0], plan["U1"][1]), plan["U1"][2])
+    y1_box = e._board_box(by_ref["Y1"], (plan["Y1"][0], plan["Y1"][1]), plan["Y1"][2])
+    assert (y1_box[0] + y1_box[2]) / 2.0 > (u1_box[0] + u1_box[2]) / 2.0
+
+
+def test_crystal_never_worse_fallback_warning() -> None:
+    """No legal adjacent slot (board barely larger than the IC) → structured
+    sense_fallback warning; the crystal is still placed (REQ-SENSE-001)."""
+    parts = [_xtal_ic("U1"), _crystal("Y1")]
+    res = e.plan_placement(parts, (0.0, 0.0, 5.0, 5.0), 0.1)
+    assert any(w["type"] == "sense_fallback" for w in res["warnings"])
+    assert "Y1" in res["plan"]
+
+
+def test_diff_pair_weight_multiplier_in_graph() -> None:
+    """A declared diff-pair net's per-pair weight scales by DIFFPAIR_WEIGHT_MULT
+    (REQ-SENSE-002); undeclared, the graph is unchanged P1 weighting."""
+    a = _part("U1", "L", [_pad("1", 30, "PAIR_P", 0, 0),
+                          _pad("2", 31, "PAIR_N", 0.5, 0)])
+    b = _part("U2", "L", [_pad("1", 30, "PAIR_P", 0, 0),
+                          _pad("2", 31, "PAIR_N", 0.5, 0)])
+    key = frozenset(("U1", "U2"))
+    base = e._part_graph([a, b])[key]
+    boosted = e._part_graph([a, b], frozenset({"PAIR_P", "PAIR_N"}))[key]
+    assert boosted == base * e.get_float("DIFFPAIR_WEIGHT_MULT")
+
+
+def test_diff_pair_binds_cluster() -> None:
+    """A net too weak to cluster on its own (fanout 6 → 0.2 < floor 0.25) binds
+    its parts once declared as a diff pair (0.8) — the boost steers clustering,
+    not just placement (REQ-SENSE-002)."""
+    parts = [
+        _part(f"U{i}", "L", [_pad("1", 30, "PAIR_P", 0, 0)]) for i in range(1, 7)
+    ]
+    roles = e.classify_parts(parts)
+    plain = e.cluster_parts(parts, roles, {})
+    assert all(len(c) == 1 for c in plain)
+    declared = e.cluster_parts(
+        parts, roles, {}, frozenset(), frozenset({"PAIR_P"}),
+    )
+    assert [len(c) for c in declared] == [6]
+
+
+def test_clock_net_intermediate_weight() -> None:
+    """A clock-like net's per-pair weight is 1/(m-1) * CLOCK_WEIGHT_MULT —
+    between a plain signal (x1) and a bus (x0) (REQ-SENSE-003)."""
+    mult = e.get_float("CLOCK_WEIGHT_MULT")
+    a = _part("U1", "L", [_pad("1", 50, "SPI_CLK", 0, 0)])
+    b = _part("U2", "L", [_pad("1", 50, "SPI_CLK", 0, 0)])
+    assert e._part_graph([a, b])[frozenset(("U1", "U2"))] == 1.0 * mult
+
+    three = [
+        _part(f"U{i}", "L", [_pad("1", 51, "SYS_CLK", 0, 0)]) for i in range(1, 4)
+    ]
+    g = e._part_graph(three)
+    assert g[frozenset(("U1", "U2"))] == 0.5 * mult
+
+
+def test_is_clock_net_pattern() -> None:
+    for name in ("CLK", "SYS_CLK", "CLKOUT", "XTAL1", "OSC_IN", "MCU_XTAL_IN"):
+        assert is_clock_net(name), name
+    for name in ("MISO", "VCC", "BLINK", "MYCLK", ""):
+        assert not is_clock_net(name), name
+
+
+def test_diff_pair_wins_over_clock() -> None:
+    """A net that is both declared diff pair and clock-like takes the diff-pair
+    multiplier (REQ-SENSE-002 over -003)."""
+    mults = e._net_weight_multipliers(
+        frozenset({"USB_CLK", "PLAIN"}), frozenset({"USB_CLK"}),
+    )
+    assert mults == {"USB_CLK": e.get_float("DIFFPAIR_WEIGHT_MULT")}
+
+
+def test_read_diff_pair_nets(tmp_path) -> None:
+    """Diff-pair nets come from .kicad_pro netclass data: exact patterns verbatim,
+    globs expanded against board nets, Default class ignored (REQ-SENSE-002)."""
+    pcb = tmp_path / "board.kicad_pcb"
+    pcb.write_text(
+        '(kicad_pcb (net 1 "USB_DP") (net 2 "USB_DM") (net 3 "SIG_A"))',
+        encoding="utf-8",
+    )
+    pro = tmp_path / "board.kicad_pro"
+
+    import json
+    pro.write_text(json.dumps({
+        "net_settings": {
+            "classes": [
+                {"name": "Default", "diff_pair_width": 0.2},
+                {"name": "USB90", "diff_pair_width": 0.2, "diff_pair_gap": 0.15},
+            ],
+            "netclass_patterns": [
+                {"netclass": "USB90", "pattern": "USB_D*"},
+                {"netclass": "USB90", "pattern": "SIG_A"},
+            ],
+        },
+    }), encoding="utf-8")
+    assert e.read_diff_pair_nets(pcb) == frozenset({"USB_DP", "USB_DM", "SIG_A"})
+
+    # A class with no positive diff_pair_* field declares nothing.
+    pro.write_text(json.dumps({
+        "net_settings": {
+            "classes": [{"name": "USB90", "clearance": 0.2}],
+            "netclass_patterns": [{"netclass": "USB90", "pattern": "USB_D*"}],
+        },
+    }), encoding="utf-8")
+    assert e.read_diff_pair_nets(pcb) == frozenset()
+
+    pro.unlink()
+    assert e.read_diff_pair_nets(pcb) == frozenset()
+
+
+def test_p4_pipeline_deterministic() -> None:
+    """Two runs with sensitive placement + diff-pair weighting are identical."""
+    parts = _crystal_fixture()
+    board = (0.0, 0.0, 100.0, 80.0)
+    dp = frozenset({"XIN", "XOUT"})
+    r1 = e.plan_placement(parts, board, 0.5, diff_pair_nets=dp)
+    r2 = e.plan_placement(parts, board, 0.5, diff_pair_nets=dp)
+    assert r1["plan"] == r2["plan"]
+    assert r1["warnings"] == r2["warnings"]

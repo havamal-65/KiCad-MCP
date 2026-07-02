@@ -898,6 +898,39 @@ def register_tools(
             "checked": (cached or {}).get("checked", 0),
         })
 
+        # Step 0b: Placement-quality gate (P4 — REQ-GATE-001). Same mechanism:
+        # autoroute refuses when validate_placement_quality has not passed on
+        # the current board state (overlaps / out-of-outline are blocking; HPWL
+        # and decap-distance ceilings are advisory unless promoted).
+        quality_gap = check_gate(p, "validate_placement_quality")
+        if quality_gap is not None:
+            report["status"] = "error"
+            if not quality_gap["ran"]:
+                report["message"] = (
+                    "autoroute refuses to start: validate_placement_quality "
+                    "has not been run on the current board state. "
+                    "Call mcp__kicad__validate_placement_quality(path) first."
+                )
+            else:
+                report["message"] = (
+                    "autoroute refuses to start: validate_placement_quality "
+                    "reports blocking violations (courtyard overlaps or "
+                    "out-of-outline footprints). Fix the placement, re-run "
+                    "mcp__kicad__validate_placement_quality, then retry."
+                )
+                report["violations"] = quality_gap["violations"]
+            report["steps"].append({
+                "step": "placement_quality_gate",
+                "status": "error",
+                "cache_hit": quality_gap["ran"],
+                "violations": (quality_gap["violations"] if quality_gap["ran"] else None),
+            })
+            return json.dumps(report, indent=2)
+        report["steps"].append({
+            "step": "placement_quality_gate",
+            "status": "success",
+        })
+
         # Step 1: Clean board (optional)
         if clean_board:
             result_json = _impl_clean_board_for_routing(

@@ -125,6 +125,50 @@ FLOW_OUTPUT_NET_TOKENS: tuple[str, ...] = (
     "LINEOUT",
 )
 
+# ---------------------------------------------------------------------------
+# Sensitive-net proximity (P4 — REQ-SENSE-001..003)
+# ---------------------------------------------------------------------------
+
+#: Maximum centre-to-centre distance (mm) a crystal / oscillator may sit from
+#: the IC it clocks. Beyond this the crystal falls back to ordinary proximity
+#: placement (never-worse fallback, REQ-SENSE-001, mirrors ``DECAP_MAX_MM``).
+SENSE_MAX_MM: float = 5.0
+
+#: Part-graph weight multiplier applied to a net declared as a differential pair
+#: (via ``.kicad_pro`` netclass ``diff_pair_*`` data). Pulls the pair's endpoint
+#: footprints tight so the constructive placer + improver shorten the pair
+#: (REQ-SENSE-002). No new declaration surface — P4 only reads the netclass data.
+DIFFPAIR_WEIGHT_MULT: float = 4.0
+
+#: A net whose name matches this pattern (CLK / *_CLK / XTAL* / OSC*) is a
+#: clock-like net and gets ``CLOCK_WEIGHT_MULT`` proximity weight — between a
+#: normal 2-pin signal (×1) and a wide bus (×0), so clock distribution stays
+#: compact without dominating (REQ-SENSE-003).
+CLOCK_NET_PATTERN: re.Pattern[str] = re.compile(
+    r"^(.*_)?(CLK|XTAL|OSC)\w*$", re.IGNORECASE,
+)
+
+#: Weight multiplier for clock-like nets (REQ-SENSE-003).
+CLOCK_WEIGHT_MULT: float = 1.5
+
+# ---------------------------------------------------------------------------
+# Placement-quality gate thresholds (P4 — REQ-GATE-001; advisory unless promoted)
+# ---------------------------------------------------------------------------
+
+#: Total-HPWL ceiling (mm) for the placement-quality gate. ``None`` = advisory
+#: only / no ceiling by default (Q5 lean: HPWL advisory). When set and exceeded,
+#: it appears in ``violations`` as ``severity: "advisory"`` and blocks only if
+#: ``GATE_PROMOTE_ADVISORY`` is true.
+GATE_HPWL_MAX_MM: float | None = None
+
+#: Decap-distance advisory ceiling (mm); reuses the P2 target by default.
+GATE_DECAP_MAX_MM: float = DECAP_MAX_MM
+
+#: When true, advisory violations (HPWL / decap distance) become hard fails so an
+#: operator can enforce a wire-length / decoupling budget without code edits
+#: (REQ-CFG-002). Overlaps / out-of-outline are always blocking regardless.
+GATE_PROMOTE_ADVISORY: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Override hook (REQ-CFG-002)
@@ -144,6 +188,12 @@ _OVERRIDABLE: frozenset[str] = frozenset({
     "FLOW_AXIS_TIE_BREAK",
     "FLOW_INPUT_NET_TOKENS",
     "FLOW_OUTPUT_NET_TOKENS",
+    "SENSE_MAX_MM",
+    "DIFFPAIR_WEIGHT_MULT",
+    "CLOCK_WEIGHT_MULT",
+    "GATE_HPWL_MAX_MM",
+    "GATE_DECAP_MAX_MM",
+    "GATE_PROMOTE_ADVISORY",
 })
 
 
@@ -188,6 +238,27 @@ def get_float(name: str) -> float:
 def get_str(name: str) -> str:
     """``get_tunable`` narrowed to ``str`` (for the flow-axis tie-break)."""
     return str(get_tunable(name))
+
+
+def get_bool(name: str) -> bool:
+    """``get_tunable`` narrowed to ``bool`` (for the gate-promotion flag)."""
+    return bool(get_tunable(name))
+
+
+def get_float_or_none(name: str) -> float | None:
+    """``get_tunable`` for a nullable distance ceiling (``GATE_HPWL_MAX_MM``)."""
+    value = get_tunable(name)
+    if value is None:
+        return None
+    return float(cast("SupportsFloat", value))
+
+
+def is_clock_net(net_name: str) -> bool:
+    """True for clock-like nets (CLK / *_CLK / XTAL* / OSC*, REQ-SENSE-003)."""
+    name = net_name.strip()
+    if not name:
+        return False
+    return CLOCK_NET_PATTERN.match(name) is not None
 
 
 def classify_net(net_name: str) -> str:

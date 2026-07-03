@@ -165,6 +165,66 @@ def test_live_gate_runs_on_open_board(bridge_session: object) -> None:
 
 
 @pytest.mark.integration
+def test_live_auto_place_gate_clean(bridge_session: object) -> None:
+    """REQ-KTEST-202 (K2, AC9/AC10): net-aware ``auto_place`` on the open
+    ESP32 scratch board yields a placement with **zero** ``keepout_intrusion``
+    — the engine avoided the antenna keep-out rather than leaving the gate to
+    reject it. Every footprint is restored to its original position after."""
+    from kicad_mcp.backends.plugin_backend import PluginBoardOps, _tcp_call
+    from kicad_mcp.tools.drc import _parse_board_bbox
+    from kicad_mcp.utils.placement_engine import read_part_records
+
+    info = _tcp_call("ping", timeout=5.0)
+    board_path = info.get("board_path") if isinstance(info, dict) else None
+    if not board_path or not Path(board_path).exists():
+        pytest.skip("no live board path available from the bridge")
+    p = Path(board_path)
+
+    content = p.read_text(encoding="utf-8")
+    embedded = [
+        k for k in _footprint_forbidding_keepouts(content)
+        if k.origin.startswith("embedded:")
+    ]
+    if not embedded:
+        pytest.skip("live board carries no embedded footprint-forbidding keep-out")
+    owner = embedded[0].origin.split(":", 1)[1]
+    bbox = _parse_board_bbox(content)
+    if bbox is None:
+        pytest.skip("live board has no Edge.Cuts outline")
+
+    snapshot = {r["ref"]: r["pos"] for r in read_part_records(content)}
+    ops = PluginBoardOps()
+    try:
+        result = ops.auto_place(
+            p, bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1],
+            clearance_mm=0.5, anchors=[owner], strategy="net_aware",
+        )
+        unresolved = [
+            w for w in result["warnings"]
+            if isinstance(w, dict) and w.get("type") == "keepout_unresolved"
+        ]
+        assert unresolved == [], unresolved
+
+        gate = run_validate_placement_quality(p)
+        intrusions = [
+            v for v in gate["violations"] if v["type"] == "keepout_intrusion"
+        ]
+        assert intrusions == [], intrusions
+    finally:
+        for ref, (ox, oy, orot) in sorted(snapshot.items()):
+            ops.move_component(p, ref, ox, oy, rotation=orot)
+        ops.save_board(p)
+
+    restored = {r["ref"]: r["pos"] for r in read_part_records(
+        p.read_text(encoding="utf-8"),
+    )}
+    for ref, (ox, oy, orot) in snapshot.items():
+        rx, ry, rrot = restored[ref]
+        assert abs(rx - ox) < 1e-3 and abs(ry - oy) < 1e-3, ref
+        assert abs((rrot - orot) % 360.0) < 1e-3, ref
+
+
+@pytest.mark.integration
 def test_live_rotation_bakes_zone_points(bridge_session: object) -> None:
     """Q1 rotation confirmation (requirements §2): when *pcbnew* rotates a
     footprint with an embedded keep-out, the saved zone points move/rotate

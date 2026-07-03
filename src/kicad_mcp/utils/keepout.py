@@ -188,6 +188,34 @@ def rect_intersects_polygon(
 
 
 # ---------------------------------------------------------------------------
+# Polygon transforms (K2 — REQ-KAVOID-003)
+# ---------------------------------------------------------------------------
+
+def transform_polygon(poly: Polygon, x: float, y: float, rot_deg: float) -> Polygon:
+    """Owner-local outline → board frame: rotate by ``rot_deg``, then translate
+    by ``(x, y)`` — the KWRITE/courtyard rotation convention (live-verified)."""
+    if rot_deg == 0.0:
+        return tuple((px + x, py + y) for px, py in poly)
+    rad = math.radians(rot_deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return tuple((px * c - py * s + x, px * s + py * c + y) for px, py in poly)
+
+
+def untransform_polygon(poly: Polygon, x: float, y: float, rot_deg: float) -> Polygon:
+    """Inverse of :func:`transform_polygon`: board frame → owner-local, so a
+    movable footprint's embedded keep-out can be re-transformed to any
+    candidate placement (REQ-KAVOID-003)."""
+    if rot_deg == 0.0:
+        return tuple((px - x, py - y) for px, py in poly)
+    rad = math.radians(rot_deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return tuple(
+        ((px - x) * c + (py - y) * s, -(px - x) * s + (py - y) * c)
+        for px, py in poly
+    )
+
+
+# ---------------------------------------------------------------------------
 # Parsing (REQ-KPARSE-*)
 # ---------------------------------------------------------------------------
 

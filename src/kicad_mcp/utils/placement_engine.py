@@ -25,9 +25,19 @@ import fnmatch
 import json
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict
 
+from kicad_mcp.utils.keepout import (
+    KeepoutArea,
+    Polygon,
+    find_keepout_intrusions,
+    rect_intersects_polygon,
+    scan_board,
+    transform_polygon,
+    untransform_polygon,
+)
 from kicad_mcp.utils.placement_config import (
     classify_net,
     get_float,
@@ -411,6 +421,23 @@ def read_diff_pair_nets(pcb_path: Path) -> frozenset[str]:
     return frozenset(result)
 
 
+def read_board_keepouts(
+    pcb_path: Path,
+) -> tuple[tuple[KeepoutArea, ...], dict[str, str]]:
+    """Footprint-forbidding keep-outs + footprint sides for the engine (K2).
+
+    One ``scan_board`` pass over the board text. Parse warnings are the K1
+    gate's report, not the engine's — best-effort avoidance. A missing or
+    unreadable file yields ``((), {})`` (mirrors :func:`read_diff_pair_nets`).
+    """
+    try:
+        content = pcb_path.read_text(encoding="utf-8")
+    except OSError:
+        return ((), {})
+    keepouts, sides, _warnings = scan_board(content)
+    return (tuple(k for k in keepouts if k.forbids_footprints), sides)
+
+
 # ---------------------------------------------------------------------------
 # Classification (REQ-CLASS-001..004)
 # ---------------------------------------------------------------------------
@@ -748,6 +775,151 @@ def _signal_pads(p: PartRecord) -> list[tuple[str, float, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Keep-out avoidance (K2 — REQ-KAVOID-001..005)
+# ---------------------------------------------------------------------------
+
+class _KeepoutFilter:
+    """Prepared keep-out obstacles + the engine's one conflict predicate.
+
+    Static areas (board-level, or embedded in footprints the engine will not
+    move) keep their parsed board-absolute polygons, each with a precomputed
+    AABB for a cheap pre-reject. Embedded areas of movable parts are held in
+    the owner's **local frame** — derived from the owner's on-file placement —
+    and re-transformed to the owner's trial position per query, so parts are
+    checked against the zone where the owner is *going*, never its stale
+    on-file position (REQ-KAVOID-003).
+    """
+
+    def __init__(
+        self,
+        parts: list[PartRecord],
+        anchor_refs: frozenset[str],
+        keepouts: tuple[KeepoutArea, ...],
+        part_sides: dict[str, str] | None,
+    ) -> None:
+        self.tol = get_float("KEEPOUT_EDGE_TOL_MM")
+        self.sides: dict[str, str] = dict(part_sides or {})
+        self.by_ref = {p["ref"]: p for p in parts}
+        # Board-absolute areas: (area, [(polygon, aabb), …]) in file order.
+        self._static: list[tuple[
+            KeepoutArea,
+            list[tuple[Polygon, tuple[float, float, float, float]]],
+        ]] = []
+        # Movable owners: ref -> [(area, local-frame polygons), …].
+        self._movable: dict[str, list[tuple[KeepoutArea, tuple[Polygon, ...]]]] = {}
+        for area in keepouts:
+            if not area.forbids_footprints or not area.polygons:
+                continue
+            owner = (
+                area.origin.split(":", 1)[1]
+                if area.origin.startswith("embedded:") else None
+            )
+            record = self.by_ref.get(owner) if owner is not None else None
+            if owner is not None and record is not None and owner not in anchor_refs:
+                ox, oy, orot = record["pos"]
+                self._movable.setdefault(owner, []).append((
+                    area,
+                    tuple(
+                        untransform_polygon(poly, ox, oy, orot)
+                        for poly in area.polygons
+                    ),
+                ))
+            else:
+                self._static.append((area, [
+                    (poly, (
+                        min(pt[0] for pt in poly), min(pt[1] for pt in poly),
+                        max(pt[0] for pt in poly), max(pt[1] for pt in poly),
+                    ))
+                    for poly in area.polygons
+                ]))
+        self.empty = not self._static and not self._movable
+
+    def conflicts(
+        self,
+        changed: dict[str, tuple[float, float, float]],
+        pos_all: dict[str, tuple[float, float, float]],
+    ) -> bool:
+        """True iff any *changed* ref's trial placement violates a keep-out.
+
+        ``pos_all`` is the full trial position map (placed + anchors, with
+        every changed ref at its trial position). Two directions are tested:
+        (a) the changed part's courtyard box against every zone at its
+        effective position, and (b) — when the changed ref itself owns movable
+        zones — those zones at the trial position against every other placed
+        part's box. An owner absent from ``pos_all`` (not yet placed)
+        contributes nothing to (a); direction (b) covers it when it lands.
+        Layer-matched throughout; self-exempt (A3).
+        """
+        if self.empty:
+            return False
+        for ref, pos in changed.items():
+            record = self.by_ref.get(ref)
+            if record is None:
+                continue
+            box = _board_box(record, (pos[0], pos[1]), pos[2])
+            side = self.sides.get(ref, "F.Cu")
+            # (a) the part's box into a zone.
+            for area, polys in self._static:
+                if area.origin == f"embedded:{ref}" or side not in area.layers:
+                    continue
+                for poly, bbox in polys:
+                    if not _boxes_overlap(box, bbox):
+                        continue
+                    if rect_intersects_polygon(box, poly, self.tol):
+                        return True
+            for owner, entries in self._movable.items():
+                if owner == ref:
+                    continue  # own embedded zone — self-exempt
+                opos = pos_all.get(owner)
+                if opos is None:
+                    continue
+                for area, local_polys in entries:
+                    if side not in area.layers:
+                        continue
+                    for local in local_polys:
+                        poly = transform_polygon(local, opos[0], opos[1], opos[2])
+                        if rect_intersects_polygon(box, poly, self.tol):
+                            return True
+            # (b) the part's own zones onto already-placed parts.
+            for area, local_polys in self._movable.get(ref, ()):
+                for local in local_polys:
+                    poly = transform_polygon(local, pos[0], pos[1], pos[2])
+                    for other, other_pos in pos_all.items():
+                        if other == ref:
+                            continue
+                        other_rec = self.by_ref.get(other)
+                        if other_rec is None:
+                            continue
+                        if self.sides.get(other, "F.Cu") not in area.layers:
+                            continue
+                        obox = _board_box(
+                            other_rec, (other_pos[0], other_pos[1]), other_pos[2],
+                        )
+                        if rect_intersects_polygon(obox, poly, self.tol):
+                            return True
+        return False
+
+    def materialize(
+        self, pos_all: dict[str, tuple[float, float, float]],
+    ) -> list[KeepoutArea]:
+        """Every area with polygons at their effective board positions —
+        static areas verbatim, movable-owner areas transformed to the owner's
+        position in ``pos_all`` (final-audit input, REQ-KAVOID-004)."""
+        out: list[KeepoutArea] = [area for area, _ in self._static]
+        for owner in sorted(self._movable, key=_ref_key):
+            opos = pos_all.get(owner)
+            for area, local_polys in self._movable[owner]:
+                if opos is None:
+                    out.append(area)  # owner untouched — on-file coords stand
+                else:
+                    out.append(replace(area, polygons=tuple(
+                        transform_polygon(local, opos[0], opos[1], opos[2])
+                        for local in local_polys
+                    )))
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Constructive placement (REQ-PROX-001..005)
 # ---------------------------------------------------------------------------
 
@@ -760,11 +932,13 @@ class _Placer:
         anchors: dict[str, tuple[float, float, float]],
         board_rect: tuple[float, float, float, float],
         clearance: float,
+        keepout_filter: _KeepoutFilter | None = None,
     ) -> None:
         self.by_ref = {p["ref"]: p for p in parts}
         self.anchor_refs = frozenset(anchors)
         self.board_rect = board_rect
         self.clearance = clearance
+        self.keepouts = keepout_filter
         self.grid = get_float("PROX_CANDIDATE_GRID_MM")
         # ref -> (x, y, rot) of placed parts (anchors first).
         self.plan: dict[str, tuple[float, float, float]] = {}
@@ -838,6 +1012,17 @@ class _Placer:
                 return True
         return False
 
+    def _keepout_blocked(
+        self, ref: str, origin: tuple[float, float, float],
+    ) -> bool:
+        """Candidate rejection tier for keep-outs (REQ-KAVOID-001) — same rank
+        as ``_overlaps_placed``; no-op when the board carries none."""
+        if self.keepouts is None or self.keepouts.empty:
+            return False
+        pos_all = dict(self.plan)
+        pos_all[ref] = origin
+        return self.keepouts.conflicts({ref: origin}, pos_all)
+
     # -- free scan (no placed neighbour) -----------------------------------
     def _next_scan_origin(self, p: PartRecord) -> tuple[float, float]:
         bxmin, bymin, bxmax, bymax = self.board_rect
@@ -870,9 +1055,16 @@ class _Placer:
         p = self.by_ref[ref]
         attractor = self._attractor(p)
         if attractor is None:
-            # No placed neighbour: tile into the next free scan row.
+            # No placed neighbour: tile into the next free scan row. If that
+            # slot sits in a keep-out, take the first keep-out-free slot on
+            # the board instead; when none exists keep the scan slot —
+            # never-worse, the final audit reports it (REQ-KAVOID-004).
             origin = self._next_scan_origin(p)
             clamped = self._clamp_into_outline(p, origin) or origin
+            if self._keepout_blocked(ref, (clamped[0], clamped[1], 0.0)):
+                anywhere = self._find_any_free_slot(ref, p)
+                if anywhere is not None:
+                    clamped = anywhere
             self._commit(ref, (clamped[0], clamped[1], 0.0))
             return
 
@@ -908,6 +1100,8 @@ class _Placer:
                     continue
                 box = _board_box(p, slot, 0.0)
                 if self._overlaps_placed(ref, box):
+                    continue
+                if self._keepout_blocked(ref, (slot[0], slot[1], 0.0)):
                     continue
                 delta = round(self._delta_hpwl(p, (slot[0], slot[1], 0.0)), 6)
                 key = (delta, slot[1], slot[0], slot)
@@ -949,7 +1143,9 @@ class _Placer:
             while x + cxmax <= bxmax + 1e-9:
                 ox, oy = round(x, 4), round(y, 4)
                 box = _board_box(p, (ox, oy), 0.0)
-                if not self._overlaps_placed(ref, box):
+                if not self._overlaps_placed(ref, box) and not self._keepout_blocked(
+                    ref, (ox, oy, 0.0)
+                ):
                     delta = round(self._delta_hpwl(p, (ox, oy, 0.0)), 6)
                     key = (delta, oy, ox, (ox, oy))
                     if best is None or key < best:
@@ -1020,6 +1216,10 @@ class _Placer:
                     break
                 box = _board_box(mover, clamped, 0.0)
                 if self._overlaps_placed(mover_ref, box):
+                    continue
+                if self._keepout_blocked(
+                    mover_ref, (clamped[0], clamped[1], 0.0)
+                ):
                     continue
                 amx = clamped[0] + m_cx_local
                 amy = clamped[1] + m_cy_local
@@ -1244,6 +1444,7 @@ def place(
     clearance: float,
     cluster_order: list[list[str]] | None = None,
     diff_pair_nets: frozenset[str] = frozenset(),
+    keepout_filter: _KeepoutFilter | None = None,
 ) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, str]]]:
     """Constructive net-aware placement + bounded local improvement.
 
@@ -1251,9 +1452,11 @@ def place(
     ``(x, y, 0.0)``; anchors are not in the plan (they never move). When
     ``cluster_order`` is given it fixes the cluster placement sequence (P3 flow
     ordering); otherwise the P2 area-descending order is used (REQ-BACK).
-    ``diff_pair_nets`` (P4) steers the graph weighting toward declared diff pairs.
+    ``diff_pair_nets`` (P4) steers the graph weighting toward declared diff
+    pairs. ``keepout_filter`` (K2) rejects candidates violating
+    footprint-forbidding keep-outs (REQ-KAVOID-001).
     """
-    placer = _Placer(parts, anchors, board_rect, clearance)
+    placer = _Placer(parts, anchors, board_rect, clearance, keepout_filter)
     warnings: list[dict[str, str]] = []
     by_ref = placer.by_ref
     graph = _part_graph(parts, diff_pair_nets)
@@ -1432,6 +1635,7 @@ def place(
         anchors,
         board_rect,
         group_of_ic,
+        keepout_filter,
     )
     for ref, pos in improved.items():
         placer.plan[ref] = pos
@@ -1486,12 +1690,14 @@ def _improve(
     anchors: dict[str, tuple[float, float, float]],
     board_rect: tuple[float, float, float, float],
     caps_of_ic: dict[str, list[str]] | None = None,
+    keepout_filter: _KeepoutFilter | None = None,
 ) -> dict[str, tuple[float, float, float]]:
     """Bounded local improvement (REQ-PROX-003): strict-decrease, legality kept.
 
     An IC moves together with its decoupling caps as a rigid group, so the caps
     stay hugging it (decaps have no signal pads, so they never initiate a move
-    themselves).
+    themselves). Legality includes keep-outs when a filter is given (K2): a
+    group member owning an embedded zone carries the zone with it.
     """
     passes = get_int("PROX_IMPROVE_PASSES")
     grid = get_float("PROX_CANDIDATE_GRID_MM")
@@ -1528,6 +1734,19 @@ def _improve(
                 obox = _board_box(by_ref[other], (opos[0], opos[1]), opos[2])
                 if _boxes_overlap(nb, obox, gap=0.0):
                     return False
+        if keepout_filter is not None and not keepout_filter.empty:
+            trial = {
+                r: (
+                    round(plan[r][0] + delta[0], 4),
+                    round(plan[r][1] + delta[1], 4),
+                    plan[r][2],
+                )
+                for r in group
+            }
+            pos_trial = dict(pos_all)
+            pos_trial.update(trial)
+            if keepout_filter.conflicts(trial, pos_trial):
+                return False
         return True
 
     for _ in range(passes):
@@ -1574,6 +1793,7 @@ def legalize(
     anchors: dict[str, tuple[float, float, float]],
     board_rect: tuple[float, float, float, float],
     clearance: float,
+    keepout_filter: _KeepoutFilter | None = None,
 ) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, object]]]:
     """Reseat overlapping courtyards to free space; bounded, always terminates.
 
@@ -1616,6 +1836,12 @@ def legalize(
             if other == ref:
                 continue
             if _boxes_overlap(cand, box_of(other), gap=0.0):
+                return False
+        if keepout_filter is not None and not keepout_filter.empty:
+            trial = (origin[0], origin[1], pos_of[ref][2])
+            pos_trial = dict(pos_of)
+            pos_trial[ref] = trial
+            if keepout_filter.conflicts({ref: trial}, pos_trial):
                 return False
         return True
 
@@ -1697,6 +1923,7 @@ def normalize_orientations(
     roles: dict[str, str],
     anchors: dict[str, tuple[float, float, float]],
     board_rect: tuple[float, float, float, float],
+    keepout_filter: _KeepoutFilter | None = None,
 ) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, object]]]:
     """Rotate-for-HPWL then normalize like footprints to one orientation.
 
@@ -1728,6 +1955,10 @@ def normalize_orientations(
                 continue
             obox = _board_box(by_ref[other], (opos[0], opos[1]), opos[2])
             if _boxes_overlap(nb, obox, gap=0.0):
+                return False
+        if keepout_filter is not None and not keepout_filter.empty:
+            pos_all[ref] = (x, y, rot)
+            if keepout_filter.conflicts({ref: (x, y, rot)}, pos_all):
                 return False
         return True
 
@@ -1804,11 +2035,18 @@ def plan_placement(
     anchors: dict[str, tuple[float, float, float]] | None = None,
     edge_connector_refs: frozenset[str] = frozenset(),
     diff_pair_nets: frozenset[str] = frozenset(),
+    keepouts: tuple[KeepoutArea, ...] = (),
+    part_sides: dict[str, str] | None = None,
 ) -> PlacementPlan:
     """Full net-aware plan: classify → pair → cluster → order-by-flow → place →
     legalize → normalize-orientations (P3 pipeline). ``diff_pair_nets`` (P4)
-    boosts the graph weight of declared differential pairs (REQ-SENSE-002)."""
+    boosts the graph weight of declared differential pairs (REQ-SENSE-002).
+    ``keepouts``/``part_sides`` (K2, from :func:`read_board_keepouts`) make
+    every legality decision reject footprint-forbidding keep-out intrusions
+    (REQ-KAVOID-001); empty ⇒ behavior identical to pre-K2."""
     anchors = dict(anchors or {})
+    kf = _KeepoutFilter(parts, frozenset(anchors), keepouts, part_sides)
+    keepout_filter: _KeepoutFilter | None = None if kf.empty else kf
     roles = classify_parts(parts, edge_connector_refs)
     decap_pairing, decap_warnings = pair_decaps(parts, roles)
     clusters = cluster_parts(
@@ -1822,8 +2060,12 @@ def plan_placement(
         pl, pw = place(
             parts, roles, clusters, decap_pairing, anchors, board_rect,
             clearance, cluster_order=order, diff_pair_nets=diff_pair_nets,
+            keepout_filter=keepout_filter,
         )
-        pl, lw = legalize(parts, pl, anchors, board_rect, clearance)
+        pl, lw = legalize(
+            parts, pl, anchors, board_rect, clearance,
+            keepout_filter=keepout_filter,
+        )
         return pl, pw, lw
 
     # Flow ordering (P3 §4). None → graceful no-op (P2 area order). When flow
@@ -1844,6 +2086,7 @@ def plan_placement(
     # Orientation normalization (P3 §3) — refine the legal layout, never-worse.
     plan, orient_warnings = normalize_orientations(
         parts, plan, roles, anchors, board_rect,
+        keepout_filter=keepout_filter,
     )
 
     warnings: list[dict[str, object]] = []
@@ -1851,6 +2094,36 @@ def plan_placement(
     warnings.extend(place_warnings)  # type: ignore[arg-type]
     warnings.extend(legal_warnings)
     warnings.extend(orient_warnings)
+
+    # K2 final audit (REQ-KAVOID-004): report any non-anchored part left in a
+    # keep-out, using the gate's own checker on the final geometry so the
+    # engine's "clean" and the gate's "clean" agree exactly. Anchored-ref
+    # intrusions are the gate's report — the engine may not move them
+    # (REQ-KAVOID-002).
+    if keepout_filter is not None:
+        by_ref_all = {p["ref"]: p for p in parts}
+        pos_all = dict(plan)
+        pos_all.update(anchors)
+        courtyards: dict[str, dict[str, float]] = {}
+        for ref, pos in pos_all.items():
+            rec = by_ref_all.get(ref)
+            if rec is None:
+                continue
+            box = _board_box(rec, (pos[0], pos[1]), pos[2])
+            courtyards[ref] = {
+                "xmin": box[0], "ymin": box[1], "xmax": box[2], "ymax": box[3],
+            }
+        for v in find_keepout_intrusions(
+            courtyards, keepout_filter.sides, keepout_filter.materialize(pos_all),
+        ):
+            if v["reference"] in anchors:
+                continue
+            warnings.append({
+                "type": "keepout_unresolved",
+                "ref": v["reference"],
+                "keepout_origin": v["keepout_origin"],
+                "reason": "no keep-out-free position found inside the board area",
+            })
     return PlacementPlan(
         plan=plan,
         roles=roles,
@@ -1869,6 +2142,8 @@ def compute_net_aware_plan(
     clearance: float,
     anchors: list[str] | None = None,
     diff_pair_nets: frozenset[str] = frozenset(),
+    keepouts: tuple[KeepoutArea, ...] = (),
+    part_sides: dict[str, str] | None = None,
 ) -> tuple[list[tuple[str, float, float, float]], list[dict[str, object]], float]:
     """Plan a net-aware layout for a board area; backend-agnostic apply contract.
 
@@ -1876,7 +2151,9 @@ def compute_net_aware_plan(
     list of ``(ref, x, y, rot)`` to apply (non-anchor refs only), so any backend
     can apply it through its own ``move_component``. The usable region is inset by
     ``clearance`` on every side (row-packer parity). ``diff_pair_nets`` comes from
-    :func:`read_diff_pair_nets` on the caller's board path (REQ-SENSE-002).
+    :func:`read_diff_pair_nets` on the caller's board path (REQ-SENSE-002);
+    ``keepouts``/``part_sides`` from :func:`read_board_keepouts` (K2,
+    REQ-KAVOID-001).
     """
     by_ref = {p["ref"]: p for p in parts}
     anchor_set = set(anchors or [])
@@ -1890,6 +2167,7 @@ def compute_net_aware_plan(
     res = plan_placement(
         parts, board_rect, clearance, anchors=anchor_pos,
         diff_pair_nets=diff_pair_nets,
+        keepouts=keepouts, part_sides=part_sides,
     )
     plan = res["plan"]
     items = [

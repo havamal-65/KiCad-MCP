@@ -1612,10 +1612,12 @@ class FileBoardOps(BoardOps):
         from kicad_mcp.utils import placement_engine as engine
 
         parts = build_engine_parts(path, self._project_dir)
+        keepouts, part_sides = engine.read_board_keepouts(path)
         items, warnings, total_area = engine.compute_net_aware_plan(
             parts, board_x, board_y, board_width, board_height,
             clearance_mm, anchors,
             diff_pair_nets=engine.read_diff_pair_nets(path),
+            keepouts=keepouts, part_sides=part_sides,
         )
         if not parts:
             return {

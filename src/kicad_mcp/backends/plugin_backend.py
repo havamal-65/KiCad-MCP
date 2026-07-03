@@ -337,10 +337,12 @@ class PluginBoardOps(BoardOps):
                 "placements": [], "warnings": [], "strategy": "net_aware",
             }
 
+        keepouts, part_sides = engine.read_board_keepouts(path)
         items, warnings, total_area = engine.compute_net_aware_plan(
             parts, board_x, board_y, board_width, board_height,
             clearance_mm, anchors,
             diff_pair_nets=engine.read_diff_pair_nets(path),
+            keepouts=keepouts, part_sides=part_sides,
         )
         placements: list[dict[str, Any]] = []
         applied_warnings: list[Any] = list(warnings)

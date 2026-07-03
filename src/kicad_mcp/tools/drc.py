@@ -1277,6 +1277,10 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
 
     - ``overlap_count > 0`` and ``out_of_outline_count > 0`` are **blocking**
       violations — placement must never proceed to routing with either.
+    - A footprint courtyard intersecting a keep-out area that forbids
+      footprints is a **blocking** ``keepout_intrusion`` violation (K1,
+      REQ-KGATE-001): layer-aware, self-exempt for the keep-out's own
+      embedded footprint, true polygon geometry.
     - Total HPWL over ``GATE_HPWL_MAX_MM`` (when set; default ``None`` = no
       ceiling) and decap distance over ``GATE_DECAP_MAX_MM`` are **advisory**
       violations: reported, but the gate still passes unless
@@ -1291,6 +1295,7 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
         ``{"passed": bool, "placement_metric": {...}, "violations": [...],
         "required_actions": [...]}``.
     """
+    from kicad_mcp.utils.keepout import find_keepout_intrusions, scan_board
     from kicad_mcp.utils.placement_config import (
         get_bool,
         get_float,
@@ -1329,6 +1334,21 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
             "Move the out-of-outline footprints inside the board outline (or "
             "enlarge the outline), then re-run validate_placement_quality."
         )
+
+    # Keep-out intrusion (K1, REQ-KGATE-001…003): blocking, same tier as
+    # courtyard_overlap. Boards without keep-out areas skip this entirely so
+    # their gate output is unchanged (REQ-KGATE-006).
+    board_text = pcb_path.read_text(encoding="utf-8")
+    keepouts, fp_sides, _keepout_warnings = scan_board(board_text)
+    if any(area.forbids_footprints for area in keepouts):
+        placed_courtyards, _no_cyd = _parse_placed_courtyards(board_text)
+        for kv in find_keepout_intrusions(placed_courtyards, fp_sides, keepouts):
+            violations.append(kv)
+            required_actions.append(
+                f"Move {kv['reference']} out of the keep-out area "
+                f"({kv['keepout_origin']}) with move_component, or re-run "
+                "auto_place; then re-run validate_placement_quality."
+            )
 
     hpwl_budget = get_float_or_none("GATE_HPWL_MAX_MM")
     total_hpwl = float(metric.get("total_hpwl_mm") or 0.0)

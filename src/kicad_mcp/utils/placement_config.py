@@ -171,6 +171,21 @@ GATE_PROMOTE_ADVISORY: bool = False
 
 
 # ---------------------------------------------------------------------------
+# Keep-out gate geometry (K1 — REQ-KGEOM-003/004)
+# ---------------------------------------------------------------------------
+
+#: Maximum chord deviation (mm) when flattening an ``(arc …)`` segment in a
+#: keep-out zone outline to a polyline — sagitta-bounded subdivision mirroring
+#: KiCad's own arc discretization (REQ-KGEOM-004; no chord shortcut, HLRP C6).
+ARC_MAX_DEVIATION_MM: float = 0.01
+
+#: Tolerance (mm) for the keep-out intrusion test's positive-area semantics: the
+#: courtyard rect is contracted by this amount per side before testing, so a
+#: boundary that exactly touches a keep-out never flags (REQ-KGEOM-003).
+KEEPOUT_EDGE_TOL_MM: float = 1e-6
+
+
+# ---------------------------------------------------------------------------
 # Override hook (REQ-CFG-002)
 # ---------------------------------------------------------------------------
 
@@ -194,6 +209,8 @@ _OVERRIDABLE: frozenset[str] = frozenset({
     "GATE_HPWL_MAX_MM",
     "GATE_DECAP_MAX_MM",
     "GATE_PROMOTE_ADVISORY",
+    "ARC_MAX_DEVIATION_MM",
+    "KEEPOUT_EDGE_TOL_MM",
 })
 
 

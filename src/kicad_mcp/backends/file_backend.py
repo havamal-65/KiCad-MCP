@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -340,6 +342,77 @@ def _add_uuids_to_fp_elements(inner: str) -> str:
     return "".join(result)
 
 
+def _fmt_mm(value: float) -> str:
+    """Format a board coordinate the way KiCad writes them (≤6 decimals, no
+    trailing zeros)."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
+
+
+def _zone_local_to_board(
+    x: float, y: float, origin_x: float, origin_y: float, rotation_deg: float,
+) -> tuple[float, float]:
+    """Footprint-local point → board-absolute, using the same rotation
+    convention as ``_parse_placed_courtyards`` (live-verified in P4)."""
+    if rotation_deg:
+        rad = math.radians(rotation_deg)
+        cos_r, sin_r = math.cos(rad), math.sin(rad)
+        x, y = x * cos_r - y * sin_r, x * sin_r + y * cos_r
+    return x + origin_x, y + origin_y
+
+
+def _transform_zone_points(
+    footprint_body: str, transform: Callable[[float, float], tuple[float, float]],
+) -> str:
+    """Rewrite every zone outline coordinate inside *footprint_body*.
+
+    Zone polygon points are stored **board-absolute** in a ``.kicad_pcb``
+    while a ``.kicad_mod`` stores them footprint-local, so embedding or moving
+    a footprint must transform them (REQ-KWRITE-001/-002). Only coordinates
+    inside ``(polygon …)`` / ``(filled_polygon …)`` blocks of ``(zone …)``
+    sub-blocks are touched — pads and fp_* graphics really are local and stay
+    as written.
+    """
+    xy_pat = re.compile(r"\((xy|start|mid|end)\s+([-\d.]+)\s+([-\d.]+)\)")
+    poly_pat = re.compile(r"\((?:filled_)?polygon[\s(]")
+    zone_pat = re.compile(r"\(zone[\s(]")
+
+    def _sub(m: re.Match[str]) -> str:
+        nx, ny = transform(float(m.group(2)), float(m.group(3)))
+        return f"({m.group(1)} {_fmt_mm(nx)} {_fmt_mm(ny)})"
+
+    def _rewrite_zone(zone_block: str) -> str:
+        parts: list[str] = []
+        pos = 0
+        while True:
+            m = poly_pat.search(zone_block, pos)
+            if m is None:
+                parts.append(zone_block[pos:])
+                return "".join(parts)
+            end = _walk_balanced_parens(zone_block, m.start())
+            if end is None:
+                parts.append(zone_block[pos:])
+                return "".join(parts)
+            parts.append(zone_block[pos:m.start()])
+            parts.append(xy_pat.sub(_sub, zone_block[m.start():end + 1]))
+            pos = end + 1
+
+    parts: list[str] = []
+    pos = 0
+    while True:
+        m = zone_pat.search(footprint_body, pos)
+        if m is None:
+            parts.append(footprint_body[pos:])
+            return "".join(parts)
+        end = _walk_balanced_parens(footprint_body, m.start())
+        if end is None:
+            parts.append(footprint_body[pos:])
+            return "".join(parts)
+        parts.append(footprint_body[pos:m.start()])
+        parts.append(_rewrite_zone(footprint_body[m.start():end + 1]))
+        pos = end + 1
+
+
 def _embed_kicad_mod_as_pcb_footprint(
     kicad_mod: str,
     lib_id: str,
@@ -385,6 +458,15 @@ def _embed_kicad_mod_as_pcb_footprint(
 
     # Inject UUIDs into sub-elements
     inner = _add_uuids_to_fp_elements(inner)
+
+    # Embedded zone outlines are footprint-local in a .kicad_mod but must be
+    # board-absolute in a .kicad_pcb (REQ-KWRITE-001) — transform them by the
+    # placement position + rotation.
+    if "(zone" in inner:
+        inner = _transform_zone_points(
+            inner,
+            lambda zx, zy: _zone_local_to_board(zx, zy, x, y, rotation),
+        )
 
     # Build the final block with PCB-level at/layer/uuid header
     rot_clause = f" {rotation}" if rotation else ""
@@ -712,12 +794,28 @@ class FileBoardOps(BoardOps):
         if at_match is None:
             raise ValueError(f"Footprint '{reference}' has no (at ...) clause")
 
+        old_x = float(at_match.group(1))
+        old_y = float(at_match.group(2))
         old_rot = float(at_match.group(3)) if at_match.group(3) else 0.0
         new_rot = rotation if rotation is not None else old_rot
 
         rot_clause = f" {new_rot}" if new_rot else ""
         new_at = f"(at {x} {y}{rot_clause})"
         new_block = block[:at_match.start()] + new_at + block[at_match.end():]
+
+        # Embedded zone outlines are stored board-absolute, so they do not
+        # follow the (at …) rewrite — re-transform them through the footprint's
+        # local frame to the new placement (REQ-KWRITE-002).
+        if re.search(r"\(zone[\s(]", new_block):
+            def _retransform(px: float, py: float) -> tuple[float, float]:
+                lx, ly = px - old_x, py - old_y
+                if old_rot:
+                    rad = math.radians(-old_rot)
+                    cos_r, sin_r = math.cos(rad), math.sin(rad)
+                    lx, ly = lx * cos_r - ly * sin_r, lx * sin_r + ly * cos_r
+                return _zone_local_to_board(lx, ly, x, y, new_rot)
+
+            new_block = _transform_zone_points(new_block, _retransform)
 
         content = content[:start] + new_block + content[end + 1:]
         path.write_text(content, encoding="utf-8")

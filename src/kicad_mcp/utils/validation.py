@@ -11,10 +11,13 @@ from kicad_mcp.models.errors import (
     InvalidReferenceError,
 )
 
-# Reference designator pattern: one or more letters followed by one or more digits
-# Supports multi-unit like U3A, U3B
-# Also supports KiCad power/flag symbols prefixed with #, e.g. #PWR001, #FLG02
-REFERENCE_PATTERN = re.compile(r"^#?[A-Za-z]+\d+[A-Za-z]?$")
+# Reference designator pattern: starts with a letter (optionally prefixed with
+# # for power/flag symbols, e.g. #PWR001, #FLG02), contains at least one digit,
+# and is made of word characters. KiCad itself permits underscores and mixed
+# segments — e.g. T14_R1 (test-suite boards) or multi-unit U3A — which the old
+# letters+digits-only pattern wrongly rejected (found live 2026-07-02: the K1
+# AC8 batch could not move_component the scratch board's own refs).
+REFERENCE_PATTERN = re.compile(r"^#?[A-Za-z][A-Za-z0-9_]*\d[A-Za-z0-9_]*$")
 
 # Net name: alphanumeric, underscores, hyphens, slashes, dots, plus signs
 # Allows hierarchical nets like /sheet1/VCC and differential pairs like USB_D+

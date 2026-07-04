@@ -42,6 +42,7 @@ Thumbs.db
 
 # Never push — internal dev notes and machine-local config
 LESSONS_LEARNED.md
+MCP-KNOWN-ISSUES.md
 CLAUDE.md
 **/CLAUDE.md
 .claude/

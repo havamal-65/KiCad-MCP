@@ -224,7 +224,12 @@ def test_determinism(tmp_path: Path) -> None:
 
 
 def test_pad_board_frame_rotation(tmp_path: Path) -> None:
-    """A footprint at (20,20,90) with a pad at local (5,0) -> board (20,25)."""
+    """A footprint at (20,20,90) with a pad at local (5,0) -> board (20,15).
+
+    KiCad rotation is CCW on screen = CW in y-down file coordinates:
+    (x,y) -> (x*c + y*s, -x*s + y*c) — verified against pcbnew-written pads
+    (tests/test_rotation_convention.py).
+    """
     fps = [
         _footprint("LibA:U", "U1", (20.0, 20.0, 90.0), [("1", 5.0, 0.0, 1, "SIG")]),
         _footprint("LibA:U", "U2", (40.0, 20.0, 0.0), [("1", 0.0, 0.0, 1, "SIG")]),
@@ -233,7 +238,7 @@ def test_pad_board_frame_rotation(tmp_path: Path) -> None:
     pads = read_board_pads(p.read_text("utf-8"))
     u1 = next(pd for pd in pads if pd["ref"] == "U1")
     assert math.isclose(u1["x_mm"], 20.0, abs_tol=1e-6)
-    assert math.isclose(u1["y_mm"], 25.0, abs_tol=1e-6)
+    assert math.isclose(u1["y_mm"], 15.0, abs_tol=1e-6)
 
 
 def test_no_outline_reports_null(tmp_path: Path) -> None:

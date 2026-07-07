@@ -224,11 +224,13 @@ def test_transform_untransform_roundtrip(rot: float) -> None:
 
 
 def test_transform_matches_kwrite_convention() -> None:
-    # (3, 0) rotated 90° must land at (0, 3) relative to the origin — the
-    # _parse_placed_courtyards / KWRITE convention (live-verified in P4/K1).
+    # (3, 0) rotated 90° must land at (0, -3) relative to the origin — the
+    # KiCad convention (positive rotation = CCW on screen = CW in y-down
+    # file coords), verified against pcbnew-written geometry
+    # (tests/test_rotation_convention.py).
     (px, py), = transform_polygon(((3.0, 0.0),), 10.0, 20.0, 90.0)
     assert math.isclose(px, 10.0, abs_tol=1e-9)
-    assert math.isclose(py, 23.0, abs_tol=1e-9)
+    assert math.isclose(py, 17.0, abs_tol=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -501,9 +503,10 @@ def test_improve_never_steps_into_keepout() -> None:
 
 
 def test_orientation_flip_never_swings_into_keepout() -> None:
-    # Rotating R1 to 270° strictly reduces HPWL, but the rotated courtyard
-    # (tall) would clip the zone at y 5–8: the flip is rejected with the
-    # filter, taken without it.
+    # Rotating R1 to 90° strictly reduces HPWL (pad 1 at local (3,0) swings to
+    # board (10,7), toward J1's pad at (10,2) under the KiCad convention), but
+    # the rotated courtyard (tall) would clip the zone at y 5–8: the flip is
+    # rejected with the filter, taken without it.
     parts = [
         _rec("J1", pos=(10.0, 2.0, 0.0), pads=[("1", 1, "S", 0.0, 0.0)]),
         _rec("R1", courtyard=(-4.0, -1.0, 4.0, 1.0),
@@ -517,7 +520,7 @@ def test_orientation_flip_never_swings_into_keepout() -> None:
     bare, _ = normalize_orientations(
         parts, dict(plan), roles, anchors, (0.0, 0.0, 30.0, 30.0),
     )
-    assert bare["R1"][2] == 270.0
+    assert bare["R1"][2] == 90.0
     held, _ = normalize_orientations(
         parts, dict(plan), roles, anchors, (0.0, 0.0, 30.0, 30.0),
         keepout_filter=kf,

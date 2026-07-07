@@ -73,6 +73,12 @@ class KiCadMCPConfig(BaseSettings):
         default=None,
         description="Path to FreeRouting JAR file for auto-routing",
     )
+    freerouting_timeout_seconds: int = Field(
+        default=300,
+        description="Wall-clock limit for one FreeRouting run before it is "
+                    "killed. Denser boards legitimately need minutes; "
+                    "override via KICAD_MCP_FREEROUTING_TIMEOUT_SECONDS.",
+    )
     java_path: Optional[Path] = Field(
         default=None,
         description="Path to java executable for running FreeRouting",

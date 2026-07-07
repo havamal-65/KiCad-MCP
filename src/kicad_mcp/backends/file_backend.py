@@ -352,12 +352,14 @@ def _fmt_mm(value: float) -> str:
 def _zone_local_to_board(
     x: float, y: float, origin_x: float, origin_y: float, rotation_deg: float,
 ) -> tuple[float, float]:
-    """Footprint-local point → board-absolute, using the same rotation
-    convention as ``_parse_placed_courtyards`` (live-verified in P4)."""
+    """Footprint-local point → board-absolute. KiCad convention: positive
+    rotation is CCW on screen = CW in y-down file coordinates, so
+    (x,y) → (x·c + y·s, −x·s + y·c) — the same transform pcbnew applies to
+    pads and zone outlines (tests/test_rotation_convention.py)."""
     if rotation_deg:
         rad = math.radians(rotation_deg)
         cos_r, sin_r = math.cos(rad), math.sin(rad)
-        x, y = x * cos_r - y * sin_r, x * sin_r + y * cos_r
+        x, y = x * cos_r + y * sin_r, -x * sin_r + y * cos_r
     return x + origin_x, y + origin_y
 
 
@@ -808,9 +810,12 @@ class FileBoardOps(BoardOps):
         # local frame to the new placement (REQ-KWRITE-002).
         if re.search(r"\(zone[\s(]", new_block):
             def _retransform(px: float, py: float) -> tuple[float, float]:
+                # Board → old local frame: inverse of _zone_local_to_board,
+                # i.e. rotate the origin-relative offset by the matrix
+                # [[c, -s], [s, c]] for the OLD rotation.
                 lx, ly = px - old_x, py - old_y
                 if old_rot:
-                    rad = math.radians(-old_rot)
+                    rad = math.radians(old_rot)
                     cos_r, sin_r = math.cos(rad), math.sin(rad)
                     lx, ly = lx * cos_r - ly * sin_r, lx * sin_r + ly * cos_r
                 return _zone_local_to_board(lx, ly, x, y, new_rot)

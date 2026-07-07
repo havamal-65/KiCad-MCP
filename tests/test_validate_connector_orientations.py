@@ -124,11 +124,13 @@ def test_connector_facing_inward_fails(tmp_path: Path):
 @pytest.mark.parametrize(
     "edge_label,at_x,at_y,rotation,local_face_xy,should_pass",
     [
-        # All four edges, connector facing outward → all should pass
+        # All four edges, connector facing outward → all should pass.
+        # KiCad rotation by theta maps local +y (file angle 90°) to the
+        # board-frame angle (90 - theta)°.
         ("south", 40.0, 67.0, 0,   (0.0, 3.65),  True),
         ("north", 40.0, 3.0,  180, (0.0, 3.65),  True),   # 180° → board -y, north outward = -y
-        ("east",  77.0, 35.0, 270, (0.0, 3.65),  True),   # 270° rotates +y→+x, east outward = +x
-        ("west",  3.0,  35.0, 90,  (0.0, 3.65),  True),   # 90° rotates +y→-x, west outward = -x
+        ("east",  77.0, 35.0, 90,  (0.0, 3.65),  True),   # 90° rotates +y→+x, east outward = +x
+        ("west",  3.0,  35.0, 270, (0.0, 3.65),  True),   # 270° rotates +y→-x, west outward = -x
     ],
 )
 def test_all_four_edges_outward(tmp_path: Path, edge_label, at_x, at_y, rotation, local_face_xy, should_pass):

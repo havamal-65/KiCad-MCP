@@ -347,16 +347,18 @@ def _impl_run_freerouter(
             "message": f"Failed to run FreeRouting: {e}",
         })
 
+    timeout_s = config.freerouting_timeout_seconds
     try:
-        stdout_bytes, stderr_bytes = proc.communicate(timeout=85)
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
         return json.dumps({
             "status": "error",
             "message": (
-                f"FreeRouting timed out after 85 seconds (max_passes={max_passes}). "
-                "Try a lower max_passes value."
+                f"FreeRouting timed out after {timeout_s} seconds "
+                f"(max_passes={max_passes}). Raise "
+                "KICAD_MCP_FREEROUTING_TIMEOUT_SECONDS or lower max_passes."
             ),
         })
 

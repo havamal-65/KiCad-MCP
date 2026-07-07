@@ -425,11 +425,13 @@ def _iso_res(ref: str, x: float, rot: float) -> PartRecord:
 def _vertical_res(ref: str, rot: float) -> tuple[
     list[PartRecord], dict[str, tuple[float, float, float]],
 ]:
-    """A resistor whose two nets pull vertically: rot=90 is strictly lower HPWL.
+    """A resistor whose two nets pull vertically: rot=270 is strictly lower HPWL.
 
     Returns ``([r], anchors)`` — two connector anchors above/below hold the far
     ends of the resistor's two signal nets, so a horizontal (rot 0) placement is
-    longer than a vertical (rot 90) one.
+    longer than a vertical one. Under the KiCad convention (positive rotation =
+    CW in y-down file coords) pad 1 at local (-0.5, 0) swings toward the NA
+    anchor above only at rot 270; rot 90 inverts the polarity and ties with 0.
     """
     r = _part(
         ref, _RES_LIB,
@@ -473,24 +475,24 @@ def test_orientation_rotation_for_hpwl() -> None:
     h_before = e._total_hpwl_of(parts, plan, anchors)
     new_plan, _w = e.normalize_orientations(parts, plan, roles, anchors, board)
 
-    assert new_plan["R7"][2] == 90.0  # rotated to the low-HPWL orientation
+    assert new_plan["R7"][2] == 270.0  # rotated to the low-HPWL orientation
     assert e._total_hpwl_of(parts, new_plan, anchors) < h_before
 
 
 def test_orientation_never_worse_rejects_snap() -> None:
     """A snap to the family mode that would raise HPWL is rejected (REQ-ORIENT-004
     never-worse): the HPWL-optimal off-modal member keeps its rotation."""
-    vparts, anchors = _vertical_res("R3", 90.0)   # R3 optimal at 90
+    vparts, anchors = _vertical_res("R3", 270.0)   # R3 optimal at 270
     parts = [_iso_res("R1", 10.0, 0.0), _iso_res("R2", 20.0, 0.0)] + vparts
     plan = {"R1": (10.0, 10.0, 0.0), "R2": (20.0, 10.0, 0.0),
-            "R3": (50.0, 20.0, 90.0)}
+            "R3": (50.0, 20.0, 270.0)}
     roles = e.classify_parts(parts)
     board = (0.0, 0.0, 100.0, 50.0)
 
     new_plan, _w = e.normalize_orientations(parts, plan, roles, anchors, board)
 
-    # modal is 0 (R1,R2) but snapping R3 to 0 raises HPWL → R3 stays at 90.
-    assert new_plan["R3"][2] == 90.0
+    # modal is 0 (R1,R2) but snapping R3 to 0 raises HPWL → R3 stays at 270.
+    assert new_plan["R3"][2] == 270.0
     assert new_plan["R1"][2] == 0.0 and new_plan["R2"][2] == 0.0
 
 

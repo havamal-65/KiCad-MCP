@@ -143,10 +143,13 @@ def _parse_footprints(content: str) -> list[_Footprint]:
             py = float(at_pm.group(2)) if at_pm else 0.0
 
             # Board-frame pad centre: footprint origin + footprint-rotated pad
-            # offset (spec-p1 §3.2; same rotation as drc.py:470-476). The pad's
-            # own rotation rotates the pad shape only, not its centre offset.
-            x_mm = fx + (px * cos_r - py * sin_r)
-            y_mm = fy + (px * sin_r + py * cos_r)
+            # offset. KiCad convention: positive rotation is CCW on screen =
+            # CW in file coords (y down), so (x,y) -> (x*c + y*s, -x*s + y*c).
+            # Verified against pcbnew-written pads at rot 90 (aqs_v2 J1.A12;
+            # tests/test_rotation_convention.py). The pad's own rotation
+            # rotates the pad shape only, not its centre offset.
+            x_mm = fx + (px * cos_r + py * sin_r)
+            y_mm = fy + (-px * sin_r + py * cos_r)
 
             pads.append(PadRecord(
                 ref=ref,

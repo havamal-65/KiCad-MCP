@@ -468,11 +468,14 @@ def _parse_placed_courtyards(
 
             if cyd_xs and cyd_ys:
                 if abs(rotation_deg) > 0.01:
+                    # KiCad convention: (x,y) -> (x*c + y*s, -x*s + y*c)
+                    # (positive rotation = CCW on screen = CW in y-down file
+                    # coords; see tests/test_rotation_convention.py).
                     rad = _math.radians(rotation_deg)
                     cos_r, sin_r = _math.cos(rad), _math.sin(rad)
                     cyd_xs, cyd_ys = (
-                        [x * cos_r - y * sin_r for x, y in zip(cyd_xs, cyd_ys)],
-                        [x * sin_r + y * cos_r for x, y in zip(cyd_xs, cyd_ys)],
+                        [x * cos_r + y * sin_r for x, y in zip(cyd_xs, cyd_ys)],
+                        [-x * sin_r + y * cos_r for x, y in zip(cyd_xs, cyd_ys)],
                     )
                 courtyards[ref] = {
                     "xmin": origin_x + min(cyd_xs),
@@ -877,12 +880,18 @@ _ORIENTATION_TOLERANCE_DEG: float = 30.0
 
 
 def _rotate_vec(vx: float, vy: float, deg: float) -> tuple[float, float]:
+    """Rotate a local-frame vector into the board frame by a footprint rotation.
+
+    KiCad convention: positive rotation is CCW on screen = CW in y-down file
+    coordinates, so (x,y) -> (x*c + y*s, -x*s + y*c). Verified against
+    pcbnew-written pad positions (tests/test_rotation_convention.py).
+    """
     import math as _math
 
     rad = _math.radians(deg)
     cos_r = _math.cos(rad)
     sin_r = _math.sin(rad)
-    return (vx * cos_r - vy * sin_r, vx * sin_r + vy * cos_r)
+    return (vx * cos_r + vy * sin_r, -vx * sin_r + vy * cos_r)
 
 
 def _vec_to_face(vx: float, vy: float) -> str:
@@ -996,7 +1005,9 @@ def _suggested_rotation_for_edge(local_face: str, edge: str) -> float:
     outward = _EDGE_OUTWARD_FACE[edge]
     ox, oy = _FACE_VECTORS[outward]
     outward_angle = _angle_deg(ox, oy)
-    required = (outward_angle - local_angle) % 360.0
+    # KiCad rotation by theta maps a vector's file-frame angle to
+    # (angle - theta), so solve local_angle - required == outward_angle.
+    required = (local_angle - outward_angle) % 360.0
     # Normalize to the nearest 90° step — KiCad footprint rotations are typically cardinal.
     snapped = round(required / 90.0) * 90.0 % 360.0
     return float(snapped)

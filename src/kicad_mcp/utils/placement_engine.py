@@ -729,11 +729,14 @@ def _courtyard_area(p: PartRecord) -> float:
 
 
 def _rotate(dx: float, dy: float, rot_deg: float) -> tuple[float, float]:
+    """Local -> board rotation, KiCad convention: (x,y) -> (x*c + y*s, -x*s + y*c)
+    (positive rotation = CCW on screen = CW in y-down file coordinates;
+    see tests/test_rotation_convention.py)."""
     if rot_deg == 0.0:
         return (dx, dy)
     rad = math.radians(rot_deg)
     c, s = math.cos(rad), math.sin(rad)
-    return (dx * c - dy * s, dx * s + dy * c)
+    return (dx * c + dy * s, -dx * s + dy * c)
 
 
 def _board_box(

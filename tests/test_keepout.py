@@ -445,9 +445,12 @@ _LOCAL_ZONE = [(-3.0, 4.0), (3.0, 4.0), (3.0, 8.0), (-3.0, 8.0)]
 
 
 def _rot(p: tuple[float, float], deg: float) -> tuple[float, float]:
+    # KiCad convention: positive rotation = CCW on screen = CW in y-down file
+    # coords, (x,y) -> (x*c + y*s, -x*s + y*c). Matches pcbnew-written
+    # geometry (tests/test_rotation_convention.py).
     rad = math.radians(deg)
     c, s = math.cos(rad), math.sin(rad)
-    return (p[0] * c - p[1] * s, p[0] * s + p[1] * c)
+    return (p[0] * c + p[1] * s, -p[0] * s + p[1] * c)
 
 
 def _expected_zone(x: float, y: float, deg: float) -> set[tuple[float, float]]:

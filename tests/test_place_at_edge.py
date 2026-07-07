@@ -140,10 +140,12 @@ def test_place_at_each_edge_passes_validation(tmp_path: Path, edge):
 
 
 @pytest.mark.parametrize("edge,expected_rotation", [
-    ("south", 0.0),    # local +y outward at south → no rotation
-    ("north", 180.0),  # local +y outward at north → flip 180
-    ("east", 270.0),   # local +y outward at east → rotate -90 (270)
-    ("west", 90.0),    # local +y outward at west → rotate +90
+    # KiCad rotation by theta maps a local vector's file-frame angle to
+    # (angle - theta): local +y (file angle 90°) needs theta = (90 - outward)°.
+    ("south", 0.0),    # outward +y (90°)  → theta 0
+    ("north", 180.0),  # outward -y (270°) → theta 180
+    ("east", 90.0),    # outward +x (0°)   → theta 90
+    ("west", 270.0),   # outward -x (180°) → theta 270
 ])
 def test_correct_rotation_for_each_edge(tmp_path: Path, edge, expected_rotation):
     board = _write(tmp_path, f"rot_{edge}.kicad_pcb", _board(

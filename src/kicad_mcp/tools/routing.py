@@ -292,14 +292,15 @@ def _impl_run_freerouter(
                        "KICAD_MCP_JAVA_PATH environment variable.",
         })
 
-    # Resolve FreeRouting JAR
+    # Resolve FreeRouting JAR (Java-compatible: never pick a JAR newer than the runtime)
     jar = None
     if freerouting_jar:
         jar = Path(freerouting_jar)
     elif config.freerouting_jar:
         jar = config.freerouting_jar
     else:
-        jar = find_freerouting_jar()
+        from kicad_mcp.utils.platform_helper import detect_java_major_version
+        jar = find_freerouting_jar(detect_java_major_version(java))
 
     # Auto-download if not found
     if jar is None or not jar.exists():
@@ -760,7 +761,7 @@ def register_tools(
     def run_freerouter(
         dsn_path: str,
         output: str = "",
-        max_passes: int = 100,
+        max_passes: int = 10,
         freerouting_jar: str = "",
         java_path: str = "",
     ) -> str:
@@ -773,7 +774,12 @@ def register_tools(
         Args:
             dsn_path: Path to input .dsn file.
             output: Output .ses file path. Defaults to same directory as DSN.
-            max_passes: Maximum routing passes (default 100).
+            max_passes: Maximum optimization passes (default 10). Measured on
+                v1.9.0/aqs_v2: routing quality (vias, track length) converges by
+                ~8 passes and does not improve beyond; <5 passes can leave nets
+                unrouted. NOTE: behavior is FreeRouting-version-dependent — v2.x
+                can stall in optimization at higher pass counts (see issue #21/#22);
+                on a stall, lower this value.
             freerouting_jar: Path to freerouting JAR. Auto-detected if empty.
             java_path: Path to java executable. Auto-detected if empty.
 
@@ -850,8 +856,9 @@ def register_tools(
             path: Path to .kicad_pcb file.
             freerouting_jar: Path to freerouting JAR. Auto-detected if empty.
             java_path: Path to java executable. Auto-detected if empty.
-            max_passes: Maximum routing passes (default 10). Increase for more
-                complete routing at the cost of longer runtime.
+            max_passes: Maximum optimization passes (default 10). On v1.9.0,
+                quality converges by ~8 passes; more only costs time. On v2.x,
+                high pass counts can stall (see #21/#22) — lower on a stall.
             clean_board: Remove keepouts and bad tracks first (default true).
 
         Returns:

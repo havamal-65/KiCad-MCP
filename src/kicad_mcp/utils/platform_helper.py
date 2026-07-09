@@ -567,13 +567,34 @@ def find_java() -> Path | None:
     return None
 
 
-def find_freerouting_jar() -> Path | None:
+def _freerouting_min_java(jar_name: str) -> int:
+    """Minimum Java major version a FreeRouting JAR requires, by release lineage.
+
+    v2.2.0+ are compiled for Java 25; v2.0–2.1 need Java 21; v1.x run on Java 17+.
+    """
+    import re
+
+    m = re.search(r"freerouting-(\d+)\.(\d+)", jar_name)
+    if not m:
+        return 17
+    major, minor = int(m.group(1)), int(m.group(2))
+    if major >= 2 and minor >= 2:
+        return 25
+    if major >= 2:
+        return 21
+    return 17
+
+
+def find_freerouting_jar(java_version: int | None = None) -> Path | None:
     """Find a FreeRouting JAR file on this system.
 
     Checks ~/.kicad-mcp/freerouting/ first, then common KiCad plugin directories.
+    When ``java_version`` is given, JARs whose required Java exceeds it are skipped,
+    so a JAR newer than the runtime (e.g. v2.2.4 needs Java 25) is never chosen over a
+    compatible older one — preventing an UnsupportedClassVersionError at route time.
 
     Returns:
-        Path to freerouting JAR if found, None otherwise.
+        Path to the highest-version *compatible* freerouting JAR, or None.
     """
     search_dirs: list[Path] = []
 
@@ -611,11 +632,20 @@ def find_freerouting_jar() -> Path | None:
     for search_dir in search_dirs:
         if not search_dir.exists():
             continue
-        # Find JAR files matching freerouting pattern
+        # Highest-version JAR first; skip any needing a newer Java than we have.
         jars = sorted(search_dir.glob("freerouting*.jar"), reverse=True)
+        for jar in jars:
+            if java_version is None or _freerouting_min_java(jar.name) <= java_version:
+                logger.debug(
+                    "Found FreeRouting JAR: %s (min Java %d, have %s)",
+                    jar, _freerouting_min_java(jar.name), java_version,
+                )
+                return jar
         if jars:
-            logger.debug("Found FreeRouting JAR: %s", jars[0])
-            return jars[0]
+            logger.warning(
+                "FreeRouting JAR(s) in %s all require newer Java than %s; skipping dir",
+                search_dir, java_version,
+            )
 
     logger.debug("FreeRouting JAR not found on this system")
     return None
@@ -677,12 +707,19 @@ def download_freerouting(target_dir: Path | None = None) -> Path | None:
     java = find_java()
     java_version = detect_java_major_version(java) if java else None
 
-    if java_version and java_version >= 21:
-        # v2.1.0 requires Java 21+
+    if java_version and java_version >= 25:
+        # v2.2.4 restores the board-hash stagnation check (fixes the #21 optimization
+        # stall) but is compiled for Java 25. Best quality when tuned (see #21/#22).
+        jar_name = "freerouting-2.2.4.jar"
+        url = "https://github.com/freerouting/freerouting/releases/download/v2.2.4/freerouting-2.2.4.jar"
+    elif java_version and java_version >= 21:
+        # v2.1.0 runs on Java 21-24 but its optimizer is weaker (more vias) and it
+        # predates the stagnation fix; prefer Java 25 + v2.2.4 where possible.
         jar_name = "freerouting-2.1.0.jar"
         url = "https://github.com/freerouting/freerouting/releases/download/v2.1.0/freerouting-2.1.0.jar"
     else:
-        # v1.9.0 is the last version compatible with Java 17-20
+        # v1.9.0 is the last version compatible with Java 17-20 (and has the
+        # stagnation check + strong via reduction — a good fallback).
         jar_name = "freerouting-1.9.0.jar"
         url = "https://github.com/freerouting/freerouting/releases/download/v1.9.0/freerouting-1.9.0.jar"
 

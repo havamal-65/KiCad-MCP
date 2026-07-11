@@ -18,12 +18,19 @@ def _run(**overrides):
       bridge_error   (Exception|None)       — if set, _tcp_call raises this
       active_board   (str, default "/board.kicad_pcb")
       cli_path       (str|None, default "/usr/bin/kicad-cli")
+      ipc_reachable  (bool, default False) — IPC API server answers ping
+      ipc_board      (str|None, default None) — board name over IPC; "" means a
+                     document exists but is still loading; None means no board
+      ipc_enabled    (bool, default True)  — KICAD_MCP_IPC_ENABLED state
     """
     kicad_running = overrides.get("kicad_running", True)
     bridge_pong = overrides.get("bridge_pong", True)
     bridge_error = overrides.get("bridge_error", None)
     active_board = overrides.get("active_board", "/board.kicad_pcb")
     cli_path = overrides.get("cli_path", "/usr/bin/kicad-cli")
+    ipc_reachable = overrides.get("ipc_reachable", False)
+    ipc_board = overrides.get("ipc_board", None)
+    ipc_on = overrides.get("ipc_enabled", True)
 
     def fake_tcp_call(method: str, timeout: float, **kwargs):
         if bridge_error:
@@ -36,12 +43,27 @@ def _run(**overrides):
             return {"board_path": active_board}
         return {}
 
+    class FakeIPCConn:
+        def ping(self):
+            return ipc_reachable
+
+        def board(self):
+            if ipc_board is None:
+                from kicad_mcp.backends.ipc_connection import IPCUnavailableError
+                raise IPCUnavailableError("no PCB document is open")
+            import types
+            return types.SimpleNamespace(name=ipc_board)
+
     with patch("kicad_mcp.utils.platform_helper.is_kicad_running", return_value=kicad_running), \
          patch("kicad_mcp.utils.platform_helper.find_kicad_cli",
                return_value=(MagicMock(__str__=lambda s: cli_path) if cli_path else None)), \
          patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=fake_tcp_call), \
          patch("kicad_mcp.backends.plugin_backend._get_port", return_value=9760), \
-         patch("kicad_mcp.backends.plugin_backend._get_ping_timeout", return_value=2.0):
+         patch("kicad_mcp.backends.plugin_backend._get_ping_timeout", return_value=2.0), \
+         patch("kicad_mcp.backends.ipc_connection.IPCConnection", return_value=FakeIPCConn()), \
+         patch("kicad_mcp.backends.ipc_connection.ipc_enabled", return_value=ipc_on), \
+         patch("kicad_mcp.backends.ipc_connection.connection_remedy",
+               return_value="Enable the IPC API server."):
         from kicad_mcp.tools.project import run_startup_checklist
         return run_startup_checklist()
 
@@ -135,6 +157,72 @@ def test_bridge_not_reachable():
                for action in result["required_actions"])
 
 
+# ---------------------------------------------------------------------------
+# REQ-GATE-1 — IPC-aware gate: one live path + a READY board is enough
+# ---------------------------------------------------------------------------
+
+def test_ipc_serves_board_with_bridge_down_is_ready():
+    """#14/#20 cure: bridge blindness is non-fatal when IPC serves the board."""
+    result = _run(bridge_error=ConnectionRefusedError("refused"),
+                  ipc_reachable=True, ipc_board="my_board.kicad_pcb")
+    assert result["ready_for_pcb"] is True
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    assert statuses["ipc_server_reachable"] == "PASS"
+    assert statuses["bridge_reachable"] == "WARN"  # non-blocking
+    assert statuses["bridge_version_ok"] == "WARN"
+    assert statuses["pcb_editor_open"] == "PASS"
+    assert statuses["project_loaded"] == "PASS"
+    assert result["required_actions"] == []
+
+
+def test_ipc_down_is_warn_when_bridge_serves():
+    result = _run(ipc_reachable=False)
+    assert result["ready_for_pcb"] is True
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    assert statuses["ipc_server_reachable"] == "WARN"
+    assert statuses["bridge_reachable"] == "PASS"
+
+
+def test_no_live_path_fails_with_combined_remedy():
+    result = _run(bridge_error=ConnectionRefusedError("refused"),
+                  ipc_reachable=False)
+    assert result["ready_for_pcb"] is False
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    assert statuses["bridge_reachable"] == "FAIL"
+    assert any("IPC API server" in action for action in result["required_actions"])
+
+
+def test_ipc_board_still_loading_blocks_with_wait_guidance():
+    """REQ-GATE-3: still-loading is distinguished from no-board; callers wait."""
+    result = _run(bridge_error=ConnectionRefusedError("refused"),
+                  ipc_reachable=True, ipc_board="")
+    assert result["ready_for_pcb"] is False
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    assert statuses["pcb_editor_open"] == "FAIL"
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert "still loading" in details["pcb_editor_open"]
+    assert any("Wait for the board" in action for action in result["required_actions"])
+
+
+def test_ipc_reachable_no_board_falls_to_bridge_board():
+    result = _run(ipc_reachable=True, ipc_board=None,
+                  active_board="/bridge_board.kicad_pcb")
+    assert result["ready_for_pcb"] is True
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    assert statuses["ipc_server_reachable"] == "PASS"
+    assert statuses["pcb_editor_open"] == "PASS"
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert "bridge_board" in details["pcb_editor_open"]
+
+
+def test_ipc_disabled_by_env_reported():
+    result = _run(ipc_enabled=False)
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert statuses["ipc_server_reachable"] == "WARN"
+    assert "KICAD_MCP_IPC_ENABLED" in details["ipc_server_reachable"]
+
+
 def test_no_board_loaded():
     result = _run(active_board="")
     assert result["ready_for_pcb"] is False
@@ -147,9 +235,13 @@ def test_no_board_loaded():
 # Checklist structure
 # ---------------------------------------------------------------------------
 
-def test_checklist_contains_six_items():
+def test_checklist_contains_seven_items():
     result = _run()
-    assert len(result["checklist"]) == 6
+    assert len(result["checklist"]) == 7
+    items = [entry["item"] for entry in result["checklist"]]
+    assert items == ["kicad_running", "ipc_server_reachable", "bridge_reachable",
+                     "bridge_version_ok", "pcb_editor_open",
+                     "kicad_cli_available", "project_loaded"]
 
 
 def test_checklist_item_keys():

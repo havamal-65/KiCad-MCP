@@ -35,6 +35,30 @@ class CapabilityNotSupportedError(BackendError):
     """The active backend(s) do not support this operation."""
 
 
+class SafeRefuseError(BackendError):
+    """A board write was refused: no live path (IPC/bridge) can reach the open
+    board, and KiCad appears to be running — writing the .kicad_pcb on disk
+    would be silently clobbered by KiCad's stale in-memory state on its next
+    save (the #14C lesson). Disk writes are only safe with KiCad closed.
+
+    The message carries the remedy; details carry
+    {capability, remedy, paths_tried}.
+    """
+
+    def __init__(
+        self, message: str, *,
+        capability: str, remedy: str, paths_tried: list[str],
+    ) -> None:
+        super().__init__(message, {
+            "capability": capability,
+            "remedy": remedy,
+            "paths_tried": paths_tried,
+        })
+        self.capability = capability
+        self.remedy = remedy
+        self.paths_tried = paths_tried
+
+
 class ProjectError(KiCadMCPError):
     """Error related to project operations."""
 

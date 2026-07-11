@@ -69,6 +69,24 @@ def _save_board(board: Board) -> None:
     board.save()  # type: ignore[no-untyped-call]
 
 
+def _bridge_save(path: Path) -> bool:
+    """Best-effort save through the bridge; True when the bridge saved.
+
+    In a mixed IPC/bridge session the bridge keeps a stale-board mtime
+    baseline (#14C) that only ITS OWN saves update — an IPC-side save would
+    advance the disk mtime behind its back and every later bridge mutation
+    would be refused as stale (live-caught in the S1 step-7 batch). So the
+    post-commit flush prefers the bridge whenever it is reachable; both paths
+    save the same live in-memory board.
+    """
+    try:
+        from kicad_mcp.backends.plugin_backend import _get_op_timeout, _tcp_call
+        _tcp_call("save_board", _get_op_timeout(), path=str(path))
+        return True
+    except Exception:  # noqa: BLE001 — bridge down/refused: IPC-only session
+        return False
+
+
 class IPCBoardOps(BoardOps):
     """Board operations served by the KiCad IPC API via kipy."""
 
@@ -126,8 +144,13 @@ class IPCBoardOps(BoardOps):
         """
         board = self._board(path)
         result = self._commit(board, mutate)
-        _save_board(board)
+        self._save(path, board)
         return result
+
+    def _save(self, path: Path, board: Board) -> None:
+        """Flush the live board to disk — bridge-first (see _bridge_save)."""
+        if not _bridge_save(path):
+            _save_board(board)
 
     # -- kipy lookup helpers -----------------------------------------------------
 
@@ -213,7 +236,7 @@ class IPCBoardOps(BoardOps):
                 "rotation": rotation if rotation is not None else fp.orientation.degrees,
             }
         result = self._commit(board, mutate)
-        _save_board(board)
+        self._save(path, board)
         return result
 
     def add_track(
@@ -320,7 +343,7 @@ class IPCBoardOps(BoardOps):
             return {"status": "ok", "reference": reference, "pad": pad,
                     "net": net, "pads_updated": pads_updated}
         result = self._commit(board, mutate)
-        _save_board(board)
+        self._save(path, board)
         return result
 
     def add_board_outline(
@@ -350,7 +373,7 @@ class IPCBoardOps(BoardOps):
                 "x2": round(x + width, 4), "y2": round(y + height, 4),
             }
         result = self._commit(board, mutate)
-        _save_board(board)
+        self._save(path, board)
         return result
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
@@ -359,7 +382,7 @@ class IPCBoardOps(BoardOps):
         if backup:
             # Flush live state first so the backup matches the pre-clear board
             # (bridge parity), then copy the file aside.
-            _save_board(board)
+            self._save(path, board)
             filename = str(path)
             if filename.endswith(".kicad_pcb"):
                 backup_file = filename[:-len(".kicad_pcb")] + ".clear_routes_backup.kicad_pcb"
@@ -382,7 +405,7 @@ class IPCBoardOps(BoardOps):
                 "backup_path": backup_path,
             }
         result = self._commit(board, mutate)
-        _save_board(board)
+        self._save(path, board)
         return result
 
     # -- Reads (spec §3 rows 1–4) ----------------------------------------------

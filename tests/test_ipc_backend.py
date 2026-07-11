@@ -710,8 +710,14 @@ def _real_net(name: str = "GND"):
 
 
 @pytest.fixture
-def write_board(live_board):
-    """FakeLiveBoard reconfigured with real kipy items for the write paths."""
+def write_board(live_board, monkeypatch):
+    """FakeLiveBoard reconfigured with real kipy items for the write paths.
+
+    _bridge_save is pinned to False (no bridge in unit tests) so the flush
+    falls through to the IPC-side board.save() and save_count stays meaningful.
+    """
+    from kicad_mcp.backends import ipc_backend
+    monkeypatch.setattr(ipc_backend, "_bridge_save", lambda path: False)
     live_board.footprints = [_real_footprint()]
     live_board.nets = [_real_net("GND")]
     return live_board
@@ -884,6 +890,49 @@ class TestAddBoardOutline:
         assert len(write_board.removed) == 1
         assert len(write_board.removed[0]) == 2  # only the Edge.Cuts shapes
         assert write_board.commits_pushed == write_board.commits_begun
+
+
+class TestSaveRouting:
+    """Post-commit flush prefers the bridge so ITS #14C mtime baseline stays
+    current in mixed IPC/bridge sessions (live-caught in the S1 step-7 batch:
+    an IPC-side save tripped the bridge's stale-board guard)."""
+
+    def test_bridge_save_preferred_when_bridge_up(self, write_ops, write_board,
+                                                  monkeypatch):
+        from kicad_mcp.backends import ipc_backend
+        bridge_saves: list = []
+        monkeypatch.setattr(ipc_backend, "_bridge_save",
+                            lambda path: bridge_saves.append(path) or True)
+        write_ops.move_component(BOARD_PATH, "U1", 1.0, 2.0)
+        assert bridge_saves == [BOARD_PATH]
+        assert write_board.save_count == 0  # IPC save skipped — bridge saved
+
+    def test_ipc_save_when_bridge_down(self, write_ops, write_board):
+        # write_board fixture pins _bridge_save to False
+        write_ops.move_component(BOARD_PATH, "U1", 1.0, 2.0)
+        assert write_board.save_count == 1
+
+    def test_bridge_save_helper_returns_false_on_unreachable(self, monkeypatch):
+        from kicad_mcp.backends import ipc_backend
+        from kicad_mcp.backends import plugin_backend
+
+        def refuse(method, timeout, **kwargs):
+            raise plugin_backend.BridgeTemporarilyUnavailableError("down")
+        monkeypatch.setattr(plugin_backend, "_tcp_call", refuse)
+        assert ipc_backend._bridge_save(BOARD_PATH) is False
+
+    def test_bridge_save_helper_calls_save_board(self, monkeypatch):
+        from kicad_mcp.backends import ipc_backend
+        from kicad_mcp.backends import plugin_backend
+        calls: list = []
+
+        def accept(method, timeout, **kwargs):
+            calls.append((method, kwargs))
+            return {"status": "ok"}
+        monkeypatch.setattr(plugin_backend, "_tcp_call", accept)
+        assert ipc_backend._bridge_save(BOARD_PATH) is True
+        assert calls[0][0] == "save_board"
+        assert calls[0][1]["path"] == str(BOARD_PATH)
 
 
 class TestClearRoutes:

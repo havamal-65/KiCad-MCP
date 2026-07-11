@@ -23,6 +23,11 @@ env/
 .coverage
 htmlcov/
 .mypy_cache/
+# Orphaned temp dirs with broken ACLs (undeletable without elevation);
+# ignoring them silences git's could-not-open-directory warnings.
+.pytest_tmp/
+tests/_tmp_pytest/
+tmpvb4qwmfq/
 
 # Environment
 .env

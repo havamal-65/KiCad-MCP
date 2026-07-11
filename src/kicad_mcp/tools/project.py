@@ -23,13 +23,18 @@ def run_startup_checklist() -> dict[str, Any]:
 
     Extracted as a module-level function so it can be imported by pcb_pipeline
     in board.py without going through the MCP tool dispatch layer.
+
+    Live-path gate (F1 / #20): board ops are served IPC-first with the bridge
+    as fallback, so the gate requires *at least one* live path plus a loaded
+    board — a down bridge is a WARN (not a blocking FAIL) whenever the IPC API
+    already serves the open board, and vice versa.
     """
     from kicad_mcp.utils.platform_helper import find_kicad_cli, is_kicad_running
 
     checklist: list[dict[str, Any]] = []
     required_actions: list[str] = []
 
-    # ── 1. KiCad process running ─────────────────────────────────────────────
+    # ── 1. KiCad process running (counts pcbnew/eeschema too — REQ-GATE-2) ──
     kicad_up = is_kicad_running()
     checklist.append({
         "item": "kicad_running",
@@ -39,7 +44,49 @@ def run_startup_checklist() -> dict[str, Any]:
     if not kicad_up:
         required_actions.append("Launch KiCad (use open_kicad tool or start KiCad manually).")
 
-    # ── 2. Bridge TCP reachable ──────────────────────────────────────────────
+    # ── 2. IPC API server reachable + board ready (REQ-GATE-1) ──────────────
+    ipc_reachable = False
+    ipc_board_ready = False
+    ipc_still_loading = False
+    ipc_board_name = ""
+    ipc_detail = ""
+    try:
+        from kicad_mcp.backends.ipc_connection import (
+            IPCConnection,
+            connection_remedy,
+            ipc_enabled,
+        )
+        if not ipc_enabled():
+            ipc_detail = "IPC routing disabled by KICAD_MCP_IPC_ENABLED."
+        else:
+            conn = IPCConnection()
+            if conn.ping():
+                ipc_reachable = True
+                try:
+                    ipc_board_name = conn.board().name
+                    if ipc_board_name:
+                        ipc_board_ready = True
+                        ipc_detail = f"IPC server up; board ready: {ipc_board_name}"
+                    else:
+                        # document exists but reports no filename yet (#20 race)
+                        ipc_still_loading = True
+                        ipc_detail = "IPC server up; board is still loading."
+                except Exception:
+                    ipc_detail = "IPC server up; no PCB document open."
+            else:
+                ipc_detail = f"IPC API server not reachable. {connection_remedy()}"
+    except ImportError:
+        ipc_detail = "kipy (kicad-python) not installed; IPC path unavailable."
+
+    # Reachability alone never blocks — the bridge may serve instead. The
+    # combined no-live-path case fails on bridge_reachable below.
+    checklist.append({
+        "item": "ipc_server_reachable",
+        "status": "PASS" if ipc_reachable else "WARN",
+        "detail": ipc_detail,
+    })
+
+    # ── 3. Bridge TCP reachable ──────────────────────────────────────────────
     _tcp_call = None
     port = 9760
     ping_timeout = 2.0
@@ -68,18 +115,28 @@ def run_startup_checklist() -> dict[str, Any]:
         except Exception as exc:
             bridge_detail = f"TCP port {port} not reachable: {exc}"
 
+    # A down bridge only blocks when IPC cannot serve the board either
+    # (REQ-ROUTE-2: the gate needs one live path, not this specific one).
+    if bridge_ok:
+        bridge_status = "PASS"
+    elif ipc_board_ready:
+        bridge_status = "WARN"
+        bridge_detail += " Non-blocking: the IPC API serves the open board."
+    else:
+        bridge_status = "FAIL"
     checklist.append({
         "item": "bridge_reachable",
-        "status": "PASS" if bridge_ok else "FAIL",
+        "status": bridge_status,
         "detail": bridge_detail,
     })
-    if not bridge_ok:
+    if bridge_status == "FAIL":
         required_actions.append(
-            "Open the PCB editor in KiCad and ensure kicad_mcp_bridge is installed and enabled."
+            "No live board path: enable the KiCad IPC API server (Preferences → "
+            "Plugins) or open the PCB editor with kicad_mcp_bridge installed and "
+            "enabled."
         )
 
-    # ── 3. Bridge version check ──────────────────────────────────────────────
-    bridge_version_ok = bridge_ok  # treat as OK if bridge is reachable but version not queryable
+    # ── 4. Bridge version check ──────────────────────────────────────────────
     bridge_version_detail = ""
     if bridge_ok and _tcp_call is not None:
         try:
@@ -98,14 +155,17 @@ def run_startup_checklist() -> dict[str, Any]:
 
     checklist.append({
         "item": "bridge_version_ok",
-        "status": "PASS" if bridge_version_ok else "FAIL",
+        "status": "PASS" if bridge_ok else bridge_status,  # mirrors bridge_reachable when down
         "detail": bridge_version_detail,
     })
 
-    # ── 4. PCB editor open ───────────────────────────────────────────────────
+    # ── 5. PCB editor open — board-ready, not just port-open (REQ-GATE-1) ───
     pcb_editor_ok = False
     board_path_str = ""
-    if bridge_ok and _tcp_call is not None:
+    if ipc_board_ready:
+        pcb_editor_ok = True
+        board_path_str = ipc_board_name
+    elif bridge_ok and _tcp_call is not None:
         try:
             active = _tcp_call("get_active_project", ping_timeout)
             board_path_str = active.get("board_path", "") if isinstance(active, dict) else ""
@@ -113,20 +173,30 @@ def run_startup_checklist() -> dict[str, Any]:
         except Exception as exc:
             board_path_str = f"(error: {exc})"
 
-    pcb_editor_detail = (
-        f"PCB editor open with: {board_path_str}"
-        if pcb_editor_ok
-        else ("No board loaded in PCB editor." if bridge_ok else "Skipped (bridge not reachable).")
-    )
+    if pcb_editor_ok:
+        pcb_editor_detail = f"PCB editor open with: {board_path_str}"
+    elif ipc_still_loading:
+        # REQ-GATE-3: distinguish still-loading from no-board so callers wait
+        # instead of hitting partial-state errors.
+        pcb_editor_detail = "Board is still loading — wait and re-run the checklist."
+    elif ipc_reachable or bridge_ok:
+        pcb_editor_detail = "No board loaded in PCB editor."
+    else:
+        pcb_editor_detail = "Skipped (no live path reachable)."
     checklist.append({
         "item": "pcb_editor_open",
         "status": "PASS" if pcb_editor_ok else "FAIL",
         "detail": pcb_editor_detail,
     })
-    if bridge_ok and not pcb_editor_ok:
-        required_actions.append("Open a .kicad_pcb file in the KiCad PCB editor.")
+    if (ipc_reachable or bridge_ok) and not pcb_editor_ok:
+        if ipc_still_loading:
+            required_actions.append(
+                "Wait for the board to finish loading, then re-run get_startup_checklist."
+            )
+        else:
+            required_actions.append("Open a .kicad_pcb file in the KiCad PCB editor.")
 
-    # ── 5. kicad-cli on PATH ─────────────────────────────────────────────────
+    # ── 6. kicad-cli on PATH ─────────────────────────────────────────────────
     cli_path_str = shutil.which("kicad-cli")
     if not cli_path_str:
         cli = find_kicad_cli()
@@ -142,17 +212,17 @@ def run_startup_checklist() -> dict[str, Any]:
         ),
     })
 
-    # ── 6. Active project loaded ─────────────────────────────────────────────
+    # ── 7. Active project loaded ─────────────────────────────────────────────
     checklist.append({
         "item": "project_loaded",
         "status": "PASS" if pcb_editor_ok else "FAIL",
         "detail": (
             f"Active board: {board_path_str}"
             if pcb_editor_ok
-            else "No active project detected in bridge."
+            else "No active project detected on any live path."
         ),
     })
-    if bridge_ok and not pcb_editor_ok:
+    if (ipc_reachable or bridge_ok) and not pcb_editor_ok and not ipc_still_loading:
         required_actions.append("Open a KiCad project (.kicad_pro or .kicad_pcb) in KiCad.")
 
     has_fail = any(item["status"] == "FAIL" for item in checklist)
@@ -186,12 +256,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         If ready_for_pcb is false, act on required_actions before proceeding.
 
         Checks performed (in order):
-          1. kicad_running    — KiCad process is detected (FAIL blocks PCB ops)
-          2. bridge_reachable — TCP connection to kicad_mcp_bridge succeeds (FAIL blocks PCB ops)
-          3. bridge_version_ok — Bridge responds with version info (FAIL blocks PCB ops)
-          4. pcb_editor_open  — A board file is active in the PCB editor (FAIL blocks PCB ops)
-          5. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
-          6. project_loaded   — Bridge has an active board path (FAIL blocks PCB ops)
+          1. kicad_running    — a KiCad GUI process (kicad/pcbnew/eeschema) is detected
+          2. ipc_server_reachable — KiCad IPC API answers; detail reports board-ready
+             vs still-loading vs no board (WARN when down: the bridge may serve)
+          3. bridge_reachable — kicad_mcp_bridge answers (WARN when the IPC API
+             already serves the open board; FAIL when NO live path is up)
+          4. bridge_version_ok — bridge version info (mirrors bridge_reachable when down)
+          5. pcb_editor_open  — a board is READY (loaded, not still-loading) on a
+             live path (FAIL blocks PCB ops)
+          6. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
+          7. project_loaded   — an active board path was resolved (FAIL blocks PCB ops)
 
         Returns:
             JSON with ready_for_pcb bool, checklist, and required_actions list.

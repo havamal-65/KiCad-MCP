@@ -58,6 +58,11 @@ class FakeIPCOps(BoardOps):
         return {"status": "ok", "reference": reference, "x": x, "y": y,
                 "rotation": rotation}
 
+    def clean_board_for_routing(self, path, remove_keepouts=True,
+                                remove_unassigned_tracks=True):
+        self.calls.append("clean_board_for_routing")
+        return {"status": "success", "keepouts_removed": 1, "tracks_removed": 2}
+
     def place_component(self, path, reference, footprint, x, y,
                         layer="F.Cu", rotation=0.0):
         # mirrors the live-verified KiCad 9.0.7 behavior
@@ -103,6 +108,7 @@ class FakeIPC:
             "project_name": "test_board", "project_path": "D:/proj",
         }
         self.active_project_error: Exception | None = None
+        self.text_vars_error: Exception | None = None
 
     def is_available(self) -> bool:
         return self.available
@@ -114,6 +120,17 @@ class FakeIPC:
         if self.active_project_error is not None:
             raise self.active_project_error
         return self.active_project
+
+    def get_text_variables(self, project_path):
+        if self.text_vars_error is not None:
+            raise self.text_vars_error
+        return {"status": "success", "variables": {"SRC": "ipc"}}
+
+    def set_text_variables(self, project_path, variables):
+        if self.text_vars_error is not None:
+            raise self.text_vars_error
+        return {"status": "success", "variables": variables,
+                "count": len(variables)}
 
 
 @pytest.fixture
@@ -290,8 +307,9 @@ class TestPerOpFallback:
         assert result["served_by"] == "bridge"
         assert bridge_ops.calls == ["set_footprint_value"]
 
-    def test_s2_row_default_falls_to_bridge(self):
-        # auto_place keeps the BoardOps base default on the IPC side (S2 row)
+    def test_base_default_falls_to_bridge(self):
+        # the ops double keeps the BoardOps base default for auto_place —
+        # the mechanism every base-default method rides (REQ-ROUTE-4)
         proxy, ipc_ops, bridge_ops = self._proxy()
         result = proxy.auto_place(BOARD, 0.0, 0.0, 100.0, 80.0)
         assert result["served_by"] == "bridge"
@@ -301,6 +319,27 @@ class TestPerOpFallback:
         proxy, ipc_ops, bridge_ops = self._proxy(bridge_down=True)
         with pytest.raises(BridgeTemporarilyUnavailableError):
             proxy.place_component(BOARD, "R1", "Lib:FP", 1.0, 2.0)
+
+    def test_clean_board_for_routing_served_by_ipc(self):
+        # S2 row 18 — IPC-only op rides the proxy like any other
+        proxy, ipc_ops, bridge_ops = self._proxy()
+        result = proxy.clean_board_for_routing(BOARD)
+        assert result == {"status": "success",
+                          "keepouts_removed": 1, "tracks_removed": 2}
+        assert ipc_ops.calls == ["clean_board_for_routing"]
+        assert self.paths == ["ipc"]
+
+    def test_clean_board_no_bridge_handler_raises_attribute_error(self):
+        # IPC falls through and the bridge has no handler: AttributeError
+        # propagates — the tool layer catches it into its headless disk path.
+        class _NoCleanIPCOps(FakeIPCOps):
+            def clean_board_for_routing(self, path, remove_keepouts=True,
+                                        remove_unassigned_tracks=True):
+                raise NotImplementedError("ipc cannot serve it")
+
+        proxy, ipc_ops, bridge_ops = self._proxy(ipc_ops=_NoCleanIPCOps())
+        with pytest.raises(AttributeError):
+            proxy.clean_board_for_routing(BOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +398,56 @@ class TestGetActiveProject:
             lambda method, timeout, **kw: {"board_path": "from_bridge"})
         result = backend.get_active_project()
         assert result["board_path"] == "from_bridge"
+
+
+class TestTextVarsRouting:
+    """Spec §3 rows 20–21 — text variables route IPC-first, file fallback."""
+
+    def _pro(self, tmp_path):
+        import json as _json
+        pro = tmp_path / "test_board.kicad_pro"
+        pro.write_text(_json.dumps({"text_variables": {"SRC": "file"}}),
+                       encoding="utf-8")
+        return pro
+
+    def test_get_ipc_first(self, router, tmp_path):
+        backend = router(ipc=True)
+        result = backend.get_text_variables(str(self._pro(tmp_path)))
+        assert result["variables"] == {"SRC": "ipc"}
+        assert backend._live_path["TEXT_VARS"] == "ipc"
+
+    def test_get_file_when_ipc_down(self, router, tmp_path):
+        backend = router(ipc=False)
+        result = backend.get_text_variables(str(self._pro(tmp_path)))
+        assert result["variables"] == {"SRC": "file"}
+        assert backend._live_path["TEXT_VARS"] == "file"
+
+    def test_get_project_mismatch_falls_to_file(self, router, tmp_path):
+        backend = router(ipc=True)
+        backend._ipc.text_vars_error = IPCUnavailableError(
+            "does not match open project")
+        result = backend.get_text_variables(str(self._pro(tmp_path)))
+        assert result["variables"] == {"SRC": "file"}
+        assert backend._live_path["TEXT_VARS"] == "file"
+
+    def test_set_ipc_first_does_not_touch_disk(self, router, tmp_path):
+        import json as _json
+        backend = router(ipc=True)
+        pro = self._pro(tmp_path)
+        result = backend.set_text_variables(str(pro), {"REV": "C"})
+        assert result == {"status": "success", "variables": {"REV": "C"},
+                          "count": 1}
+        assert backend._live_path["TEXT_VARS"] == "ipc"
+        # the live project owns persistence — no file-side JSON write
+        on_disk = _json.loads(pro.read_text(encoding="utf-8"))
+        assert on_disk["text_variables"] == {"SRC": "file"}
+
+    def test_set_file_fallback_writes_pro(self, router, tmp_path):
+        import json as _json
+        backend = router(ipc=False)
+        pro = self._pro(tmp_path)
+        result = backend.set_text_variables(str(pro), {"REV": "C"})
+        assert result["status"] == "success"
+        assert backend._live_path["TEXT_VARS"] == "file"
+        on_disk = _json.loads(pro.read_text(encoding="utf-8"))
+        assert on_disk["text_variables"] == {"REV": "C"}

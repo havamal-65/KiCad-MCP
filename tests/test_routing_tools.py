@@ -138,3 +138,72 @@ def test_clean_board_succeeds_via_subprocess_mock(tmp_path: Path, tmp_board: Pat
     assert result["status"] == "success"
     assert result["keepouts_removed"] == 0
     assert result["tracks_removed"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _impl_clean_board_for_routing — live-first path (spec §3 row 18, F1/S2)
+# ---------------------------------------------------------------------------
+
+class _LiveCleanOps:
+    """Backend ops double serving clean_board_for_routing on the live board."""
+
+    def __init__(self, fail_with: Exception | None = None):
+        self.fail_with = fail_with
+        self.calls: list[str] = []
+
+    def save_board(self, path):
+        self.calls.append("save_board")
+        return {"success": True}
+
+    def clean_board_for_routing(self, path, remove_keepouts=True,
+                                remove_unassigned_tracks=True):
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.calls.append("clean_board_for_routing")
+        return {"status": "success", "keepouts_removed": 2, "tracks_removed": 3}
+
+
+class _StubBackend:
+    def __init__(self, ops):
+        self._ops = ops
+
+    def get_board_modify_ops(self):
+        return self._ops
+
+
+def test_clean_board_live_path_serves_and_skips_disk_script(
+        tmp_path: Path, tmp_board: Path):
+    ops = _LiveCleanOps()
+    with patch("kicad_mcp.tools.routing._get_pcbnew",
+               side_effect=AssertionError("disk path must not run")):
+        result = json.loads(_impl_clean_board_for_routing(
+            path=str(tmp_board),
+            remove_keepouts=True,
+            remove_unassigned_tracks=True,
+            change_log=_make_change_log(tmp_path),
+            backend=_StubBackend(ops),
+        ))
+    assert result["status"] == "success"
+    assert result["keepouts_removed"] == 2
+    assert result["tracks_removed"] == 3
+    # live state flushed before the backup so the backup is current
+    assert ops.calls == ["save_board", "clean_board_for_routing"]
+
+
+def test_clean_board_live_path_unavailable_falls_to_disk_script(
+        tmp_path: Path, tmp_board: Path):
+    # AttributeError = no live path serves the op (e.g. bridge-only session)
+    ops = _LiveCleanOps(fail_with=AttributeError("no such method"))
+    success_output = "KEEPOUTS=1\nTRACKS=0\n"
+    with patch("kicad_mcp.tools.routing._get_pcbnew", return_value=None), \
+         patch("kicad_mcp.tools.routing._run_pcbnew_script",
+               return_value=(True, success_output)):
+        result = json.loads(_impl_clean_board_for_routing(
+            path=str(tmp_board),
+            remove_keepouts=True,
+            remove_unassigned_tracks=True,
+            change_log=_make_change_log(tmp_path),
+            backend=_StubBackend(ops),
+        ))
+    assert result["status"] == "success"
+    assert result["keepouts_removed"] == 1

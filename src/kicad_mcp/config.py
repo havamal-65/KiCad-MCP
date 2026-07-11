@@ -12,6 +12,16 @@ from pydantic_settings import BaseSettings
 
 
 class BackendType(str, Enum):
+    """Backend selector.
+
+    AUTO (the default) is IPC-first for live-board ops: the router in
+    PluginDirectBackend serves board reads/writes over the KiCad IPC API
+    (kipy) when it is reachable with a loaded board, falls back to the SWIG
+    plugin bridge, and degrades to the file backend only when KiCad is closed
+    (writes safe-refuse while KiCad is open). The IPC leg can be forced off at
+    runtime with KICAD_MCP_IPC_ENABLED=0 (see the ipc_* settings below).
+    """
+
     AUTO = "auto"
     IPC = "ipc"
     SWIG = "swig"
@@ -39,7 +49,32 @@ class KiCadMCPConfig(BaseSettings):
 
     backend: BackendType = Field(
         default=BackendType.AUTO,
-        description="Backend to use: auto, ipc, swig, cli, file",
+        description="Backend to use: auto (= IPC-first live routing with bridge "
+                    "fallback), ipc, swig, cli, file",
+    )
+    # --- IPC board backend (F1) -------------------------------------------
+    # These mirror the exact env vars the IPC connection reads at runtime
+    # (KICAD_MCP_IPC_ENABLED / _SOCKET / _TIMEOUT_MS via this class's
+    # KICAD_MCP_ env prefix), so the config object and the backend can never
+    # disagree. Note: ipc_connection.py reads the env directly — the
+    # KICAD_MCP_IPC_* names stay authoritative even under the plugin entry
+    # point's KICAD_PLUGIN_ prefix.
+    ipc_enabled: bool = Field(
+        default=True,
+        description="Route live-board ops through the KiCad IPC API when "
+                    "available. Set KICAD_MCP_IPC_ENABLED=0 to force the SWIG "
+                    "bridge / file paths.",
+    )
+    ipc_socket: Optional[str] = Field(
+        default=None,
+        description="IPC API socket path override (e.g. ipc://C:/temp/kicad/"
+                    "api.sock). Defaults to kipy's resolution: KICAD_API_SOCKET "
+                    "env or the platform default under the temp dir.",
+    )
+    ipc_timeout_ms: int = Field(
+        default=2000,
+        gt=0,
+        description="Per-request timeout for IPC API calls, in milliseconds.",
     )
     transport: TransportType = Field(
         default=TransportType.STDIO,

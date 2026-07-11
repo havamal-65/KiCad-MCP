@@ -160,3 +160,125 @@ def test_per_op_fallback_place_component_lands_real_footprint(
 
     # clean up the probe footprint via the bridge
     _tcp_call("remove_component", 10.0, path=str(path), reference="TIPC1")
+
+
+# ---------------------------------------------------------------------------
+# S2 — full 21-tool live matrix (REQ-COV-1)
+# ---------------------------------------------------------------------------
+
+def test_full_21_tool_live_matrix(bridge_session, ipc_session):
+    """REQ-COV-1 (S2): on a real session every live-board tool's backend op
+    resolves to IPC or its documented fallback, and the served path telemetry
+    proves it.
+
+    Rows not exercised directly here, with their documented resolution:
+    - ``place_component`` — bridge (per-op fall; dedicated test above)
+    - ``place_at_edge`` — rides move/place (F2 owns the edge marker)
+    - ``verify_board_size`` — rides the board reads
+    - ``set_board_design_rules`` — file-side by design (pcbnew-clobber
+      contract, d018367); never called against a live session
+    """
+    from kicad_mcp.tools.drc import _parse_board_bbox
+    from kicad_mcp.utils.placement_engine import read_part_records
+    from kicad_mcp_plugin.backends.plugin_direct import PluginDirectBackend
+
+    path = Path(_board_path())
+    backend = PluginDirectBackend()
+    ops = backend.get_board_ops()
+    modify = backend.get_board_modify_ops()
+    matrix: dict[str, str] = {}
+
+    def record(tool: str, cap: str = "BOARD_MODIFY") -> None:
+        matrix[tool] = backend._live_path[cap]
+
+    # -- reads (rows 1–4, 13–14) ------------------------------------------
+    assert ops.read_board(path)["info"]
+    record("read_board", "BOARD_READ")
+    assert ops.get_board_info(path)["footprint_count"] > 0
+    record("get_board_info", "BOARD_READ")
+    rules = ops.get_design_rules(path)
+    assert any(k.endswith("_mm") for k in rules), rules
+    record("get_design_rules", "BOARD_READ")
+    stackup = backend.get_board_stackup_ops().get_stackup(path)
+    assert stackup["layers"], stackup
+    record("get_stackup", "BOARD_STACKUP")
+    assert backend.get_active_project()["board_path"]
+    matrix["get_active_project"] = backend._live_path["ACTIVE_PROJECT"]
+
+    # -- text variables (rows 20–21), restored afterwards ------------------
+    pro_path = str(path.with_suffix(".kicad_pro"))
+    original_vars = backend.get_text_variables(pro_path)["variables"]
+    record("get_text_variables", "TEXT_VARS")
+    try:
+        backend.set_text_variables(pro_path, {"S2_MATRIX": "on"})
+        record("set_text_variables", "TEXT_VARS")
+        echoed = backend.get_text_variables(pro_path)["variables"]
+        assert echoed == {"S2_MATRIX": "on"}, echoed
+    finally:
+        backend.set_text_variables(pro_path, dict(original_vars))
+
+    # -- copper writes (rows 6, 9–12) --------------------------------------
+    comps = ops.get_components(path)
+    first = comps[0]
+    modify.move_component(path, first["reference"], first["x"], first["y"],
+                          rotation=first["rotation"])
+    record("move_component")
+    modify.add_track(path, 210.0, 210.0, 212.0, 210.0, 0.25)
+    record("add_track")
+    modify.add_via(path, 211.0, 211.0)
+    record("add_via")
+
+    fps = [f for f in ipc_session.board().get_footprints() if f.definition.pads]
+    netted = [(f, p) for f in fps for p in f.definition.pads if p.net.name]
+    if netted:
+        fp, pad = netted[0]
+        modify.assign_net(path, fp.reference_field.text.value,
+                          pad.number, pad.net.name)  # reassign = no-op write
+        record("assign_net")
+
+    modify.clear_routes(path, backup=False)
+    record("clear_routes")
+
+    # -- outline (row 11): re-add the same bbox — an idempotent replace ----
+    bbox = _parse_board_bbox(path.read_text(encoding="utf-8"))
+    assert bbox is not None
+    modify.add_board_outline(path, bbox[0], bbox[1],
+                             bbox[2] - bbox[0], bbox[3] - bbox[1])
+    record("add_board_outline")
+
+    # -- specialized (rows 16–19) ------------------------------------------
+    zone_ops = backend.get_zone_refill_ops()
+    assert zone_ops is not None
+    zone_ops.refill_zones(path)
+    record("refill_zones", "ZONE_REFILL")
+    modify.clean_board_for_routing(path)  # sweeps the net-less test copper
+    record("clean_board_for_routing")
+
+    modify.save_board(path)
+    record("save_project")
+    snapshot = {r["ref"]: r["pos"]
+                for r in read_part_records(path.read_text(encoding="utf-8"))}
+    try:
+        result = modify.auto_place(
+            path, bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1],
+            clearance_mm=0.5, strategy="net_aware")
+        assert result["strategy"] == "net_aware"
+        record("auto_place")
+    finally:
+        for ref, (ox, oy, orot) in sorted(snapshot.items()):
+            modify.move_component(path, ref, ox, oy, rotation=orot)
+        modify.save_board(path)
+
+    # -- the verdict --------------------------------------------------------
+    expected_ipc = {
+        "read_board", "get_board_info", "get_design_rules", "get_stackup",
+        "get_active_project", "get_text_variables", "set_text_variables",
+        "move_component", "add_track", "add_via", "clear_routes",
+        "add_board_outline", "refill_zones", "clean_board_for_routing",
+        "save_project", "auto_place",
+    }
+    if netted:
+        expected_ipc.add("assign_net")
+    wrong = {t: p for t, p in matrix.items()
+             if t in expected_ipc and p != "ipc"}
+    assert not wrong, f"tools not served over IPC: {wrong} (matrix: {matrix})"

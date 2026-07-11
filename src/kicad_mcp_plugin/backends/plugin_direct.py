@@ -14,9 +14,10 @@ DRC / ERC / export   → CLIBackend      (kicad-cli subprocess)
 Library ops          → FileBackend
 Routing (DSN/SES)    → bridge/subprocess (unchanged — BOARD_ROUTE)
 
-Per-op fallback: ops the IPC backend cannot perform (S2 rows, or in-commit
-validation shortfalls like place-by-lib-id) raise NotImplementedError and are
-transparently retried on the bridge (REQ-ROUTE-4).
+Per-op fallback: ops the IPC backend cannot perform (in-commit validation
+shortfalls like place-by-lib-id, the legacy "row" auto_place packer, bridge
+extras) raise NotImplementedError and are transparently retried on the bridge
+(REQ-ROUTE-4).
 """
 
 from __future__ import annotations
@@ -230,6 +231,19 @@ class _LiveBoardOps(BoardOps):
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = self._call("clear_routes", path, backup)
+        return result
+
+    def clean_board_for_routing(
+        self, path: Path,
+        remove_keepouts: bool = True,
+        remove_unassigned_tracks: bool = True,
+    ) -> dict[str, Any]:
+        # IPC-only op (no bridge handler): if IPC falls through, the bridge
+        # retry raises AttributeError, which the tool layer catches into its
+        # headless disk path.
+        result: dict[str, Any] = self._call(
+            "clean_board_for_routing", path, remove_keepouts,
+            remove_unassigned_tracks)
         return result
 
 
@@ -551,6 +565,16 @@ class PluginDirectBackend(BackendProtocol):
             raise
 
     def get_text_variables(self, project_path: Any) -> dict[str, Any]:
+        # IPC first (spec §3 row 20): the live project may hold definitions
+        # newer than the on-disk .kicad_pro (KiCad writes it on save/close).
+        if self._ipc.is_available():
+            try:
+                result = self._ipc.get_text_variables(project_path)
+                self._live_path["TEXT_VARS"] = "ipc"
+                return result
+            except (NotImplementedError, IPCUnavailableError):
+                pass  # wrong project open, or dropped mid-op — use the file
+        self._live_path["TEXT_VARS"] = "file"
         try:
             pro = json.loads(Path(project_path).read_text(encoding="utf-8"))
             return {"status": "success", "variables": pro.get("text_variables", {})}
@@ -562,6 +586,17 @@ class PluginDirectBackend(BackendProtocol):
     def set_text_variables(
         self, project_path: Any, variables: dict[str, str]
     ) -> dict[str, Any]:
+        # IPC first (spec §3 row 21): writing the .kicad_pro file-side while
+        # KiCad is open gets clobbered when KiCad saves its in-memory project
+        # state — the same hazard class as set_board_design_rules (d018367).
+        if self._ipc.is_available():
+            try:
+                result = self._ipc.set_text_variables(project_path, variables)
+                self._live_path["TEXT_VARS"] = "ipc"
+                return result
+            except (NotImplementedError, IPCUnavailableError):
+                pass
+        self._live_path["TEXT_VARS"] = "file"
         try:
             p = Path(project_path)
             pro = json.loads(p.read_text(encoding="utf-8"))

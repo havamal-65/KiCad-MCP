@@ -231,6 +231,9 @@ def _call_autoroute(board_path: Path) -> dict:
     from kicad_mcp.utils.change_log import ChangeLog
 
     backend_stub = MagicMock()
+    # No live path in this harness: clean_board_for_routing must fall through
+    # to its headless disk script, not be "served" by the mock (S2 row 18).
+    backend_stub.get_board_modify_ops.side_effect = NotImplementedError
     change_log = ChangeLog(board_path.parent / "changes.json")
     mcp = fastmcp.FastMCP("test")
     routing.register_tools(mcp, backend_stub, change_log, config={})

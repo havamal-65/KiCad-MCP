@@ -412,9 +412,48 @@ def _impl_clean_board_for_routing(
     remove_keepouts: bool,
     remove_unassigned_tracks: bool,
     change_log: ChangeLog,
+    backend: BackendProtocol | None = None,
 ) -> str:
-    """Clean a PCB board in preparation for auto-routing."""
+    """Clean a PCB board in preparation for auto-routing.
+
+    Live-first (spec §3 row 18, F1): when a live path can serve the op (IPC),
+    the rule-area zones and net-less tracks are removed on the OPEN board —
+    the headless disk-side script below writes the .kicad_pcb behind a live
+    pcbnew's back and only remains for sessions with no live path.
+    """
+    from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
     p = validate_kicad_path(path, ".kicad_pcb")
+
+    if backend is not None:
+        try:
+            ops = backend.get_board_modify_ops()
+            try:
+                ops.save_board(p)  # flush live state so the backup is current
+            except Exception:  # noqa: BLE001 — backup freshness is best-effort
+                pass
+            live_backup = create_backup(p)
+            result = ops.clean_board_for_routing(
+                p, remove_keepouts=remove_keepouts,
+                remove_unassigned_tracks=remove_unassigned_tracks)
+        except (NotImplementedError, AttributeError,
+                BridgeTemporarilyUnavailableError):
+            pass  # no live path serves this op — headless disk path below
+        else:
+            change_log.record(
+                "clean_board_for_routing",
+                {"path": path},
+                file_modified=path,
+                backup_path=str(live_backup) if live_backup else None,
+            )
+            return json.dumps({
+                "status": "success",
+                "keepouts_removed": result["keepouts_removed"],
+                "tracks_removed": result["tracks_removed"],
+                "message": (f"Removed {result['keepouts_removed']} keepout zones "
+                            f"and {result['tracks_removed']} unassigned tracks"),
+            }, indent=2)
+
     backup = create_backup(p)
     keepouts_removed = 0
     tracks_removed = 0
@@ -811,7 +850,7 @@ def register_tools(
             JSON with counts of removed items.
         """
         return _impl_clean_board_for_routing(
-            path, remove_keepouts, remove_unassigned_tracks, change_log,
+            path, remove_keepouts, remove_unassigned_tracks, change_log, backend,
         )
 
     @mcp.tool()
@@ -943,7 +982,7 @@ def register_tools(
         # Step 1: Clean board (optional)
         if clean_board:
             result_json = _impl_clean_board_for_routing(
-                path, True, True, change_log,
+                path, True, True, change_log, backend,
             )
             result = json.loads(result_json)
             report["steps"].append({"step": "clean_board", **result})

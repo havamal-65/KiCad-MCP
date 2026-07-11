@@ -396,6 +396,10 @@ class FakeLiveBoard:
         ]
         self.title_block = types.SimpleNamespace(title="Test Board", revision="B")
         self.project = types.SimpleNamespace(name="test_board", path="D:/proj")
+        # S2 rows 13/16/18 surface
+        self.zones: list = []
+        self.stackup = None
+        self.refill_calls = 0
         # commit bookkeeping
         self.commits_begun: list = []
         self.commits_pushed: list = []
@@ -425,6 +429,15 @@ class FakeLiveBoard:
 
     def get_shapes(self):
         return self.shapes
+
+    def get_zones(self):
+        return self.zones
+
+    def refill_zones(self):
+        self.refill_calls += 1
+
+    def get_stackup(self):
+        return self.stackup
 
     def get_item_bounding_box(self, items):
         assert all(s.layer == _edge_layer() for s in items)  # only edges queried
@@ -520,10 +533,11 @@ class TestIPCBoardOpsInterface:
             assert callable(getattr(board_ops, method))
 
     def test_uncovered_write_falls_to_base_notimplemented(self, board_ops):
-        # REQ-ROUTE-4: methods IPC does not cover yet keep the base default so
+        # REQ-ROUTE-4: methods IPC does not cover keep the base default so
         # the router falls through to the bridge — never a stubbed result.
+        # (reload_board stays uncovered: KiCad 9 has no in-place reload.)
         with pytest.raises(NotImplementedError):
-            board_ops.auto_place(BOARD_PATH, 0, 0, 100, 80)
+            board_ops.reload_board(BOARD_PATH)
 
 
 class TestIPCBackendSurface:
@@ -966,6 +980,297 @@ class TestClearRoutes:
         assert result["tracks_removed"] == 0
         assert result["vias_removed"] == 0
         assert write_board.removed == []
+
+
+# ---------------------------------------------------------------------------
+# S2 — specialized ops (spec §3 rows 13–14, 16–21)
+# ---------------------------------------------------------------------------
+
+def _real_netclass(name: str = "Default", *, clearance=0.2, track_width=0.25,
+                   via_diameter=0.8, via_drill=0.4):
+    """A real kipy NetClass (fresh proto — the default arg instance is shared)."""
+    from kipy.project_types import NetClass
+    from kipy.proto.common.types import project_settings_pb2
+    proto = project_settings_pb2.NetClass()
+    proto.name = name
+    if clearance is not None:
+        proto.board.clearance.value_nm = _nm(clearance)
+    if track_width is not None:
+        proto.board.track_width.value_nm = _nm(track_width)
+    if via_diameter is not None:
+        layer = proto.board.via_stack.copper_layers.add()
+        layer.size.x_nm = _nm(via_diameter)
+    if via_drill is not None:
+        proto.board.via_stack.drill.diameter.x_nm = _nm(via_drill)
+    return NetClass(proto)
+
+
+class TestGetDesignRules:
+    """Spec §3 row 14 — Default-netclass values; gaps fall to the bridge."""
+
+    def test_default_netclass_bridge_shape(self, board_ops, live_board):
+        live_board.project = types.SimpleNamespace(
+            get_net_classes=lambda: [_real_netclass("HV", clearance=0.5),
+                                     _real_netclass("Default")])
+        rules = board_ops.get_design_rules(BOARD_PATH)
+        assert rules == {
+            "clearance_mm": 0.2,
+            "track_width_mm": 0.25,
+            "via_diameter_mm": 0.8,
+            "via_drill_mm": 0.4,
+        }
+
+    def test_partial_netclass_reports_present_fields_only(self, board_ops, live_board):
+        live_board.project = types.SimpleNamespace(
+            get_net_classes=lambda: [
+                _real_netclass("Default", via_diameter=None, via_drill=None)])
+        rules = board_ops.get_design_rules(BOARD_PATH)
+        assert rules == {"clearance_mm": 0.2, "track_width_mm": 0.25}
+
+    def test_no_default_netclass_signals_fallback(self, board_ops, live_board):
+        live_board.project = types.SimpleNamespace(
+            get_net_classes=lambda: [_real_netclass("HV")])
+        with pytest.raises(NotImplementedError, match="bridge path"):
+            board_ops.get_design_rules(BOARD_PATH)
+
+    def test_empty_default_netclass_signals_fallback(self, board_ops, live_board):
+        live_board.project = types.SimpleNamespace(
+            get_net_classes=lambda: [_real_netclass(
+                "Default", clearance=None, track_width=None,
+                via_diameter=None, via_drill=None)])
+        with pytest.raises(NotImplementedError, match="bridge path"):
+            board_ops.get_design_rules(BOARD_PATH)
+
+
+def _real_stackup():
+    """Two-layer stackup: F.Cu copper + one FR4 dielectric (real kipy protos)."""
+    from kipy.board import BoardStackup
+    from kipy.proto.board import board_pb2
+    proto = board_pb2.BoardStackup()
+    copper = proto.layers.add()
+    copper.user_name = "F.Cu"
+    copper.type = board_pb2.BoardStackupLayerType.BSLT_COPPER
+    copper.thickness.value_nm = _nm(0.035)
+    dielectric = proto.layers.add()
+    dielectric.type = board_pb2.BoardStackupLayerType.BSLT_DIELECTRIC
+    dielectric.thickness.value_nm = _nm(1.51)
+    sub = dielectric.dielectric.layer.add()
+    sub.epsilon_r = 4.5
+    sub.loss_tangent = 0.02
+    sub.material_name = "FR4"
+    return BoardStackup(proto)
+
+
+class TestGetStackup:
+    """Spec §3 row 13 — bridge-shape {layers, source}."""
+
+    def test_bridge_shape(self, board_ops, live_board):
+        live_board.stackup = _real_stackup()
+        result = board_ops.get_stackup(BOARD_PATH)
+        assert result == {
+            "layers": [
+                {"name": "F.Cu", "type": "copper", "thickness_mm": 0.035},
+                {"name": "", "type": "dielectric", "thickness_mm": 1.51,
+                 "epsilon_r": 4.5, "loss_tangent": 0.02, "material": "FR4"},
+            ],
+            "source": "stackup_descriptor",
+        }
+
+    def test_empty_stackup_empty_layers(self, board_ops, live_board):
+        from kipy.board import BoardStackup
+        from kipy.proto.board import board_pb2
+        live_board.stackup = BoardStackup(board_pb2.BoardStackup())
+        assert board_ops.get_stackup(BOARD_PATH) == {
+            "layers": [], "source": "stackup_descriptor",
+        }
+
+
+class TestRefillZones:
+    """Spec §3 row 16 — board.refill_zones() + save, bridge shape."""
+
+    def test_refills_and_saves(self, write_ops, write_board):
+        write_board.zones = [object(), object()]
+        result = write_ops.refill_zones(BOARD_PATH)
+        assert result == {"status": "ok", "zones_filled": 2}
+        assert write_board.refill_calls == 1
+        assert write_board.save_count == 1
+
+    def test_no_zones_skips_refill(self, write_ops, write_board):
+        result = write_ops.refill_zones(BOARD_PATH)
+        assert result == {"status": "ok", "zones_filled": 0}
+        assert write_board.refill_calls == 0
+
+
+class TestSaveBoard:
+    """Spec §3 row 19 — explicit flush, bridge shape."""
+
+    def test_saves_and_reports_path(self, write_ops, write_board):
+        result = write_ops.save_board(BOARD_PATH)
+        assert result == {"success": True, "path": str(BOARD_PATH)}
+        assert write_board.save_count == 1
+
+
+class TestAutoPlaceIPC:
+    """Spec §3 row 17 — net-aware plan applied through IPC moves."""
+
+    def test_row_strategy_signals_bridge_fallback(self, write_ops):
+        with pytest.raises(NotImplementedError, match="bridge path"):
+            write_ops.auto_place(BOARD_PATH, 0, 0, 100, 80, strategy="row")
+
+    @pytest.fixture
+    def engine_stub(self, monkeypatch):
+        from kicad_mcp.backends import file_backend
+        from kicad_mcp.utils import placement_engine as engine
+        monkeypatch.setattr(file_backend, "build_engine_parts",
+                            lambda path, project_dir: ["part"])
+        monkeypatch.setattr(engine, "read_board_keepouts", lambda path: ([], {}))
+        monkeypatch.setattr(engine, "read_diff_pair_nets", lambda path: set())
+        plans = {"items": [("U1", 30.0, 40.0, 0.0)]}
+        monkeypatch.setattr(
+            engine, "compute_net_aware_plan",
+            lambda *args, **kwargs: (plans["items"], ["w1"], 123.4))
+        return plans
+
+    def test_net_aware_plan_applied_via_ipc_moves(
+            self, write_ops, write_board, engine_stub):
+        result = write_ops.auto_place(BOARD_PATH, 0, 0, 100, 80)
+        assert result == {
+            "components_placed": 1,
+            "rows": 0,
+            "total_area_mm2": 123.4,
+            "placements": [{"reference": "U1", "x": 30.0, "y": 40.0}],
+            "warnings": ["w1"],
+            "strategy": "net_aware",
+        }
+        from kipy.util.units import to_mm
+        moved = write_board.updated[0]
+        assert to_mm(moved.position.x) == 30.0
+        # pre-plan flush + per-move save + final save
+        assert write_board.save_count == 3
+
+    def test_move_failure_becomes_warning(self, write_ops, engine_stub):
+        engine_stub["items"] = [("R99", 1.0, 1.0, 0.0)]  # not on the board
+        result = write_ops.auto_place(BOARD_PATH, 0, 0, 100, 80)
+        assert result["components_placed"] == 0
+        assert any("R99" in str(w) and "move failed" in str(w)
+                   for w in result["warnings"])
+
+    def test_no_parts_empty_result(self, write_ops, monkeypatch):
+        from kicad_mcp.backends import file_backend
+        monkeypatch.setattr(file_backend, "build_engine_parts",
+                            lambda path, project_dir: [])
+        result = write_ops.auto_place(BOARD_PATH, 0, 0, 100, 80)
+        assert result == {
+            "components_placed": 0, "rows": 0, "total_area_mm2": 0.0,
+            "placements": [], "warnings": [], "strategy": "net_aware",
+        }
+
+
+class TestCleanBoardForRouting:
+    """Spec §3 row 18 — rule-area zones + net-less tracks/vias, one commit."""
+
+    @pytest.fixture
+    def dirty_board(self, write_board):
+        write_board.zones = [
+            types.SimpleNamespace(is_rule_area=lambda: True),
+            types.SimpleNamespace(is_rule_area=lambda: False),  # copper pour stays
+        ]
+        write_board.tracks.append(types.SimpleNamespace(
+            start=_xy(0.0, 0.0), end=_xy(1.0, 0.0), width=_nm(0.2),
+            layer=_f_cu(), net=types.SimpleNamespace(name=""),
+        ))
+        write_board.vias.append(types.SimpleNamespace(
+            position=_xy(9.0, 9.0), diameter=_nm(0.8), drill_diameter=_nm(0.4),
+            net=types.SimpleNamespace(name=""),
+        ))
+        return write_board
+
+    def test_removes_keepouts_and_netless_copper(self, write_ops, dirty_board):
+        result = write_ops.clean_board_for_routing(BOARD_PATH)
+        assert result == {"status": "success",
+                          "keepouts_removed": 1, "tracks_removed": 2}
+        assert len(dirty_board.removed[0]) == 3  # 1 zone + 1 track + 1 via
+        assert dirty_board.commits_pushed == dirty_board.commits_begun
+        assert dirty_board.save_count == 1
+
+    def test_flags_off_removes_nothing(self, write_ops, dirty_board):
+        result = write_ops.clean_board_for_routing(
+            BOARD_PATH, remove_keepouts=False, remove_unassigned_tracks=False)
+        assert result == {"status": "success",
+                          "keepouts_removed": 0, "tracks_removed": 0}
+        assert dirty_board.removed == []
+
+    def test_netted_copper_untouched(self, write_ops, write_board):
+        # default fixture: 1 GND track + 1 GND via, no rule areas
+        result = write_ops.clean_board_for_routing(BOARD_PATH)
+        assert result == {"status": "success",
+                          "keepouts_removed": 0, "tracks_removed": 0}
+        assert write_board.removed == []
+
+
+class TestTextVariables:
+    """Spec §3 rows 20–21 — kipy Project text variables via IPCBackend."""
+
+    PRO_PATH = "D:/proj/test_board.kicad_pro"
+
+    @pytest.fixture
+    def project_recorder(self, live_board):
+        from kipy.project_types import TextVariables
+        from kipy.proto.common.types import project_settings_pb2
+
+        stored = TextVariables(project_settings_pb2.TextVariables())
+        stored.variables = {"REV": "B", "PROJECT": "AQS"}
+        calls: dict = {"set": []}
+
+        def set_text_variables(variables, merge_mode):
+            calls["set"].append((dict(variables.variables), merge_mode))
+
+        live_board.project = types.SimpleNamespace(
+            name="test_board", path="D:/proj",
+            get_text_variables=lambda: stored,
+            set_text_variables=set_text_variables,
+        )
+        return calls
+
+    @pytest.fixture
+    def ipc_backend(self, live_board, monkeypatch):
+        from kicad_mcp.backends import ipc_backend
+        monkeypatch.setattr(ipc_backend, "_bridge_save", lambda path: True)
+        return IPCBackend(FakeIPCBoardConnection(live_board))
+
+    def test_get_shape(self, ipc_backend, project_recorder):
+        result = ipc_backend.get_text_variables(self.PRO_PATH)
+        assert result == {"status": "success",
+                          "variables": {"REV": "B", "PROJECT": "AQS"}}
+
+    def test_set_replace_semantics(self, ipc_backend, project_recorder):
+        from kipy.proto.common.types import MapMergeMode
+        result = ipc_backend.set_text_variables(self.PRO_PATH, {"REV": "C"})
+        assert result == {"status": "success", "variables": {"REV": "C"},
+                          "count": 1}
+        assert project_recorder["set"] == [({"REV": "C"}, MapMergeMode.MMM_REPLACE)]
+
+    def test_set_flushes_ipc_side_when_bridge_down(
+            self, live_board, project_recorder, monkeypatch):
+        from kicad_mcp.backends import ipc_backend
+        monkeypatch.setattr(ipc_backend, "_bridge_save", lambda path: False)
+        backend = IPCBackend(FakeIPCBoardConnection(live_board))
+        backend.set_text_variables(self.PRO_PATH, {"REV": "C"})
+        assert live_board.save_count == 1
+
+    def test_project_mismatch_refused_with_canonical_phrase(
+            self, ipc_backend, project_recorder):
+        with pytest.raises(IPCUnavailableError) as exc_info:
+            ipc_backend.get_text_variables("D:/other/wrong_project.kicad_pro")
+        assert "does not match open project" in str(exc_info.value)
+
+    def test_fresh_textvariables_proto_no_default_aliasing(
+            self, ipc_backend, project_recorder):
+        # kipy's TextVariables() default argument is a shared proto instance;
+        # two sequential sets must not leak keys into each other.
+        ipc_backend.set_text_variables(self.PRO_PATH, {"A": "1"})
+        ipc_backend.set_text_variables(self.PRO_PATH, {"B": "2"})
+        assert project_recorder["set"][1][0] == {"B": "2"}
 
 
 class TestConnectionParams:

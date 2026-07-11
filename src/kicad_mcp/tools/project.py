@@ -598,10 +598,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Returns:
             JSON with save status, the backend name, and live_bridge_session.
         """
-        from kicad_mcp.backends.base import BackendCapability
+        from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+        from kicad_mcp.models.errors import SafeRefuseError
 
         backend_name = type(backend).__name__
-        # A live bridge session means pcbnew holds the board in memory; detect it
+        # A live session means pcbnew holds the board in memory; detect it
         # so the response can warn about disk/memory divergence.
         live_bridge = False
         try:
@@ -609,18 +610,28 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         except Exception:
             live_bridge = False
 
-        if backend.has_capability(BackendCapability.REAL_TIME_SYNC):
+        # Spec §3 row 19 (F1/S2): flush the live board through the router
+        # (IPC-first, bridge fallback). Before S2 this tool only returned
+        # advisory text — the save branch was gated on a capability no
+        # backend declares and never executed.
+        p = Path(path)
+        board_path = p if p.suffix == ".kicad_pcb" else p.with_suffix(".kicad_pcb")
+        if board_path.exists():
             try:
-                # IPC backend can trigger save
+                backend.get_board_modify_ops().save_board(board_path)
+            except (NotImplementedError, AttributeError,
+                    BridgeTemporarilyUnavailableError, SafeRefuseError):
+                pass  # no live path to flush — advisory below
+            except Exception as e:
+                return json.dumps({"status": "error", "message": str(e)})
+            else:
                 change_log.record("save_project", {"path": path})
                 return json.dumps({
                     "status": "success",
                     "backend": backend_name,
                     "live_bridge_session": live_bridge,
-                    "message": "Project saved via IPC.",
+                    "message": "Live board state flushed to disk.",
                 }, indent=2)
-            except Exception as e:
-                return json.dumps({"status": "error", "message": str(e)})
 
         message = ("File-based operations auto-save on modification; no explicit "
                    "project save is required.")

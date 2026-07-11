@@ -1,9 +1,10 @@
-"""Tests for #14C save_project coherence messaging.
+"""Tests for save_project — #14C coherence messaging + the S2 live flush.
 
-save_project's response now states which backend persisted the file and whether
-a live KiCad/pcbnew bridge session is open (so its in-memory board can diverge
-from disk). We register the project tools against a capturing MCP stub and a
-mocked backend, then invoke the captured save_project closure directly.
+Since F1/S2 (spec §3 row 19) save_project actually flushes the live board
+through the router (IPC-first, bridge fallback) when the .kicad_pcb exists and
+a live path serves ``save_board``; otherwise it returns the advisory text. We
+register the project tools against a capturing MCP stub and a mocked backend,
+then invoke the captured save_project closure directly.
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
-from kicad_mcp.backends.base import BackendCapability
 from kicad_mcp.tools import project as project_tools
 from kicad_mcp.utils.change_log import ChangeLog
 
@@ -36,13 +36,18 @@ def _save_project_fn(backend, tmp_path):
     return mcp.tools["save_project"]
 
 
-def _backend(*, live: bool):
+def _backend(*, live: bool, save_error: Exception | None = None):
     backend = MagicMock()
-    backend.has_capability.return_value = False  # file-based (no REAL_TIME_SYNC)
+    backend.has_capability.return_value = False
     if live:
         backend.get_active_project.return_value = {"project_name": "demo"}
     else:
         backend.get_active_project.side_effect = RuntimeError("no live session")
+    if save_error is not None:
+        backend.get_board_modify_ops.return_value.save_board.side_effect = save_error
+    else:
+        backend.get_board_modify_ops.return_value.save_board.return_value = {
+            "success": True}
     return backend
 
 
@@ -65,12 +70,63 @@ def test_save_project_no_live_session(tmp_path):
     assert "diverge" not in out["message"]
 
 
-def test_save_project_ipc_backend_reports_success(tmp_path):
-    backend = MagicMock()
-    backend.has_capability.return_value = True  # REAL_TIME_SYNC capable
-    backend.get_active_project.return_value = {"project_name": "demo"}
+def _project_with_board(tmp_path):
+    """A .kicad_pro with its sibling .kicad_pcb on disk."""
+    pro = tmp_path / "demo.kicad_pro"
+    pro.write_text("{}", encoding="utf-8")
+    board = tmp_path / "demo.kicad_pcb"
+    board.write_text("(kicad_pcb)", encoding="utf-8")
+    return pro, board
+
+
+def test_save_project_flushes_live_board_via_router(tmp_path):
+    """S2 row 19: an existing board + a serving live path → real save."""
+    backend = _backend(live=True)
     fn = _save_project_fn(backend, tmp_path)
-    out = json.loads(fn("/tmp/demo.kicad_pro"))
+    pro, board = _project_with_board(tmp_path)
+    out = json.loads(fn(str(pro)))
     assert out["status"] == "success"
     assert out["live_bridge_session"] is True
-    backend.has_capability.assert_called_with(BackendCapability.REAL_TIME_SYNC)
+    backend.get_board_modify_ops.return_value.save_board.assert_called_once_with(board)
+
+
+def test_save_project_accepts_board_path_directly(tmp_path):
+    backend = _backend(live=True)
+    fn = _save_project_fn(backend, tmp_path)
+    _, board = _project_with_board(tmp_path)
+    out = json.loads(fn(str(board)))
+    assert out["status"] == "success"
+    backend.get_board_modify_ops.return_value.save_board.assert_called_once_with(board)
+
+
+def test_save_project_no_live_path_falls_to_advisory(tmp_path):
+    """save_board NotImplementedError (file ops) → the old advisory text."""
+    backend = _backend(live=False, save_error=NotImplementedError("no live path"))
+    fn = _save_project_fn(backend, tmp_path)
+    pro, _ = _project_with_board(tmp_path)
+    out = json.loads(fn(str(pro)))
+    assert out["status"] == "info"
+    assert "auto-save" in out["message"]
+
+
+def test_save_project_safe_refuse_falls_to_advisory(tmp_path):
+    """KiCad open with no live path → advisory with the divergence warning."""
+    from kicad_mcp.models.errors import SafeRefuseError
+    backend = _backend(live=True, save_error=SafeRefuseError(
+        "refused", capability="BOARD_MODIFY", remedy="open KiCad",
+        paths_tried=["ipc", "bridge"]))
+    fn = _save_project_fn(backend, tmp_path)
+    pro, _ = _project_with_board(tmp_path)
+    out = json.loads(fn(str(pro)))
+    assert out["status"] == "info"
+    assert "diverge" in out["message"]
+
+
+def test_save_project_wrong_board_surfaces_error(tmp_path):
+    backend = _backend(live=True,
+                       save_error=ValueError("does not match open board"))
+    fn = _save_project_fn(backend, tmp_path)
+    pro, _ = _project_with_board(tmp_path)
+    out = json.loads(fn(str(pro)))
+    assert out["status"] == "error"
+    assert "does not match open board" in out["message"]

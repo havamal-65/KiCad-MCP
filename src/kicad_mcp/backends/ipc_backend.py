@@ -9,10 +9,16 @@ S1 scope (spec §3 rows 1–12): reads (read_board / get_board_info /
 get_components / get_nets / get_tracks / get_active_project) and the core
 writes (place_component / move_component / add_track / add_via / assign_net /
 add_board_outline / clear_routes), each an atomic ``_commit`` transaction
-followed by a disk save. Methods not yet covered keep the ``BoardOps`` base
-default (``NotImplementedError``) so the router falls through to the bridge
-(REQ-ROUTE-4) — never a stubbed wrong result; writes whose server-side IPC
-support is unverified validate the result in-commit and use the same signal.
+followed by a disk save. S2 scope (rows 13–21): the specialized ops —
+get_stackup / get_design_rules / refill_zones / auto_place / save_board plus
+project text variables (rows 20–21, served from ``IPCBackend``). Row 15
+(``set_board_design_rules``) stays off IPC by design: kipy 0.5.0 has no
+netclass/design-rules write wrapper, and the tool intentionally edits the
+.kicad_pro file-side (pcbnew-clobber contract, d018367). Methods not covered
+keep the ``BoardOps`` base default (``NotImplementedError``) so the router
+falls through to the bridge (REQ-ROUTE-4) — never a stubbed wrong result;
+writes whose server-side IPC support is unverified validate the result
+in-commit and use the same signal.
 
 All distances cross the IPC boundary in nanometers (kipy convention); the MCP
 surface stays in millimeters, rounded to 4 decimals like the bridge.
@@ -39,7 +45,11 @@ try:
     import kipy.board_types as kbt
     from kipy.common_types import LibraryIdentifier
     from kipy.geometry import Angle, Vector2
+    from kipy.project_types import TextVariables
+    from kipy.proto.board.board_pb2 import BoardStackupLayerType
     from kipy.proto.board.board_types_pb2 import BoardLayer, ViaType
+    from kipy.proto.common.types import MapMergeMode
+    from kipy.proto.common.types import project_settings_pb2
     from kipy.util.board_layer import canonical_name, layer_from_canonical_name
     from kipy.util.units import from_mm, to_mm
 except ImportError:  # REQ-IPC-8: missing client degrades, never crashes
@@ -47,8 +57,12 @@ except ImportError:  # REQ-IPC-8: missing client degrades, never crashes
     LibraryIdentifier = None  # type: ignore[assignment,misc]
     Angle = None  # type: ignore[assignment,misc]
     Vector2 = None  # type: ignore[assignment,misc]
+    TextVariables = None  # type: ignore[assignment,misc]
+    BoardStackupLayerType = None  # type: ignore[assignment,misc]
     BoardLayer = None  # type: ignore[assignment,misc]
     ViaType = None  # type: ignore[assignment,misc]
+    MapMergeMode = None  # type: ignore[assignment,misc]
+    project_settings_pb2 = None  # type: ignore[assignment]
     canonical_name = None  # type: ignore[assignment]
     layer_from_canonical_name = None  # type: ignore[assignment]
     from_mm = None  # type: ignore[assignment]
@@ -408,6 +422,115 @@ class IPCBoardOps(BoardOps):
         self._save(path, board)
         return result
 
+    # -- Specialized ops (spec §3 rows 16–19, S2) --------------------------------
+
+    def refill_zones(self, path: Path) -> dict[str, Any]:
+        """Spec §3 row 16 — ``board.refill_zones()`` (kipy blocks until done)."""
+        board = self._board(path)
+        zones = board.get_zones()
+        if zones:
+            board.refill_zones()
+        self._save(path, board)
+        return {"status": "ok", "zones_filled": len(zones)}
+
+    def save_board(self, path: Path) -> dict[str, Any]:
+        """Spec §3 row 19 — flush the live board to disk (bridge-first save)."""
+        board = self._board(path)
+        self._save(path, board)
+        return {"success": True, "path": str(path)}
+
+    def clean_board_for_routing(
+        self, path: Path,
+        remove_keepouts: bool = True,
+        remove_unassigned_tracks: bool = True,
+    ) -> dict[str, Any]:
+        """Spec §3 row 18 — routing prep on the LIVE board.
+
+        Removes rule-area (keep-out) zones and net-less tracks/vias in one
+        atomic commit. Serving this over IPC replaces the headless disk-side
+        pcbnew script for live sessions, which wrote the .kicad_pcb behind
+        pcbnew's back (#14C hazard). Net-less vias count as tracks for parity
+        with the SWIG path (``board.GetTracks()`` includes vias).
+        """
+        board = self._board(path)
+        doomed_zones = (
+            [z for z in board.get_zones() if z.is_rule_area()]
+            if remove_keepouts else []
+        )
+        doomed_tracks = (
+            [t for t in [*board.get_tracks(), *board.get_vias()] if not t.net.name]
+            if remove_unassigned_tracks else []
+        )
+
+        def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
+            doomed: list[Any] = [*doomed_zones, *doomed_tracks]
+            if doomed:
+                board_.remove_items(doomed)
+            return {
+                "status": "success",
+                "keepouts_removed": len(doomed_zones),
+                "tracks_removed": len(doomed_tracks),
+            }
+        result = self._commit(board, mutate)
+        self._save(path, board)
+        return result
+
+    def auto_place(
+        self, path: Path, board_x: float, board_y: float,
+        board_width: float, board_height: float, clearance_mm: float = 1.5,
+        anchors: list[str] | None = None,
+        strategy: str = "net_aware",
+    ) -> dict[str, Any]:
+        """Spec §3 row 17 — net-aware placement over IPC moves.
+
+        The engine is pure Python and reads the on-disk board, exactly like the
+        bridge-side net-aware branch: flush live state to disk, compute the
+        plan, apply each pose through ``move_component`` (IPC), save. Anchored
+        refs are never moved (AC7). The legacy "row" packer runs inside pcbnew
+        and stays bridge-served.
+        """
+        if strategy == "row":
+            raise NotImplementedError(
+                "legacy row packer runs inside pcbnew — serve via the bridge path"
+            )
+        from kicad_mcp.backends.file_backend import build_engine_parts
+        from kicad_mcp.utils import placement_engine as engine
+
+        board = self._board(path)
+        self._save(path, board)  # live board -> disk, so the plan is current
+
+        parts = build_engine_parts(path, path.parent)
+        if not parts:
+            return {
+                "components_placed": 0, "rows": 0, "total_area_mm2": 0.0,
+                "placements": [], "warnings": [], "strategy": "net_aware",
+            }
+
+        keepouts, part_sides = engine.read_board_keepouts(path)
+        items, warnings, total_area = engine.compute_net_aware_plan(
+            parts, board_x, board_y, board_width, board_height,
+            clearance_mm, anchors,
+            diff_pair_nets=engine.read_diff_pair_nets(path),
+            keepouts=keepouts, part_sides=part_sides,
+        )
+        placements: list[dict[str, Any]] = []
+        applied_warnings: list[Any] = list(warnings)
+        for ref, x, y, rot in items:
+            try:
+                self.move_component(path, ref, x, y, rotation=rot)
+                placements.append({"reference": ref, "x": x, "y": y})
+            except Exception as exc:  # noqa: BLE001 — bridge parity: warn, keep going
+                applied_warnings.append(f"{ref}: move failed — {exc}")
+        self._save(path, board)
+        return {
+            "components_placed": len(placements),
+            "rows": 0,
+            "total_area_mm2": total_area,
+            "placements": placements,
+            "warnings": applied_warnings,
+            "strategy": "net_aware",
+        }
+
     # -- Reads (spec §3 rows 1–4) ----------------------------------------------
 
     def read_board(self, path: Path) -> dict[str, Any]:
@@ -505,6 +628,76 @@ class IPCBoardOps(BoardOps):
             })
         return items
 
+    # -- Specialized reads (spec §3 rows 13–14, S2) ------------------------------
+
+    def get_design_rules(self, path: Path) -> dict[str, Any]:
+        """Spec §3 row 14 — Default-netclass values over IPC.
+
+        KiCad 9.0.7 IPC exposes project netclasses but not the board-level
+        minimum constraints (``m_TrackMinWidth`` family) the bridge also
+        reports — those stay a documented bridge extra. An absent or empty
+        Default netclass falls through to the bridge rather than returning a
+        hollow result.
+        """
+        board = self._board(path)
+        classes = board.get_project().get_net_classes()
+        default = next((c for c in classes if c.name == "Default"), None)
+        if default is None:
+            raise NotImplementedError(
+                "IPC returned no Default netclass — serve via the bridge path"
+            )
+        result: dict[str, Any] = {}
+        for attr, key in [
+            ("clearance", "clearance_mm"),
+            ("track_width", "track_width_mm"),
+            ("via_diameter", "via_diameter_mm"),
+            ("via_drill", "via_drill_mm"),
+        ]:
+            value_nm = getattr(default, attr)
+            if value_nm is not None:
+                result[key] = _mm4(value_nm)
+        if not result:
+            raise NotImplementedError(
+                "IPC Default netclass carries no board settings — serve via "
+                "the bridge path"
+            )
+        return result
+
+    def get_stackup(self, path: Path) -> dict[str, Any]:
+        """Spec §3 row 13 — bridge-shape ``{layers, source}`` from kipy.
+
+        Shape parity note: the IPC layer-type enum cannot distinguish core
+        from prepreg (both map to "dielectric"); epsilon_r / loss_tangent come
+        from the first dielectric sub-layer, matching what the bridge reads
+        off the stackup descriptor.
+        """
+        board = self._board(path)
+        type_names = {
+            BoardStackupLayerType.BSLT_COPPER: "copper",
+            BoardStackupLayerType.BSLT_DIELECTRIC: "dielectric",
+            BoardStackupLayerType.BSLT_SILKSCREEN: "silkscreen",
+            BoardStackupLayerType.BSLT_SOLDERMASK: "soldermask",
+            BoardStackupLayerType.BSLT_SOLDERPASTE: "solderpaste",
+        }
+        layers: list[dict[str, Any]] = []
+        for layer in board.get_stackup().layers:
+            entry: dict[str, Any] = {
+                "name": layer.user_name,
+                "type": type_names.get(layer.type, "unknown"),
+                "thickness_mm": _mm4(layer.thickness),
+            }
+            if layer.material_name:
+                entry["material"] = layer.material_name
+            if layer.type == BoardStackupLayerType.BSLT_DIELECTRIC:
+                sub = layer.dielectric.layers
+                if sub:
+                    entry["epsilon_r"] = sub[0].epsilon_r
+                    entry["loss_tangent"] = sub[0].loss_tangent
+                    if "material" not in entry and sub[0].material_name:
+                        entry["material"] = sub[0].material_name
+            layers.append(entry)
+        return {"layers": layers, "source": "stackup_descriptor"}
+
 
 class IPCBackend(KiCadBackend):
     """KiCad backend serving live-board ops over the IPC API (kipy)."""
@@ -561,3 +754,53 @@ class IPCBackend(KiCadBackend):
         except Exception:  # noqa: BLE001 — mirror the bridge: project info is best-effort
             pass
         return result
+
+    # -- Project text variables (spec §3 rows 20–21, S2²→covered) ---------------
+
+    def _project(self, project_path: Path) -> Any:
+        """Resolve the open board's project and verify it is the one named.
+
+        Mirrors ``IPCBoardOps._board``: a mismatch raises with the canonical
+        "does not match open" phrase so the router falls through cleanly.
+        """
+        board = self._conn.board()
+        project = board.get_project()
+        requested = Path(project_path).stem
+        if project.name and os.path.normcase(requested) != os.path.normcase(project.name):
+            raise IPCUnavailableError(
+                f"Requested project '{requested}' does not match open project "
+                f"'{project.name}'",
+                remedy="Call open_kicad with the correct project path and wait "
+                       "for the board to load, then retry.",
+            )
+        return project
+
+    def get_text_variables(self, project_path: Any) -> dict[str, Any]:
+        """Spec §3 row 20 — live text-variable definitions via kipy Project."""
+        variables = self._project(Path(project_path)).get_text_variables()
+        return {"status": "success", "variables": dict(variables.variables)}
+
+    def set_text_variables(
+        self, project_path: Any, variables: dict[str, str],
+    ) -> dict[str, Any]:
+        """Spec §3 row 21 — replace-semantics write via kipy Project.
+
+        MMM_REPLACE keeps parity with the file-side implementation, which
+        overwrites the whole ``text_variables`` map. The post-write save
+        flushes live state to disk so file-side readers stay coherent
+        (bridge-first, same #14C rationale as ``IPCBoardOps._save``).
+        """
+        project = self._project(Path(project_path))
+        # TextVariables() without an explicit proto would alias the shared
+        # default-argument instance in kipy 0.5.0 (mutable-default bug) —
+        # always hand it a fresh proto.
+        wrapped = TextVariables(project_settings_pb2.TextVariables())
+        wrapped.variables = dict(variables)
+        project.set_text_variables(wrapped, MapMergeMode.MMM_REPLACE)
+        board_path = Path(project_path).with_suffix(".kicad_pcb")
+        if not _bridge_save(board_path):
+            try:
+                _save_board(self._conn.board())
+            except Exception:  # noqa: BLE001 — write landed; the flush is best-effort
+                logger.warning("post-set_text_variables save failed", exc_info=True)
+        return {"status": "success", "variables": variables, "count": len(variables)}

@@ -491,7 +491,7 @@ def _impl_run_freerouter(
 
     logger.info("Running FreeRouting: %s", " ".join(cmd))
 
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         proc = subprocess.Popen(
             cmd,

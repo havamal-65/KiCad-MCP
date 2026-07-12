@@ -3825,7 +3825,21 @@ class FileSchematicOps(SchematicOps):
                     except Exception:
                         pass
 
-        # 4. Transform pin positions to absolute schematic coordinates
+        # 4. Transform pin positions to absolute schematic coordinates.
+        #
+        # Mirrors KiCad's own SCH_SYMBOL TRANSFORM (eeschema/sch_symbol.cpp):
+        # the library point is first Y-flipped (the library frame is Y-up, the
+        # schematic is Y-down) to (u, v) = (px, -py), then rotated with KiCad's
+        # on-screen-counterclockwise convention, then mirrored. KiCad applies
+        # the symbol mirror AFTER rotation, as a negation of the transformed
+        # axis: mirror X negates the transformed Y, mirror Y negates the
+        # transformed X. Audited against eeschema ground truth for every
+        # rotation (0/90/180/270) x mirror (none/x/y) combination -- see
+        # tests/test_symbol_pin_rotation.py. The previous transposed rotation
+        # (px*cos - py*sin / px*sin + py*cos, with a pre-rotation mirror)
+        # matched eeschema only at 0/180 degrees and for mirrored 90/270, and
+        # was reflected through the symbol origin at un-mirrored 90/270 -- the
+        # schematic-domain twin of the board rotation bug fixed in b65df77.
         rad = math.radians(sym_rot)
         cos_r = math.cos(rad)
         sin_r = math.sin(rad)
@@ -3835,21 +3849,23 @@ class FileSchematicOps(SchematicOps):
             pos = pin.get("position")
             if pos is None:
                 continue
-            px = pos["x"]
-            py = pos["y"]
+            # Library coordinates are Y-up, schematic is Y-down: Y-flip first.
+            u = pos["x"]
+            v = -pos["y"]
 
-            # Library coordinates are Y-up, schematic is Y-down, so negate py
-            py_sch = -py
+            # KiCad rotation convention (positive angle = counterclockwise on
+            # screen); identical to the board-domain transform.
+            rot_x = u * cos_r + v * sin_r
+            rot_y = -u * sin_r + v * cos_r
 
-            # Apply mirror before rotation
+            # Symbol mirror is applied after rotation, negating the axis.
             if sym_mirror == "x":
-                py_sch = -py_sch
+                rot_y = -rot_y
             elif sym_mirror == "y":
-                px = -px
+                rot_x = -rot_x
 
-            # Apply rotation
-            abs_x = sx + px * cos_r - py_sch * sin_r
-            abs_y = sy + px * sin_r + py_sch * cos_r
+            abs_x = sx + rot_x
+            abs_y = sy + rot_y
 
             pin_key = pin.get("number", pin.get("name", ""))
             if pin_key:

@@ -1,0 +1,374 @@
+(kicad_sch
+  (version 20250114)
+  (generator "kicad_mcp")
+  (generator_version "9.0")
+  (uuid "23c87ca3-c726-4faf-ac03-d65512044df2")
+
+  (paper "A4")
+
+  (title_block
+    (title "Symbol Rotation Audit (F4 / #17)")
+    (rev "1")
+  )
+
+  (lib_symbols
+  
+    (symbol "Regulator_Linear:LM7805_TO220"
+    		(pin_names
+    			(offset 0.254)
+    		)
+    		(exclude_from_sim no)
+    		(in_bom yes)
+    		(on_board yes)
+    		(property "Reference" "U"
+    			(at -3.81 3.175 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    			)
+    		)
+    		(property "Value" "LM7805_TO220"
+    			(at 0 3.175 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    				(justify left)
+    			)
+    		)
+    		(property "Footprint" "Package_TO_SOT_THT:TO-220-3_Vertical"
+    			(at 0 5.715 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    					(italic yes)
+    				)
+    				(hide yes)
+    			)
+    		)
+    		(property "Datasheet" "https://www.onsemi.cn/PowerSolutions/document/MC7800-D.PDF"
+    			(at 0 -1.27 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    				(hide yes)
+    			)
+    		)
+    		(property "Description" "Positive 1A 35V Linear Regulator, Fixed Output 5V, TO-220"
+    			(at 0 0 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    				(hide yes)
+    			)
+    		)
+    		(property "ki_keywords" "Voltage Regulator 1A Positive"
+    			(at 0 0 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    				(hide yes)
+    			)
+    		)
+    		(property "ki_fp_filters" "TO?220*"
+    			(at 0 0 0)
+    			(effects
+    				(font
+    					(size 1.27 1.27)
+    				)
+    				(hide yes)
+    			)
+    		)
+    		(symbol "LM7805_TO220_0_1"
+    			(rectangle
+    				(start -5.08 1.905)
+    				(end 5.08 -5.08)
+    				(stroke
+    					(width 0.254)
+    					(type default)
+    				)
+    				(fill
+    					(type background)
+    				)
+    			)
+    		)
+    		(symbol "LM7805_TO220_1_1"
+    			(pin power_in line
+    				(at -7.62 0 0)
+    				(length 2.54)
+    				(name "VI"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    				(number "1"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    			)
+    			(pin power_in line
+    				(at 0 -7.62 90)
+    				(length 2.54)
+    				(name "GND"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    				(number "2"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    			)
+    			(pin power_out line
+    				(at 7.62 0 180)
+    				(length 2.54)
+    				(name "VO"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    				(number "3"
+    					(effects
+    						(font
+    							(size 1.27 1.27)
+    						)
+    					)
+    				)
+    			)
+    		)
+    		(embedded_fonts no)
+    	)
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 126.99999999999999 101.6 270.0)
+    (mirror y) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "2bce0de7-66f1-437e-b794-61532e80dd2d")
+    (property "Reference" "U270Y" (at 126.99999999999999 99.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 126.99999999999999 103.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U270Y") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 101.6 101.6 270.0)
+    (mirror x) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "4ff59b81-cf36-4659-9890-f715dea08fd4")
+    (property "Reference" "U270X" (at 101.6 99.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 101.6 103.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U270X") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 76.19999999999999 101.6 270.0) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "7a76c4f1-3626-4ce3-b91e-bef0b8bb2d92")
+    (property "Reference" "U270N" (at 76.19999999999999 99.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 76.19999999999999 103.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U270N") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 50.8 101.6 180.0)
+    (mirror y) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "365b6116-843d-4512-a50c-182b967c8c4b")
+    (property "Reference" "U180Y" (at 50.8 99.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 50.8 103.6 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U180Y") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 126.99999999999999 76.19999999999999 180.0)
+    (mirror x) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "5abf666b-7f84-4dd0-a265-46b77dea0889")
+    (property "Reference" "U180X" (at 126.99999999999999 74.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 126.99999999999999 78.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U180X") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 101.6 76.19999999999999 180.0) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "c4b1320f-d916-4152-a011-053c863f3111")
+    (property "Reference" "U180N" (at 101.6 74.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 101.6 78.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U180N") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 76.19999999999999 76.19999999999999 90.0)
+    (mirror y) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "a27cb91c-353f-4920-9480-1cde670b58b4")
+    (property "Reference" "U90Y" (at 76.19999999999999 74.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 76.19999999999999 78.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U90Y") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 50.8 76.19999999999999 90.0)
+    (mirror x) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "0ae26ea0-e7cd-44af-bbf1-3c3f4e79804f")
+    (property "Reference" "U90X" (at 50.8 74.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 50.8 78.19999999999999 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U90X") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 126.99999999999999 50.8 90.0) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "7977e56b-d29b-4e16-8bdc-22d75a7f2ea3")
+    (property "Reference" "U90N" (at 126.99999999999999 48.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 126.99999999999999 52.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U90N") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 101.6 50.8 0.0)
+    (mirror y) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "58060cab-5143-420f-95df-16add4a96892")
+    (property "Reference" "U0Y" (at 101.6 48.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 101.6 52.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U0Y") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 76.19999999999999 50.8 0.0)
+    (mirror x) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "3b249b3f-ac57-42af-b97d-2aaac9893545")
+    (property "Reference" "U0X" (at 76.19999999999999 48.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 76.19999999999999 52.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U0X") (unit 1)
+        )
+      )
+    )
+  )
+  (symbol (lib_id "Regulator_Linear:LM7805_TO220") (at 50.8 50.8 0.0) (unit 1)
+    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)
+    (uuid "c347f1a0-4323-4b09-b1f3-5bcd3f8df36d")
+    (property "Reference" "U0N" (at 50.8 48.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (property "Value" "audit" (at 50.8 52.8 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (instances
+      (project ""
+        (path "/23c87ca3-c726-4faf-ac03-d65512044df2"
+          (reference "U0N") (unit 1)
+        )
+      )
+    )
+  )
+
+  (sheet_instances
+    (path "/" (page "1"))
+  )
+)

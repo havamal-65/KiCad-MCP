@@ -67,6 +67,32 @@ def _is_on_grid(value: float, grid: float = _SCH_GRID_MM, tolerance: float = 0.0
     return abs(value - _snap_to_grid(value, grid)) <= tolerance
 
 
+# Half a grid step — the coincidence/on-segment tolerance for stub collision
+# checks (#19). A stub endpoint or segment within this distance of another pin
+# would create a silent schematic short.
+_STUB_COLLISION_EPS_MM = _SCH_GRID_MM / 2.0
+
+
+def _coincident(ax: float, ay: float, bx: float, by: float, eps: float) -> bool:
+    """True when points A and B are within *eps* mm of each other."""
+    return math.hypot(ax - bx, ay - by) <= eps
+
+
+def _point_on_segment(
+    px: float, py: float, ax: float, ay: float, bx: float, by: float, eps: float,
+) -> bool:
+    """True when point P lies within *eps* mm of segment A→B (endpoints included)."""
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0.0:
+        return _coincident(px, py, ax, ay, eps)
+    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+    if t < 0.0 or t > 1.0:
+        return False
+    proj_x, proj_y = ax + t * dx, ay + t * dy
+    return math.hypot(px - proj_x, py - proj_y) <= eps
+
+
 # ---------------------------------------------------------------------------
 # Footprint library helpers used by place_component
 # ---------------------------------------------------------------------------
@@ -3023,6 +3049,141 @@ class FileSchematicOps(SchematicOps):
     # Uses pin numbers only in v1 (pin names like "U1.SDA" not yet supported).
     _PIN_REF_RE = re.compile(r"^(#?[A-Za-z][A-Za-z0-9]*\d+[A-Za-z]?)\.(\w+)$")
 
+    def _pin_obstacles(
+        self, tree: list, path: Path, ref_cache: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Every placed pin in the sheet as ``{x, y, pin_id}`` obstacle records.
+
+        Used by the #19 stub-collision check. Resolves each symbol's pin
+        positions once, reusing (and populating) the caller's ``ref_cache`` so a
+        connect_pins_bulk call never re-parses a reference it already touched.
+        """
+        obstacles: list[dict[str, Any]] = []
+        for node in tree:
+            if not (isinstance(node, list) and len(node) >= 2 and node[0] == "symbol"):
+                continue
+            ref = None
+            for child in node[1:]:
+                if (isinstance(child, list) and len(child) >= 3
+                        and child[0] == "property" and child[1] == "Reference"):
+                    ref = child[2]
+                    break
+            if not ref:
+                continue
+            if ref not in ref_cache:
+                ref_cache[ref] = self._resolve_pin_positions(tree, ref, path)
+            info = ref_cache[ref]
+            if "error" in info:
+                continue
+            for num, pos in info.get("pin_positions", {}).items():
+                try:
+                    obstacles.append({
+                        "x": float(pos["x"]),
+                        "y": float(pos["y"]),
+                        "pin_id": f"{ref}.{num}",
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return obstacles
+
+    @staticmethod
+    def _stub_end(px: float, py: float, dx: float, dy: float, length: float) -> tuple[float, float]:
+        """Grid-snapped free end of a stub from (px, py) along (dx, dy).
+
+        Byte-identical to the #9 snap logic, including the collapse guard that
+        keeps a very short stub from snapping back onto the pin.
+        """
+        end_x = _snap_to_grid(px + dx * length)
+        end_y = _snap_to_grid(py + dy * length)
+        if end_x == px and end_y == py:
+            end_x = round(px + dx * _SCH_GRID_MM, 4)
+            end_y = round(py + dy * _SCH_GRID_MM, 4)
+        return end_x, end_y
+
+    def _choose_stub(
+        self, px: float, py: float, sx: float, sy: float, stub_length: float,
+        obstacles: list[dict[str, Any]], own_pin_id: str,
+    ) -> tuple[float, float, dict[str, Any] | None]:
+        """Pick a collision-free stub end for the pin at (px, py) — REQ-STUB-1..5.
+
+        Tries the dominant *outward* cardinal first (preserving #9 output when
+        it is clear), then the two perpendicular cardinals — each at full length,
+        then at one grid step — never the inward cardinal (into the symbol body).
+        Falls back to ``stub_length=0`` (terminate on the pin) if nothing is
+        clear. Returns ``(end_x, end_y, warning_or_None)``; the endpoint equals
+        (px, py) exactly only in the terminal fallback so the caller can suppress
+        the zero-length wire.
+        """
+        eps = _STUB_COLLISION_EPS_MM
+        others = [o for o in obstacles if o["pin_id"] != own_pin_id]
+
+        # Candidate directions: dominant outward cardinal, then the two
+        # perpendicular cardinals (outward sign first). Inward is excluded.
+        dx_raw, dy_raw = px - sx, py - sy
+        if abs(dx_raw) >= abs(dy_raw):
+            dom = (1.0, 0.0) if dx_raw >= 0 else (-1.0, 0.0)
+            perps = [(0.0, 1.0), (0.0, -1.0)] if dy_raw >= 0 else [(0.0, -1.0), (0.0, 1.0)]
+        else:
+            dom = (0.0, 1.0) if dy_raw >= 0 else (0.0, -1.0)
+            perps = [(1.0, 0.0), (-1.0, 0.0)] if dx_raw >= 0 else [(-1.0, 0.0), (1.0, 0.0)]
+        candidates = [dom, *perps]
+
+        def _clear(ex: float, ey: float) -> dict[str, Any] | None:
+            """First obstacle blocking the stub (px,py)→(ex,ey), or None."""
+            for o in others:
+                if _coincident(ex, ey, o["x"], o["y"], eps):
+                    return o
+                if _point_on_segment(o["x"], o["y"], px, py, ex, ey, eps):
+                    return o
+            return None
+
+        blockers: list[str] = []
+
+        def _note(hit: dict[str, Any]) -> None:
+            if hit["pin_id"] not in blockers:
+                blockers.append(hit["pin_id"])
+
+        # Loop 1 — full length, any allowed direction. Picks the first clear
+        # direction silently; the dominant cardinal is tried first, so a
+        # conflict-free pin produces #9-identical output (REQ-STUB-5).
+        for dx, dy in candidates:
+            ex, ey = self._stub_end(px, py, dx, dy, stub_length)
+            hit = _clear(ex, ey)
+            if hit is None:
+                return ex, ey, None
+            _note(hit)
+
+        # Loop 2 — one grid step. A clear reduced-length direction beats
+        # terminating on the pin; emit a structured warning (REQ-STUB-2/4).
+        for dx, dy in candidates:
+            ex, ey = self._stub_end(px, py, dx, dy, _SCH_GRID_MM)
+            hit = _clear(ex, ey)
+            if hit is None:
+                return ex, ey, {
+                    "type": "stub_collision",
+                    "pin": own_pin_id,
+                    "conflict_pins": list(blockers),
+                    "fallback": "reduced_length",
+                    "message": (
+                        f"Stub for {own_pin_id} would short onto "
+                        f"{', '.join(blockers)}; shortened to a clear direction."
+                    ),
+                }
+            _note(hit)
+
+        # Nothing clear at full or reduced length in any allowed direction →
+        # terminate on the pin. Never a silent short (REQ-STUB-2).
+        return px, py, {
+            "type": "stub_collision",
+            "pin": own_pin_id,
+            "conflict_pins": list(blockers),
+            "fallback": "stub_length=0",
+            "message": (
+                f"No clear stub direction for {own_pin_id} (blocked by "
+                f"{', '.join(blockers)}); terminated on the pin without a stub."
+            ),
+        }
+
     def connect_pins_bulk(
         self, path: Path, pins: list[str], net: str,
         stub_length: float = 2.54,
@@ -3042,6 +3203,12 @@ class FileSchematicOps(SchematicOps):
             if ref not in ref_cache:
                 ref_cache[ref] = self._resolve_pin_positions(tree, ref, path)
             return ref_cache[ref]
+
+        # Every pin in the sheet — the obstacle cloud for #19 stub-collision
+        # checks. Built once (and only when stubs are drawn); shares ref_cache.
+        obstacles = (
+            self._pin_obstacles(tree, path, ref_cache) if stub_length > 0 else []
+        )
 
         connected: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
@@ -3093,23 +3260,13 @@ class FileSchematicOps(SchematicOps):
                 })
 
             if stub_length > 0:
-                dx_raw = px - sx
-                dy_raw = py - sy
-                # Snap stub direction to whichever cardinal axis dominates.
-                # If pin is exactly at symbol center (rare), default to +X.
-                if abs(dx_raw) >= abs(dy_raw):
-                    dx = 1.0 if dx_raw >= 0 else -1.0
-                    dy = 0.0
-                else:
-                    dx = 0.0
-                    dy = 1.0 if dy_raw >= 0 else -1.0
-                end_x = _snap_to_grid(px + dx * stub_length)
-                end_y = _snap_to_grid(py + dy * stub_length)
-                # Snapping a very short stub can collapse it onto the pin;
-                # keep at least one axis-aligned grid step in that case.
-                if end_x == px and end_y == py:
-                    end_x = round(px + dx * _SCH_GRID_MM, 4)
-                    end_y = round(py + dy * _SCH_GRID_MM, 4)
+                # Choose a collision-free stub direction (#19): the stub must
+                # not land its endpoint or run its segment onto another pin.
+                end_x, end_y, stub_warning = self._choose_stub(
+                    px, py, sx, sy, stub_length, obstacles, pin_str,
+                )
+                if stub_warning is not None:
+                    warnings.append(stub_warning)
             else:
                 end_x = px
                 end_y = py
@@ -3117,7 +3274,10 @@ class FileSchematicOps(SchematicOps):
             label_uuid = str(_uuid.uuid4())
             wire_uuid: str | None = None
 
-            if stub_length > 0:
+            # Emit a wire only when the stub has a real length. The #19 fallback
+            # can terminate the stub on the pin (end == pin) even though
+            # stub_length > 0 — that must not write a zero-length wire.
+            if stub_length > 0 and (end_x, end_y) != (px, py):
                 wire_uuid = str(_uuid.uuid4())
                 blocks.append(
                     f'  (wire (pts (xy {px} {py}) (xy {end_x} {end_y}))\n'

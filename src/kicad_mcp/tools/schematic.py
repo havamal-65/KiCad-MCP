@@ -782,6 +782,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             connected entries: {pin, reference, pin_number, x, y,
                                 label_uuid, wire_uuid (null if stub_length=0)}.
             failed entries: {pin, reason}.
+            May include "warnings": each stub is collision-checked against every
+            other pin; if the preferred direction would short onto a neighbour
+            the stub is rerouted, shortened, or (last resort) terminated on the
+            pin — reported as {type: "stub_collision", pin, conflict_pins,
+            fallback}. A stub is never silently placed onto another pin.
         """
         p = validate_kicad_path(path, ".kicad_sch")
         validate_net_name(net)

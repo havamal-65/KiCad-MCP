@@ -173,11 +173,14 @@ def test_usb4085_places_gates_and_autoroutes(bridge_session):
         # clean_board=False: the default sweep would strip the fixture's
         # embedded ESP32 antenna keep-out (a rule area) from the live board.
         report = json.loads(autoroute_fn(path, max_passes=2, clean_board=False))
-        # The scratch fixture is a torture board full of netless pads, so
-        # post-route DRC noise is expected — "success_with_drc_errors" still
-        # means the routing pipeline ran end-to-end. The copper assertion
-        # below is the real AC3 check.
-        assert str(report["status"]).startswith("success"), report
+        # The scratch fixture is a torture board full of netless pads, so the
+        # pipeline may report "success", "success_with_drc_errors", or (with the
+        # F3 honest reporting) "partial" when some torture-board nets stay
+        # unrouted. Any of these means the routing pipeline ran end-to-end; the
+        # copper assertion below is the real AC3 check.
+        assert str(report["status"]) in (
+            "success", "success_with_drc_errors", "partial",
+        ), report
         step_names = [s["step"] for s in report["steps"]]
         assert "run_freerouter" in step_names, step_names
 

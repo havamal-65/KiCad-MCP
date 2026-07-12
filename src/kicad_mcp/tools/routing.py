@@ -255,6 +255,144 @@ def _import_ses_with_fallback(backend: BackendProtocol, p: Path, ses_path: Path)
         raise
 
 
+def _freerouting_version_from_jar(jar_name: str) -> str | None:
+    """The FreeRouting release from a JAR filename, e.g. 'freerouting-2.2.4.jar' → '2.2.4'.
+
+    Read from the launched JAR name (deterministic even if the process times out
+    before printing its banner) rather than scraping stdout.
+    """
+    import re
+    m = re.search(r"freerouting-(\d+\.\d+\.\d+)", jar_name)
+    return m.group(1) if m else None
+
+
+def _parse_freerouting_unrouted(output: str) -> int | None:
+    """Final unrouted-connection count FreeRouting reports on stdout, or None.
+
+    The authoritative source is v2.x's session-completed summary line, which
+    reads either ``... final score: 975.19 (7 unrouted)`` (incomplete) or
+    ``... final score: 995.66`` with the parenthetical **omitted when fully
+    routed** (0 unrouted) — confirmed live 2026-07-12. Per-pass ``(N unrouted)``
+    lines are deliberately ignored: at high pass counts the last *printed* count
+    is an intermediate pass, not the final state. v1.9.0's headless stdout has no
+    summary line → None (completeness left unverified, never falsely claimed).
+    """
+    import re
+    for line in output.splitlines():
+        if "session completed" not in line.lower():
+            continue
+        m = re.search(r"final score:\s*[\d.]+\s*\((\d+)\s+unrouted\)", line)
+        if m:
+            return int(m.group(1))
+        # Session completed with a score but no "(N unrouted)" → fully routed.
+        if re.search(r"final score:\s*[\d.]+", line):
+            return 0
+    return None
+
+
+def _parse_freerouting_vias(ses_path: Path) -> int | None:
+    """Count vias in a Specctra SES file (``(via ...)`` records), or None on error."""
+    try:
+        text = ses_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    import re
+    return len(re.findall(r"\(via\s", text))
+
+
+def _parse_freerouting_track_length(ses_path: Path) -> float | None:
+    """Total routed track length in a SES file (sum of wire-path segments).
+
+    Units are the SES's own (µm) — used only as a relative tie-break between
+    equal-via complete solutions, so the absolute unit is irrelevant.
+    """
+    import math
+    import re
+    try:
+        text = ses_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    total = 0.0
+    # (path <layer> <width> x1 y1 x2 y2 ...) — sum consecutive-point distances.
+    for m in re.finditer(r"\(path\s+\S+\s+[\d.]+\s+([-\d.\s]+?)\)", text):
+        nums = [float(v) for v in m.group(1).split()]
+        pts = list(zip(nums[0::2], nums[1::2]))
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            total += math.hypot(x2 - x1, y2 - y1)
+    return total
+
+
+# Via-cost ladder for the v2.x adaptive auto-tune (REQ-FR-6). 50 is FreeRouting's
+# max-completeness default; higher costs trade completeness for fewer vias. The
+# completeness optimum is board-dependent and non-monotonic, so the whole ladder
+# is tried and the best-complete result kept — never escalate-until-fail.
+_VIA_COST_LADDER = [50, 100, 150, 200, 300]
+
+
+def _detect_freerouting_is_v2(
+    config: KiCadMCPConfig, freerouting_jar: str, java_path: str,
+) -> bool:
+    """Best-effort: will this run use a via-cost-capable (v2.x) FreeRouting JAR?
+
+    Mirrors _impl_run_freerouter's resolver just enough to read the JAR name.
+    On any uncertainty returns False, so the caller falls back to a single
+    non-ladder run (safe — the run itself re-resolves and errors cleanly).
+    """
+    import re
+    from kicad_mcp.utils.platform_helper import detect_java_major_version
+    try:
+        if freerouting_jar:
+            jar: Path | None = Path(freerouting_jar)
+        elif config.freerouting_jar:
+            jar = config.freerouting_jar
+        else:
+            if java_path:
+                java: Path | None = Path(java_path)
+            elif config.java_path:
+                java = config.java_path
+            else:
+                java = find_java()
+            if java is None:
+                return False
+            jar = find_freerouting_jar(detect_java_major_version(java))
+        if jar is None:
+            return False
+        return re.search(r"freerouting-2\.", jar.name) is not None
+    except Exception:
+        return False
+
+
+def _select_via_ladder_winner(rungs: list[dict]) -> tuple[dict, bool]:
+    """Pick the best via-cost rung — REQ-FR-6.
+
+    Prefers a **fully-routed** (0 unrouted) rung with the **fewest vias**
+    (tie-break: shortest track length, then lowest via cost). If no rung fully
+    routes, returns the **most-complete** one (fewest unrouted) — flagged
+    incomplete so the caller reports ``partial``, never a false ``success``.
+
+    ``rungs`` entries carry: via_costs, unrouted (int|None), vias (int|None),
+    track_length (float|None). Returns ``(winner, fully_complete)``.
+    """
+    inf = float("inf")
+
+    def _via_key(r: dict) -> tuple:
+        return (
+            r.get("vias") if r.get("vias") is not None else inf,
+            r.get("track_length") if r.get("track_length") is not None else inf,
+            r.get("via_costs", inf),
+        )
+
+    complete = [r for r in rungs if r.get("unrouted") == 0]
+    if complete:
+        return min(complete, key=_via_key), True
+
+    def _unrouted_key(r: dict) -> tuple:
+        u = r.get("unrouted")
+        return (u if u is not None else inf, *_via_key(r))
+
+    return min(rungs, key=_unrouted_key), False
+
+
 def _impl_run_freerouter(
     dsn_path: str,
     output: str,
@@ -263,9 +401,21 @@ def _impl_run_freerouter(
     java_path: str,
     config: KiCadMCPConfig,
     change_log: ChangeLog,
+    via_costs: int | None = None,
 ) -> str:
-    """Run FreeRouting auto-router on a Specctra DSN file."""
+    """Run FreeRouting auto-router on a Specctra DSN file.
+
+    Reports the detected version, max_passes, elapsed time, unrouted-connection
+    count, and via count. Never reports ``success`` while connections remain
+    unrouted (→ ``incomplete``); a timeout returns a structured ``timeout``
+    result with a remedy hint rather than a bare error (REQ-FR-4, #22).
+
+    ``via_costs`` (REQ-FR-6): when set, injects ``--router.scoring.via_costs`` on
+    v2.x runs so the adaptive ladder can trade vias for completeness. Ignored on
+    v1.x, which has no such knob.
+    """
     import re
+    import time
 
     dsn = Path(dsn_path).resolve()
     if not dsn.exists():
@@ -316,6 +466,8 @@ def _impl_run_freerouter(
                        "or set KICAD_MCP_FREEROUTING_JAR environment variable.",
         })
 
+    detected_version = _freerouting_version_from_jar(jar.name)
+
     # v2.x requires --gui.enabled=false for headless/batch mode;
     # v1.x runs headlessly when -de/-do are provided without this flag.
     jar_is_v2 = re.search(r"freerouting-2\.", jar.name) is not None
@@ -330,6 +482,11 @@ def _impl_run_freerouter(
         "-do", str(ses),
         "-mp", str(max_passes),
     ]
+    # Adaptive via-cost (REQ-FR-6): the caller injects a via cost via
+    # via_costs; v2.x reads it as a Spring-style flag (same mechanism as
+    # --gui.enabled=false). v1.x has no such knob, so it is ignored there.
+    if jar_is_v2 and via_costs is not None:
+        cmd.append(f"--router.scoring.via_costs={int(via_costs)}")
 
     logger.info("Running FreeRouting: %s", " ".join(cmd))
 
@@ -349,19 +506,31 @@ def _impl_run_freerouter(
         })
 
     timeout_s = config.freerouting_timeout_seconds
+    start = time.monotonic()
     try:
         stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
+        elapsed_s = round(time.monotonic() - start, 2)
         return json.dumps({
-            "status": "error",
+            "status": "timeout",
+            "elapsed_s": elapsed_s,
+            "timeout_s": timeout_s,
+            "max_passes": max_passes,
+            "detected_version": detected_version,
+            "hint": (
+                "FreeRouting v2.x can stall in optimization at high pass "
+                "counts — lower max_passes, or raise "
+                "KICAD_MCP_FREEROUTING_TIMEOUT_SECONDS for a legitimately "
+                "dense board."
+            ),
             "message": (
                 f"FreeRouting timed out after {timeout_s} seconds "
-                f"(max_passes={max_passes}). Raise "
-                "KICAD_MCP_FREEROUTING_TIMEOUT_SECONDS or lower max_passes."
+                f"(max_passes={max_passes}, version={detected_version})."
             ),
-        })
+        }, indent=2)
+    elapsed_s = round(time.monotonic() - start, 2)
 
     combined_output = (
         stdout_bytes.decode(errors="replace") + stderr_bytes.decode(errors="replace")
@@ -393,12 +562,44 @@ def _impl_run_freerouter(
         "max_passes": max_passes,
     })
 
+    unrouted = _parse_freerouting_unrouted(combined_output)
+    vias = _parse_freerouting_vias(ses)
+
+    # Never claim success while connections remain unrouted (REQ-FR-4). A known
+    # positive count → incomplete; 0 → success; None (v1.x reports no count) →
+    # success with completeness flagged unverified, never a bare false success.
+    if unrouted is not None and unrouted > 0:
+        status = "incomplete"
+        message = (
+            f"FreeRouting incomplete: {unrouted} connection(s) still unrouted "
+            f"(max_passes={max_passes}, version={detected_version}) — raise "
+            "max_passes or adjust the via cost."
+        )
+    else:
+        status = "success"
+        if unrouted == 0:
+            message = "FreeRouting completed: fully routed (0 unrouted)."
+        else:
+            message = (
+                "FreeRouting completed; this version does not report an "
+                "unrouted count, so completeness is unverified here."
+            )
+
     response: dict = {
-        "status": "success",
+        "status": status,
         "ses_path": str(ses),
         "ses_size_bytes": ses.stat().st_size,
-        "message": "FreeRouting completed successfully",
+        "detected_version": detected_version,
+        "max_passes": max_passes,
+        "elapsed_s": elapsed_s,
+        "unrouted": unrouted,
+        "vias": vias,
+        "message": message,
     }
+    if unrouted is None:
+        response["completeness"] = "unverified"
+    if via_costs is not None:
+        response["via_costs"] = int(via_costs)
     if routing_time is not None:
         response["routing_time_seconds"] = routing_time
     if improvement is not None:
@@ -882,6 +1083,8 @@ def register_tools(
         java_path: str = "",
         max_passes: int = 10,
         clean_board: bool = True,
+        adaptive_via_cost: bool = True,
+        via_cost_ladder: list[int] | None = None,
     ) -> str:
         """Run the full auto-routing pipeline on a PCB board.
 
@@ -891,6 +1094,13 @@ def register_tools(
         Board outline and loadability are validated inside export_dsn — no separate
         preflight step is needed here.
 
+        On a via-cost-capable (v2.x) FreeRouting the router auto-tunes the via
+        cost: it routes the whole ``via_cost_ladder`` and keeps the fully-routed
+        result with the fewest vias (the completeness optimum is board-dependent
+        and non-monotonic, so the whole ladder is tried). If no rung fully routes
+        it reports ``partial`` with the unrouted count — never a false success.
+        The v1.9.0 fallback runs once (its optimizer already minimizes vias).
+
         Args:
             path: Path to .kicad_pcb file.
             freerouting_jar: Path to freerouting JAR. Auto-detected if empty.
@@ -899,9 +1109,14 @@ def register_tools(
                 quality converges by ~8 passes; more only costs time. On v2.x,
                 high pass counts can stall (see #21/#22) — lower on a stall.
             clean_board: Remove keepouts and bad tracks first (default true).
+            adaptive_via_cost: Auto-tune the via cost on v2.x (default true).
+            via_cost_ladder: Override the via-cost ladder (default
+                [50, 100, 150, 200, 300]). Ignored on v1.x / when adaptive off.
 
         Returns:
-            JSON with comprehensive routing report.
+            JSON with comprehensive routing report. status is "success" (fully
+            routed), "partial" (routed but connections remain — carries
+            unrouted), "success_with_drc_errors", or "error".
         """
         p = validate_kicad_path(path, ".kicad_pcb")
         dsn = p.parent / "freerouting.dsn"
@@ -1011,18 +1226,69 @@ def register_tools(
             report["message"] = f"DSN export failed: {exc}"
             return json.dumps(report, indent=2)
 
-        # Step 3: Run FreeRouting
-        result_json = _impl_run_freerouter(
-            str(dsn), str(ses), max_passes, freerouting_jar, java_path,
-            config, change_log,
-        )
-        result = json.loads(result_json)
-        report["steps"].append({"step": "run_freerouter", **result})
-        if result["status"] != "success":
-            report["status"] = "error"
-            report["message"] = f"FreeRouting failed: {result.get('message', '')}"
-            dsn.unlink(missing_ok=True)
-            return json.dumps(report, indent=2)
+        # Step 3: Run FreeRouting. On v2.x, auto-tune the via cost across the
+        # ladder and keep the best-complete result (REQ-FR-6); v1.x runs once.
+        temp_ses: list[Path] = []  # every SES written this run, for cleanup
+        is_v2 = _detect_freerouting_is_v2(config, freerouting_jar, java_path)
+        route_complete = False
+        route_unrouted: int | None = None
+
+        if is_v2 and adaptive_via_cost:
+            ladder = via_cost_ladder or _VIA_COST_LADDER
+            rungs: list[dict] = []
+            for vc in ladder:
+                ses_vc = p.parent / f"freerouting_vc{vc}.ses"
+                temp_ses.append(ses_vc)
+                rj = json.loads(_impl_run_freerouter(
+                    str(dsn), str(ses_vc), max_passes, freerouting_jar,
+                    java_path, config, change_log, via_costs=vc,
+                ))
+                report["steps"].append({"step": "run_freerouter", **rj})
+                if ses_vc.exists():
+                    rungs.append({
+                        "via_costs": vc,
+                        "unrouted": rj.get("unrouted"),
+                        "vias": rj.get("vias"),
+                        "track_length": _parse_freerouting_track_length(ses_vc),
+                        "ses_path": str(ses_vc),
+                    })
+                if rj.get("status") == "timeout":
+                    break  # a stall won't improve at higher costs — stop laddering
+
+            if not rungs:
+                report["status"] = "error"
+                report["message"] = "FreeRouting produced no session on any via-cost rung"
+                dsn.unlink(missing_ok=True)
+                for s in temp_ses:
+                    s.unlink(missing_ok=True)
+                return json.dumps(report, indent=2)
+
+            winner, route_complete = _select_via_ladder_winner(rungs)
+            ses = Path(winner["ses_path"])
+            route_unrouted = winner.get("unrouted")
+            report["via_ladder"] = {
+                "tried": [r["via_costs"] for r in rungs],
+                "selected_via_cost": winner["via_costs"],
+                "complete": route_complete,
+                "vias": winner.get("vias"),
+                "unrouted": route_unrouted,
+            }
+        else:
+            rj = json.loads(_impl_run_freerouter(
+                str(dsn), str(ses), max_passes, freerouting_jar, java_path,
+                config, change_log,
+            ))
+            report["steps"].append({"step": "run_freerouter", **rj})
+            temp_ses.append(ses)
+            if rj.get("status") in ("error", "timeout") or not ses.exists():
+                report["status"] = "error"
+                report["message"] = f"FreeRouting failed: {rj.get('message', '')}"
+                dsn.unlink(missing_ok=True)
+                return json.dumps(report, indent=2)
+            route_unrouted = rj.get("unrouted")
+            # unrouted 0 → complete; None → v1.x can't report (treat as complete,
+            # its optimizer is strong); >0 → partial.
+            route_complete = route_unrouted in (0, None)
 
         # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves),
         # falling back to a headless subprocess that loads the board fresh from disk when the
@@ -1030,72 +1296,56 @@ def register_tools(
         try:
             ses_result = _import_ses_with_fallback(backend, p, ses)
             report["steps"].append({"step": "import_ses", "status": "success", **ses_result})
-            report["message"] = (
-                f"Auto-routing complete: {ses_result.get('new_tracks', 0)} tracks routed"
-            )
-            result = {"status": "success", **ses_result}
         except Exception as exc:
             report["status"] = "error"
             report["message"] = f"SES import failed: {exc}"
+            for s in temp_ses:
+                s.unlink(missing_ok=True)
+            dsn.unlink(missing_ok=True)
             return json.dumps(report, indent=2)
 
-        # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking)
-        if result["status"] == "success":
-            try:
-                drc_ops = backend.get_drc_ops()
-                drc_result = drc_ops.run_drc(p, None)
-                drc_passed = drc_result.get("passed", False)
-                error_count = drc_result.get("error_count", 0)
-                report["steps"].append({
-                    "step": "post_route_drc",
-                    "status": "success",
-                    "passed": drc_passed,
-                    "error_count": error_count,
-                    "warning_count": drc_result.get("warning_count", 0),
-                })
-                if not drc_passed:
-                    report["status"] = "success_with_drc_errors"
-                    report["message"] = (
-                        f"Routed {result.get('new_tracks', 0)} tracks but DRC found "
-                        f"{error_count} error(s) — inspect board before fabrication."
-                    )
-            except Exception as drc_exc:
-                report["steps"].append({
-                    "step": "post_route_drc",
-                    "status": "unavailable",
-                    "message": f"Post-route DRC skipped: {drc_exc}",
-                })
+        new_tracks = ses_result.get("new_tracks", 0)
+        if route_complete:
+            report["status"] = "success"
+            report["message"] = f"Auto-routing complete: {new_tracks} tracks routed"
+        else:
+            report["status"] = "partial"
+            report["message"] = (
+                f"Auto-routing incomplete: {new_tracks} tracks routed, "
+                f"{route_unrouted} connection(s) still unrouted — raise "
+                "max_passes or review placement."
+            )
 
-        # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking)
-        if result["status"] == "success":
-            try:
-                drc_ops = backend.get_drc_ops()
-                drc_result = drc_ops.run_drc(p, None)
-                drc_passed = drc_result.get("passed", False)
-                error_count = drc_result.get("error_count", 0)
-                report["steps"].append({
-                    "step": "post_route_drc",
-                    "status": "success",
-                    "passed": drc_passed,
-                    "error_count": error_count,
-                    "warning_count": drc_result.get("warning_count", 0),
-                })
-                if not drc_passed:
-                    report["status"] = "success_with_drc_errors"
-                    report["message"] = (
-                        f"Routed {result.get('new_tracks', 0)} tracks but DRC found "
-                        f"{error_count} error(s) — inspect board before fabrication."
-                    )
-            except Exception as drc_exc:
-                report["steps"].append({
-                    "step": "post_route_drc",
-                    "status": "unavailable",
-                    "message": f"Post-route DRC skipped: {drc_exc}",
-                })
+        # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking).
+        try:
+            drc_ops = backend.get_drc_ops()
+            drc_result = drc_ops.run_drc(p, None)
+            drc_passed = drc_result.get("passed", False)
+            error_count = drc_result.get("error_count", 0)
+            report["steps"].append({
+                "step": "post_route_drc",
+                "status": "success",
+                "passed": drc_passed,
+                "error_count": error_count,
+                "warning_count": drc_result.get("warning_count", 0),
+            })
+            if not drc_passed and report["status"] == "success":
+                report["status"] = "success_with_drc_errors"
+                report["message"] = (
+                    f"Routed {new_tracks} tracks but DRC found "
+                    f"{error_count} error(s) — inspect board before fabrication."
+                )
+        except Exception as drc_exc:
+            report["steps"].append({
+                "step": "post_route_drc",
+                "status": "unavailable",
+                "message": f"Post-route DRC skipped: {drc_exc}",
+            })
 
-        # Clean up temp files
+        # Clean up temp files (dsn + every rung's SES)
         dsn.unlink(missing_ok=True)
-        ses.unlink(missing_ok=True)
+        for s in temp_ses:
+            s.unlink(missing_ok=True)
 
         change_log.record("autoroute", {"path": path, "max_passes": max_passes})
         return json.dumps(report, indent=2)

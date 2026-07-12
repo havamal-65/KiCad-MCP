@@ -46,7 +46,8 @@ def parse_sexp_content(content: str, source: str = "<string>") -> list[Any]:
     try:
         import sexpdata
         parsed = sexpdata.loads(content)
-        return _normalize_sexpdata(parsed)
+        result: list[Any] = _normalize_sexpdata(parsed)
+        return result
     except ImportError:
         return _simple_parse(content)
 
@@ -432,7 +433,7 @@ def find_nearest_wires(
     start_x: float, start_y: float,
     end_x: float, end_y: float,
     count: int = 3,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Rank wires by endpoint distance to the requested segment.
 
     Used to build actionable no-match diagnostics for ``remove_wire``.
@@ -445,7 +446,7 @@ def find_nearest_wires(
     """
     import math
 
-    candidates = []
+    candidates: list[dict[str, Any]] = []
     for _idx, _end, (wx1, wy1, wx2, wy2) in _iter_wire_segments(content):
         forward = (math.hypot(wx1 - start_x, wy1 - start_y)
                    + math.hypot(wx2 - end_x, wy2 - end_y))
@@ -517,7 +518,7 @@ def _unescape_sexp_string(raw: str) -> str:
 def _iter_label_blocks(
     content: str,
     kinds: tuple[str, ...] = _LABEL_KINDS,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Enumerate label blocks of the given kinds.
 
     Returns:
@@ -595,7 +596,7 @@ def find_nearest_labels(
     x: float, y: float,
     count: int = 3,
     kinds: tuple[str, ...] = _LABEL_KINDS,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Rank labels by distance to the requested position.
 
     Used to build actionable no-match diagnostics for the label edit ops.

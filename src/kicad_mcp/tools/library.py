@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.base import BackendProtocol
+from kicad_mcp.backends.base import BackendProtocol, LibraryOps
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog
 
@@ -56,7 +57,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         if project_dir:
             from kicad_mcp.backends.file_backend import FileLibraryOps
-            ops = FileLibraryOps(project_dir=project_dir)
+            ops: LibraryOps = FileLibraryOps(project_dir=project_dir)
         else:
             ops = backend.get_library_ops()
         results = ops.search_footprints(query)
@@ -100,7 +101,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         if project_dir:
             from kicad_mcp.backends.file_backend import FileLibraryOps
-            ops = FileLibraryOps(project_dir=project_dir)
+            ops: LibraryOps = FileLibraryOps(project_dir=project_dir)
         else:
             ops = backend.get_library_ops()
         libraries = ops.list_libraries()
@@ -125,9 +126,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             page = page[:limit]
 
         if summary:
-            entries: list[dict] = []
+            entries: list[dict[str, Any]] = []
             for lib in page:
-                entry: dict = {"name": lib.get("name"), "type": lib.get("type")}
+                entry: dict[str, Any] = {"name": lib.get("name"), "type": lib.get("type")}
                 if lib.get("type") == "footprint" and lib.get("path"):
                     try:
                         from pathlib import Path
@@ -198,7 +199,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         result = ops.suggest_footprints(lib_id)
 
         # Enrich each suggested footprint with physical dimensions
-        enriched: list[dict] = []
+        enriched: list[dict[str, Any]] = []
         for fp in result.get("footprints", []):
             fp_id = fp.get("lib_id", "")
             entry = dict(fp)
@@ -269,7 +270,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 alias_note = "routing_overhead_pct is a deprecated alias for routing_channel_pct"
         effective_panel = panel_keepout_mm if panel_keepout_mm != 3.0 else edge_clearance_mm
 
-        per_component: list[dict] = []
+        per_component: list[dict[str, Any]] = []
         missing: list[str] = []
         component_area = 0.0
         mh_count = 0

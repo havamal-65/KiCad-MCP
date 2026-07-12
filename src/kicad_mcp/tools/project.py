@@ -384,7 +384,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     edge_clearance = 3.0
                     raw_w = math.sqrt(routed_area * 1.4) + edge_clearance * 2
                     raw_h = math.sqrt(routed_area / 1.4) + edge_clearance * 2
-                    ceil5 = lambda v: math.ceil(v / 5.0) * 5.0
+                    def ceil5(v: float) -> float:
+                        return math.ceil(v / 5.0) * 5.0
                     estimated_width = ceil5(ceil5(raw_w) * 1.25)
                     estimated_height = ceil5(ceil5(raw_h) * 1.25)
             except Exception:
@@ -420,7 +421,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         plan_path.write_text(_json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
 
         change_log.record("plan_project", {"dir": project_dir, "fab": fab_target})
-        result: dict = {
+        result: dict[str, Any] = {
             "status": "success",
             "plan_file": str(plan_path),
             "plan": plan,
@@ -492,7 +493,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         p = Path(path).resolve()
         files = resolve_project_files(p)
 
-        result = {
+        result: dict[str, Any] = {
             "status": "success",
             "project": {
                 "name": p.stem if p.is_file() else p.name,
@@ -726,7 +727,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps(result, indent=2)
 
     @mcp.tool()
-    def set_text_variables(project_path: str, variables: dict) -> str:
+    def set_text_variables(project_path: str, variables: dict[str, Any]) -> str:
         """Set project text variables.
 
         Updates ${VAR} substitution values used in title blocks, schematic

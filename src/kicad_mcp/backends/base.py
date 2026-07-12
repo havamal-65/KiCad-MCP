@@ -114,6 +114,14 @@ class BoardOps(ABC):
         """Reload the board from disk into pcbnew (sync after external file writes)."""
         raise NotImplementedError("This backend does not support explicit board reload")
 
+    def clean_board_for_routing(
+        self, path: Path,
+        remove_keepouts: bool = True,
+        remove_unassigned_tracks: bool = True,
+    ) -> dict[str, Any]:
+        """Strip keep-outs and net-less tracks/vias before routing (live backends)."""
+        raise NotImplementedError("This backend does not support clean_board_for_routing")
+
     def add_board_outline(
         self, path: Path, x: float, y: float,
         width: float, height: float, line_width: float = 0.05,
@@ -131,7 +139,7 @@ class BoardOps(ABC):
         raise NotImplementedError("This backend does not support auto_place")
 
     def place_components_bulk(
-        self, path: Path, components: list[dict],
+        self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Place multiple components in a single read/write cycle.
 
@@ -281,7 +289,7 @@ class SchematicOps(ABC):
         raise NotImplementedError("This backend does not support netlist generation")
 
     def add_components_bulk(
-        self, path: Path, components: list[dict],
+        self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Add multiple components in a single read/write cycle.
 
@@ -293,7 +301,7 @@ class SchematicOps(ABC):
         raise NotImplementedError("This backend does not support add_components_bulk")
 
     def add_power_symbols_bulk(
-        self, path: Path, symbols: list[dict],
+        self, path: Path, symbols: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Add multiple power symbols in a single read/write cycle.
 
@@ -318,7 +326,7 @@ class SchematicOps(ABC):
         raise NotImplementedError("This backend does not support connect_pins_bulk")
 
     def add_no_connects_bulk(
-        self, path: Path, points: list[dict],
+        self, path: Path, points: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Add multiple no-connect markers in a single read/write cycle.
 
@@ -328,7 +336,7 @@ class SchematicOps(ABC):
         raise NotImplementedError("This backend does not support add_no_connects_bulk")
 
     def move_components_bulk(
-        self, path: Path, moves: list[dict],
+        self, path: Path, moves: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Move multiple symbols in a single read/write cycle.
 
@@ -584,7 +592,7 @@ class BackendProtocol:
         """
         return False
 
-    def export_dsn(self, path: Path, dsn_path: Path) -> dict:
+    def export_dsn(self, path: Path, dsn_path: Path) -> dict[str, Any]:
         """Export DSN for FreeRouting.
 
         Routes to the best available BOARD_ROUTE backend (plugin bridge if active,
@@ -592,7 +600,7 @@ class BackendProtocol:
         """
         raise NotImplementedError("This backend does not support DSN export")
 
-    def import_ses(self, path: Path, ses_path: Path) -> dict:
+    def import_ses(self, path: Path, ses_path: Path) -> dict[str, Any]:
         """Import FreeRouting SES result.
 
         Routes to the best available BOARD_ROUTE backend (plugin bridge if active,

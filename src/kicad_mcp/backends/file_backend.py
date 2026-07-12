@@ -1086,8 +1086,8 @@ class FileBoardOps(BoardOps):
 
     def set_board_design_rules(
         self, path: Path, preset: str = "class2",
-        differential_pairs: list[dict] | None = None,
-        length_matching: list[dict] | None = None,
+        differential_pairs: list[dict[str, Any]] | None = None,
+        length_matching: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Write design rules into the project's Default netclass.
 
@@ -1225,8 +1225,8 @@ class FileBoardOps(BoardOps):
 
     @staticmethod
     def _upsert_netclass(
-        classes: list, name: str, *, width: float, gap: float, via_gap: float, seed: dict
-    ) -> dict:
+        classes: list[Any], name: str, *, width: float, gap: float, via_gap: float, seed: dict[str, Any]
+    ) -> dict[str, Any]:
         """Upsert a named netclass with diff-pair fields (idempotent by name).
 
         New named classes are seeded from the ``Default`` netclass shape and
@@ -1252,7 +1252,7 @@ class FileBoardOps(BoardOps):
 
     @staticmethod
     def _assign_nets_to_class(
-        net_settings: dict, netclass: str, nets: list | None, net_pattern: str | None
+        net_settings: dict[str, Any], netclass: str, nets: list[Any] | None, net_pattern: str | None
     ) -> None:
         """Map nets to a netclass via ``net_settings.netclass_patterns``.
 
@@ -1315,7 +1315,7 @@ class FileBoardOps(BoardOps):
         return text[:idx] + text[end:]
 
     def _apply_length_matching(
-        self, path: Path, length_matching: list[dict]
+        self, path: Path, length_matching: list[dict[str, Any]]
     ) -> dict[str, Any]:
         """Write length constraints to the sibling ``.kicad_dru`` (approved surface).
 
@@ -1529,8 +1529,8 @@ class FileBoardOps(BoardOps):
 
         anchor_set: set[str] = set(anchors or [])
         warnings: list[str] = []
-        placements: list[dict] = []
-        comp_dims: list[dict] = []
+        placements: list[dict[str, Any]] = []
+        comp_dims: list[dict[str, Any]] = []
 
         for comp in components:
             ref = comp.get("reference", "")
@@ -1577,7 +1577,7 @@ class FileBoardOps(BoardOps):
         # schematic with no overrides — this collapses to a single
         # largest-first sort identical to pre-6.3.3 behavior.
         from collections import defaultdict
-        clusters: dict[str, list[dict]] = defaultdict(list)
+        clusters: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for c in comp_dims:
             clusters[c["cluster_key"]].append(c)
         for g in clusters.values():
@@ -1870,7 +1870,7 @@ class FileBoardOps(BoardOps):
         }
 
     def place_components_bulk(
-        self, path: Path, components: list[dict],
+        self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Place multiple components in a single file read/write cycle.
 
@@ -1906,7 +1906,7 @@ class FileBoardOps(BoardOps):
         on_board = index_existing(self.get_components(path))
         content = path.read_text(encoding="utf-8")
         placed: list[str] = []
-        failed: list[dict] = []
+        failed: list[dict[str, Any]] = []
         idempotent: list[str] = []
         inserts: list[str] = []
 
@@ -2289,7 +2289,8 @@ class FileSchematicOps(SchematicOps):
 
     def get_symbols(self, path: Path) -> list[dict[str, Any]]:
         result = self.read_schematic(path)
-        return result.get("symbols", [])
+        symbols: list[dict[str, Any]] = result.get("symbols", [])
+        return symbols
 
     def _resolve_symbol_libs(self) -> list[Path]:
         """Lazily resolve system symbol library paths (avoids scanning at construction)."""
@@ -2486,11 +2487,11 @@ class FileSchematicOps(SchematicOps):
         """
         lib_sym_end = content.find("(lib_symbols")
         if lib_sym_end != -1:
-            lib_sym_end = _walk_balanced_parens(content, lib_sym_end)
-            if lib_sym_end is not None:
+            balanced_end: int | None = _walk_balanced_parens(content, lib_sym_end)
+            if balanced_end is not None:
                 # Advance past the closing ) and the newline that follows it,
                 # so that inserted elements start on their own line.
-                pos = lib_sym_end + 1
+                pos = balanced_end + 1
                 if pos < len(content) and content[pos] == '\n':
                     pos += 1
                 return pos
@@ -2888,7 +2889,7 @@ class FileSchematicOps(SchematicOps):
     # ------------------------------------------------------------------
 
     def add_components_bulk(
-        self, path: Path, components: list[dict],
+        self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
         import uuid as _uuid
 
@@ -2968,7 +2969,7 @@ class FileSchematicOps(SchematicOps):
         return {"placed": placed, "failed": failed}
 
     def add_power_symbols_bulk(
-        self, path: Path, symbols: list[dict],
+        self, path: Path, symbols: list[dict[str, Any]],
     ) -> dict[str, Any]:
         import uuid as _uuid
 
@@ -3050,7 +3051,7 @@ class FileSchematicOps(SchematicOps):
     _PIN_REF_RE = re.compile(r"^(#?[A-Za-z][A-Za-z0-9]*\d+[A-Za-z]?)\.(\w+)$")
 
     def _pin_obstacles(
-        self, tree: list, path: Path, ref_cache: dict[str, dict[str, Any]],
+        self, tree: list[Any], path: Path, ref_cache: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Every placed pin in the sheet as ``{x, y, pin_id}`` obstacle records.
 
@@ -3314,7 +3315,7 @@ class FileSchematicOps(SchematicOps):
         return result
 
     def add_no_connects_bulk(
-        self, path: Path, points: list[dict],
+        self, path: Path, points: list[dict[str, Any]],
     ) -> dict[str, Any]:
         import uuid as _uuid
 
@@ -3349,7 +3350,7 @@ class FileSchematicOps(SchematicOps):
         return {"placed": placed, "failed": failed}
 
     def move_components_bulk(
-        self, path: Path, moves: list[dict],
+        self, path: Path, moves: list[dict[str, Any]],
     ) -> dict[str, Any]:
         content = path.read_text(encoding="utf-8")
 
@@ -3661,7 +3662,7 @@ class FileSchematicOps(SchematicOps):
         return self._resolve_pin_positions(tree, reference, path)
 
     def _resolve_pin_positions(
-        self, tree: list, reference: str, path: Path,
+        self, tree: list[Any], reference: str, path: Path,
     ) -> dict[str, Any]:
         """Resolve absolute pin coordinates for a placed symbol.
 
@@ -3762,8 +3763,8 @@ class FileSchematicOps(SchematicOps):
         # 3. Extract pins from lib symbol (recurse into sub-symbols).
         # If the cached symbol uses (extends "ParentName"), the pin definitions
         # live in the parent symbol inside the source .kicad_sym library file.
-        def _collect_pins_from_node(node: list) -> list[dict]:
-            collected: list[dict] = []
+        def _collect_pins_from_node(node: list[Any]) -> list[dict[str, Any]]:
+            collected: list[dict[str, Any]] = []
             for child in node[1:]:
                 if not isinstance(child, list) or len(child) < 2:
                     continue
@@ -3800,7 +3801,7 @@ class FileSchematicOps(SchematicOps):
                         # Follow extends chain (up to 5 levels deep)
                         resolved_name = parent_name
                         for _ in range(5):
-                            parent_node: list | None = None
+                            parent_node: list[Any] | None = None
                             for node in lib_tree:
                                 if (isinstance(node, list) and len(node) >= 2
                                         and node[0] == "symbol"
@@ -4083,7 +4084,7 @@ class FileSchematicOps(SchematicOps):
             if lbl.get("text") == net_name:
                 labels_on_net.append(lbl)
 
-        wires_on_net = []  # Simplified: return all wires (full wire-to-net mapping is complex)
+        wires_on_net: list[dict[str, Any]] = []  # Simplified: return all wires (full wire-to-net mapping is complex)
 
         return {
             "net_name": net_name,
@@ -4170,12 +4171,13 @@ class FileSchematicOps(SchematicOps):
 
         TOLERANCE = 0.02
 
-        def _near(a: dict, b: dict) -> bool:
-            return (abs(a.get("x", 0) - b.get("x", 0)) < TOLERANCE
+        def _near(a: dict[str, Any], b: dict[str, Any]) -> bool:
+            result: bool = (abs(a.get("x", 0) - b.get("x", 0)) < TOLERANCE
                     and abs(a.get("y", 0) - b.get("y", 0)) < TOLERANCE)
+            return result
 
         # --- Check 1: Duplicate reference designators ---
-        ref_counts: dict[str, list[dict]] = {}
+        ref_counts: dict[str, list[dict[str, Any]]] = {}
         for sym in symbols:
             ref = sym.get("reference", "")
             if not ref or ref.startswith("#"):
@@ -4929,7 +4931,7 @@ class FileBackend(KiCadBackend):
 
 # --- S-expression parsing helpers ---
 
-def _parse_title_block(node: list) -> dict[str, Any]:
+def _parse_title_block(node: list[Any]) -> dict[str, Any]:
     info: dict[str, Any] = {}
     for child in node[1:]:
         if isinstance(child, list) and len(child) >= 2:
@@ -4942,7 +4944,7 @@ def _parse_title_block(node: list) -> dict[str, Any]:
     return info
 
 
-def _parse_layers(node: list) -> list[str]:
+def _parse_layers(node: list[Any]) -> list[str]:
     layers = []
     for child in node[1:]:
         if isinstance(child, list) and len(child) >= 3:
@@ -4950,7 +4952,7 @@ def _parse_layers(node: list) -> list[str]:
     return layers
 
 
-def _parse_footprint(node: list) -> dict[str, Any] | None:
+def _parse_footprint(node: list[Any]) -> dict[str, Any] | None:
     if len(node) < 2:
         return None
     comp: dict[str, Any] = {"footprint": node[1]}
@@ -4992,7 +4994,7 @@ def _parse_footprint(node: list) -> dict[str, Any] | None:
     return comp
 
 
-def _parse_segment(node: list) -> dict[str, Any] | None:
+def _parse_segment(node: list[Any]) -> dict[str, Any] | None:
     track: dict[str, Any] = {}
     for child in node[1:]:
         if not isinstance(child, list) or len(child) < 2:
@@ -5011,7 +5013,7 @@ def _parse_segment(node: list) -> dict[str, Any] | None:
     return track if "start" in track else None
 
 
-def _parse_setup(node: list) -> dict[str, Any]:
+def _parse_setup(node: list[Any]) -> dict[str, Any]:
     rules: dict[str, Any] = {}
     for child in node[1:]:
         if not isinstance(child, list) or len(child) < 2:
@@ -5030,7 +5032,7 @@ def _parse_setup(node: list) -> dict[str, Any]:
     return rules
 
 
-def _parse_sheet_node(node: list) -> dict[str, Any] | None:
+def _parse_sheet_node(node: list[Any]) -> dict[str, Any] | None:
     """Parse a (sheet ...) S-expression block from a KiCad schematic."""
     if len(node) < 2:
         return None
@@ -5064,7 +5066,7 @@ def _parse_sheet_node(node: list) -> dict[str, Any] | None:
     return sheet if "sheetfile" in sheet else None
 
 
-def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
+def _parse_sch_symbol(node: list[Any]) -> dict[str, Any] | None:
     """Parse a placed symbol node into a flat dict.
 
     Reference, Value, and Footprint stay as named top-level fields for
@@ -5125,7 +5127,7 @@ def _parse_sch_symbol(node: list) -> dict[str, Any] | None:
     return sym if sym else None
 
 
-def _parse_sch_wire(node: list) -> dict[str, Any] | None:
+def _parse_sch_wire(node: list[Any]) -> dict[str, Any] | None:
     for child in node[1:]:
         if isinstance(child, list) and len(child) > 0 and child[0] == "pts":
             points = []
@@ -5137,7 +5139,7 @@ def _parse_sch_wire(node: list) -> dict[str, Any] | None:
     return None
 
 
-def _parse_position_node(node: list) -> dict[str, Any] | None:
+def _parse_position_node(node: list[Any]) -> dict[str, Any] | None:
     """Parse a node that has an (at x y) child, returning {"position": {"x": ..., "y": ...}}."""
     for child in node[1:]:
         if isinstance(child, list) and len(child) >= 3 and child[0] == "at":
@@ -5145,7 +5147,7 @@ def _parse_position_node(node: list) -> dict[str, Any] | None:
     return None
 
 
-def _parse_sch_label(node: list, label_type: str) -> dict[str, Any] | None:
+def _parse_sch_label(node: list[Any], label_type: str) -> dict[str, Any] | None:
     if len(node) < 2:
         return None
     label: dict[str, Any] = {"label_type": label_type, "text": node[1]}
@@ -5155,7 +5157,7 @@ def _parse_sch_label(node: list, label_type: str) -> dict[str, Any] | None:
     return label
 
 
-def _parse_pin_node(child: list) -> dict[str, Any]:
+def _parse_pin_node(child: list[Any]) -> dict[str, Any]:
     """Parse a single pin s-expression node and extract type, shape, name, number, position."""
     pin_info: dict[str, Any] = {}
     if len(child) >= 3:
@@ -5178,7 +5180,7 @@ def _parse_pin_node(child: list) -> dict[str, Any]:
     return pin_info
 
 
-def _parse_symbol_detail(node: list, lib_name: str) -> dict[str, Any]:
+def _parse_symbol_detail(node: list[Any], lib_name: str) -> dict[str, Any]:
     info: dict[str, Any] = {
         "name": node[1] if len(node) > 1 else "",
         "library": lib_name,
@@ -5210,7 +5212,7 @@ def _parse_symbol_detail(node: list, lib_name: str) -> dict[str, Any]:
     return info
 
 
-def _parse_footprint_detail(tree: list, lib_name: str, fp_name: str) -> dict[str, Any]:
+def _parse_footprint_detail(tree: list[Any], lib_name: str, fp_name: str) -> dict[str, Any]:
     info: dict[str, Any] = {
         "name": fp_name,
         "library": lib_name,

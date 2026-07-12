@@ -133,7 +133,7 @@ def _default_var_value(var: str) -> str | None:
     m = re.fullmatch(r"KICAD(\d+)_3RD_PARTY", var)
     if m:
         version = f"{m.group(1)}.0"
-        candidates: list[Path] = []
+        candidates = []
         onedrive = os.environ.get("OneDrive")
         if onedrive:
             candidates.append(Path(onedrive) / "Documents" / "KiCad" / version / "3rdparty")

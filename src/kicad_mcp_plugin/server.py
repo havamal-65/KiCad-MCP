@@ -6,6 +6,9 @@ import functools
 import json
 import os
 import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -71,10 +74,10 @@ def _norm_path(p: str) -> str:
 
 def _evaluate_launch_guard(
     pcb_path: "Path",
-    identity: dict | None,
+    identity: dict[str, Any] | None,
     pcbnew_running: bool,
     force: bool,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Decide whether open_kicad should launch pcbnew for *pcb_path* (#13A).
 
     Pure decision function (no I/O) so it is unit-testable.  The caller fetches
@@ -92,9 +95,10 @@ def _evaluate_launch_guard(
     bridge_up = isinstance(identity, dict) and identity.get("pong") is True
     # A bridge that identifies as a non-pcbnew owner (e.g. the project manager
     # holding the port) is not a usable editor session.
-    wrong_owner = bridge_up and identity.get("app") not in (None, "pcbnew")
+    wrong_owner = bridge_up and isinstance(identity, dict) and identity.get("app") not in (None, "pcbnew")
 
     if bridge_up and not wrong_owner:
+        assert identity is not None  # bridge_up implies identity is a dict
         open_board = identity.get("board_path") or ""
         if open_board and _norm_path(open_board) == _norm_path(str(pcb_path)):
             return {
@@ -221,7 +225,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
         logger.info("open_kicad called: project_path=%r force=%s", project_path, force)
 
         # --- check if bridge is already up (capture full identity, #13B) ---
-        identity: dict | None = None
+        identity: dict[str, Any] | None = None
         try:
             result = _tcp_call("ping", _get_ping_timeout())
             if isinstance(result, dict) and result.get("pong") is True:
@@ -313,7 +317,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
             note_launch()
 
             def _launch_response(bridge: str, message: str) -> str:
-                payload: dict = {"status": "success", "bridge": bridge, "message": message}
+                payload: dict[str, Any] = {"status": "success", "bridge": bridge, "message": message}
                 if stale_removed:
                     payload["stale_files_removed"] = stale_removed
                 return json.dumps(payload, indent=2)
@@ -386,15 +390,15 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     })
     _original_tool = mcp.tool
 
-    def _guarded_tool(*args, **kwargs):
+    def _guarded_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         decorator = _original_tool(*args, **kwargs)
 
-        def wrapper(func):
+        def wrapper(func: Callable[..., Any]) -> Any:
             if func.__name__ in _BRIDGE_EXEMPT_TOOLS:
                 return decorator(func)  # file-side tool — no bridge required
 
             @functools.wraps(func)
-            def guarded(*fargs, **fkwargs):
+            def guarded(*fargs: Any, **fkwargs: Any) -> Any:
                 try:
                     result = _tcp_call("ping", _get_ping_timeout())
                     if not isinstance(result, dict) or result.get("pong") is not True:
@@ -406,7 +410,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
 
         return wrapper
 
-    mcp.tool = _guarded_tool  # type: ignore[method-assign]
+    mcp.tool = _guarded_tool  # type: ignore[method-assign,assignment]
 
     board.register_tools(mcp, backend, change_log)
     routing.register_tools(mcp, backend, change_log, config)

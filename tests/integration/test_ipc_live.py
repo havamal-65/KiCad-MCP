@@ -140,26 +140,34 @@ def test_per_op_fallback_place_component_lands_real_footprint(
     path = Path(_board_path())
     backend = PluginDirectBackend()
     ops = backend.get_board_ops()
+
+    def _remove_probe() -> None:
+        try:
+            _tcp_call("remove_component", 10.0, path=str(path), reference="TIPC1")
+        except RuntimeError:
+            pass  # not on board
+
+    _remove_probe()  # self-heal from a crashed prior run (REQ-FIX-1)
     n_before = len(ops.get_components(path))
+    try:
+        modify = backend.get_board_modify_ops()
+        result = modify.place_component(
+            path, "TIPC1", "Resistor_SMD:R_0805_2012Metric", 205.0, 205.0)
+        assert result["status"] == "ok"
+        assert backend._live_path["BOARD_MODIFY"] == "bridge"  # fell through
 
-    modify = backend.get_board_modify_ops()
-    result = modify.place_component(
-        path, "TIPC1", "Resistor_SMD:R_0805_2012Metric", 205.0, 205.0)
-    assert result["status"] == "ok"
-    assert backend._live_path["BOARD_MODIFY"] == "bridge"  # fell through
+        components = ops.get_components(path)
+        assert len(components) == n_before + 1
+        placed = [c for c in components if c["reference"] == "TIPC1"]
+        assert len(placed) == 1
 
-    components = ops.get_components(path)
-    assert len(components) == n_before + 1
-    placed = [c for c in components if c["reference"] == "TIPC1"]
-    assert len(placed) == 1
-
-    # pads present = the bridge materialized the real library definition
-    pads = ipc_session.board().get_footprints()
-    target = [f for f in pads if f.reference_field.text.value == "TIPC1"]
-    assert target and len(target[0].definition.pads) == 2
-
-    # clean up the probe footprint via the bridge
-    _tcp_call("remove_component", 10.0, path=str(path), reference="TIPC1")
+        # pads present = the bridge materialized the real library definition
+        pads = ipc_session.board().get_footprints()
+        target = [f for f in pads if f.reference_field.text.value == "TIPC1"]
+        assert target and len(target[0].definition.pads) == 2
+    finally:
+        # clean up the probe footprint via the bridge
+        _remove_probe()
 
 
 # ---------------------------------------------------------------------------

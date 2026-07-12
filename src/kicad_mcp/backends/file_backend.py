@@ -21,6 +21,13 @@ from kicad_mcp.backends.base import (
     LibraryOps,
     SchematicOps,
 )
+from kicad_mcp.backends.placement_guard import (
+    DuplicateRefError,
+    check_placement,
+    find_batch_duplicate_refs,
+    idempotent_success,
+    index_existing,
+)
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.models.errors import GitOperationError, LibraryImportError, LibraryManageError
 from kicad_mcp.utils.library_sources import LibrarySourceRegistry
@@ -736,6 +743,16 @@ class FileBoardOps(BoardOps):
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
         import uuid as _uuid
+
+        # Duplicate-ref guard (#16, REQ-DUP-1..3): never append a second
+        # footprint with an existing reference. Matching re-place succeeds
+        # idempotently; a differing one raises DuplicateRefError.
+        existing = index_existing(self.get_components(path)).get(reference)
+        if check_placement(existing, reference, footprint,
+                           x, y, rotation, layer) == "idempotent":
+            assert existing is not None
+            return idempotent_success(existing)
+
         fp_uuid = str(_uuid.uuid4())
 
         kicad_mod = _load_kicad_mod(footprint, self._project_dir)
@@ -1834,13 +1851,37 @@ class FileBoardOps(BoardOps):
         Reads the board file once, appends all footprint blocks, then writes once.
         components: list of dicts with keys: reference, footprint, x, y,
                     and optionally layer (default "F.Cu") and rotation (default 0.0).
-        Returns {"placed": [...], "failed": [...]}.
+        Returns {"placed": [...], "failed": [...], "idempotent": [...]}.
+
+        Duplicate-ref rules (#16, REQ-DUP-4): a ref repeated within the input
+        list refuses the ENTIRE batch with the board untouched; a ref that
+        collides with a component already on the board gets a per-item outcome
+        (idempotent skip or refusal) while clean items proceed.
         """
         import uuid as _uuid
 
+        batch_dupes = find_batch_duplicate_refs(components)
+        if batch_dupes:
+            return {
+                "status": "refused",
+                "reason": (
+                    "duplicate reference(s) within the batch: "
+                    + ", ".join(batch_dupes)
+                    + " — batch refused, board untouched"
+                ),
+                "placed": [],
+                "idempotent": [],
+                "failed": [
+                    {"reference": ref, "reason": "duplicate reference within batch"}
+                    for ref in batch_dupes
+                ],
+            }
+
+        on_board = index_existing(self.get_components(path))
         content = path.read_text(encoding="utf-8")
         placed: list[str] = []
         failed: list[dict] = []
+        idempotent: list[str] = []
         inserts: list[str] = []
 
         for comp in components:
@@ -1853,6 +1894,22 @@ class FileBoardOps(BoardOps):
 
             if not reference or not footprint:
                 failed.append({"reference": reference, "reason": "missing reference or footprint"})
+                continue
+
+            existing = on_board.get(reference)
+            if existing is not None:
+                try:
+                    check_placement(existing, reference, footprint,
+                                    x, y, rotation, layer)
+                    idempotent.append(reference)
+                except DuplicateRefError as dup:
+                    entry = dup.to_refusal()
+                    failed.append({
+                        "reference": reference,
+                        "reason": entry["reason"],
+                        "existing": entry["existing"],
+                        "suggested_tool": entry["suggested_tool"],
+                    })
                 continue
 
             try:
@@ -1890,7 +1947,7 @@ class FileBoardOps(BoardOps):
                 content = content[:last_paren] + "".join(inserts) + content[last_paren:]
                 path.write_text(content, encoding="utf-8")
 
-        return {"placed": placed, "failed": failed}
+        return {"placed": placed, "failed": failed, "idempotent": idempotent}
 
     def create_board(
         self, path: Path, title: str = "", revision: str = "",

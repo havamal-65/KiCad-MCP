@@ -34,6 +34,11 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from kicad_mcp.backends.base import BackendCapability, BoardOps, KiCadBackend
 from kicad_mcp.backends.ipc_connection import IPCConnection, IPCUnavailableError
+from kicad_mcp.backends.placement_guard import (
+    check_placement,
+    idempotent_success,
+    index_existing,
+)
 from kicad_mcp.logging_config import get_logger
 
 if TYPE_CHECKING:
@@ -205,6 +210,15 @@ class IPCBoardOps(BoardOps):
         self, path: Path, reference: str, footprint: str,
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
+        # Duplicate-ref guard (#16, REQ-DUP-1..3) BEFORE the create attempt,
+        # so idempotent hits and refusals are served here instead of falling
+        # through to the bridge (whose client runs the same shared rule).
+        existing = index_existing(self.get_components(path)).get(reference)
+        if check_placement(existing, reference, footprint,
+                           x, y, rotation, layer) == "idempotent":
+            assert existing is not None
+            return idempotent_success(existing)
+
         def mutate(board: Board, commit: Commit) -> dict[str, Any]:
             fp = kbt.FootprintInstance()
             lib, _, name = footprint.partition(":")

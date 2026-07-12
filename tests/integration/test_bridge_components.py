@@ -25,6 +25,15 @@ def _board_path() -> str:
     return _tcp_call("get_active_project", 5.0)["board_path"]
 
 
+def _remove_if_present(path: str, reference: str) -> None:
+    """Teardown/self-heal helper (REQ-FIX-1): drop *reference* if it is on the
+    board; swallow the unknown-ref error so cleanup is idempotent."""
+    try:
+        _tcp_call("remove_component", 10.0, path=path, reference=reference)
+    except RuntimeError:
+        pass
+
+
 def _find_component(components: list[dict], reference: str) -> dict | None:
     for comp in components:
         if comp.get("reference") == reference:
@@ -74,19 +83,58 @@ def test_place_component_appears_in_get_components(bridge_session):
     """REQ-COV-006: place a single component, observe it in get_components."""
     path = _board_path()
     ref = "T06_R1"
-    _tcp_call(
-        "place_component", 5.0,
-        path=path, reference=ref, footprint=_RESISTOR_FP,
-        x=10.0, y=10.0, rotation=0,
-    )
-    components = _tcp_call("get_components", 5.0, path=path)
-    found = _find_component(components, ref)
-    assert found is not None, f"{ref} not found in get_components after placement"
-    assert abs(found["x"] - 10.0) < _POSITION_TOL_MM, found
-    assert abs(found["y"] - 10.0) < _POSITION_TOL_MM, found
-    # get_components MUST carry the footprint lib_id, else sync_schematic_to_pcb
-    # cannot detect footprint mismatches against a live board (#2 swap path).
-    assert found.get("footprint") == _RESISTOR_FP, found
+    _remove_if_present(path, ref)  # self-heal from a crashed prior run
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=10.0, y=10.0, rotation=0,
+        )
+        components = _tcp_call("get_components", 5.0, path=path)
+        found = _find_component(components, ref)
+        assert found is not None, f"{ref} not found in get_components after placement"
+        assert abs(found["x"] - 10.0) < _POSITION_TOL_MM, found
+        assert abs(found["y"] - 10.0) < _POSITION_TOL_MM, found
+        # get_components MUST carry the footprint lib_id, else sync_schematic_to_pcb
+        # cannot detect footprint mismatches against a live board (#2 swap path).
+        assert found.get("footprint") == _RESISTOR_FP, found
+    finally:
+        _remove_if_present(path, ref)
+
+
+def test_place_component_duplicate_ref_refused(bridge_session):
+    """#16 / REQ-DUP-3 live: re-placing an existing ref at a DIFFERENT pose
+    must refuse with the existing state in the message — never a duplicate.
+    An IDENTICAL re-place (retry-after-timeout) succeeds idempotently
+    (REQ-DUP-2) without adding a second copy."""
+    path = _board_path()
+    ref = "T06_DUP"
+    _remove_if_present(path, ref)
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=12.0, y=12.0, rotation=0,
+        )
+        # Identical re-place → idempotent success, still exactly one copy.
+        result = _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=12.0, y=12.0, rotation=0,
+        )
+        assert result.get("idempotent") is True, result
+        # Differing re-place → informative refusal.
+        with pytest.raises(RuntimeError, match="already exists"):
+            _tcp_call(
+                "place_component", 5.0,
+                path=path, reference=ref, footprint=_RESISTOR_FP,
+                x=90.0, y=90.0, rotation=0,
+            )
+        components = _tcp_call("get_components", 5.0, path=path)
+        copies = [c for c in components if c.get("reference") == ref]
+        assert len(copies) == 1, f"duplicate created despite guard: {copies}"
+    finally:
+        _remove_if_present(path, ref)
 
 
 def test_place_components_bulk_adds_all(bridge_session):
@@ -94,50 +142,85 @@ def test_place_components_bulk_adds_all(bridge_session):
     path = _board_path()
     refs = ["T07_R1", "T07_R2", "T07_R3"]
     positions = [(30.0, 10.0), (32.0, 10.0), (34.0, 10.0)]
+    for ref in refs:
+        _remove_if_present(path, ref)
     payload = [
         {"reference": r, "footprint": _RESISTOR_FP, "x": x, "y": y, "rotation": 0}
         for r, (x, y) in zip(refs, positions)
     ]
-    result = _tcp_call("place_components_bulk", 10.0, path=path, components=payload)
+    try:
+        result = _tcp_call("place_components_bulk", 10.0, path=path, components=payload)
 
-    assert isinstance(result, dict), f"bulk response not a dict: {result!r}"
-    assert sorted(result.get("placed", [])) == sorted(refs), \
-        f"placed list mismatch: {result.get('placed')!r} vs {refs!r}, failed={result.get('failed')!r}"
-    assert result.get("failed") == [], f"bulk reported failures: {result.get('failed')!r}"
+        assert isinstance(result, dict), f"bulk response not a dict: {result!r}"
+        assert sorted(result.get("placed", [])) == sorted(refs), \
+            f"placed list mismatch: {result.get('placed')!r} vs {refs!r}, failed={result.get('failed')!r}"
+        assert result.get("failed") == [], f"bulk reported failures: {result.get('failed')!r}"
 
-    components = _tcp_call("get_components", 5.0, path=path)
-    for ref, (x, y) in zip(refs, positions):
-        comp = _find_component(components, ref)
-        assert comp is not None, f"{ref} not found in get_components after bulk"
-        assert abs(comp["x"] - x) < _POSITION_TOL_MM, comp
-        assert abs(comp["y"] - y) < _POSITION_TOL_MM, comp
+        components = _tcp_call("get_components", 5.0, path=path)
+        for ref, (x, y) in zip(refs, positions):
+            comp = _find_component(components, ref)
+            assert comp is not None, f"{ref} not found in get_components after bulk"
+            assert abs(comp["x"] - x) < _POSITION_TOL_MM, comp
+            assert abs(comp["y"] - y) < _POSITION_TOL_MM, comp
+    finally:
+        for ref in refs:
+            _remove_if_present(path, ref)
+
+
+def test_place_components_bulk_in_batch_dup_refuses_all(bridge_session):
+    """#16 / REQ-DUP-4 live: a ref repeated WITHIN the input list refuses the
+    entire batch — nothing lands on the board, not even the clean item."""
+    path = _board_path()
+    refs = ["T07_D1", "T07_D2"]
+    for ref in refs:
+        _remove_if_present(path, ref)
+    payload = [
+        {"reference": "T07_D1", "footprint": _RESISTOR_FP, "x": 40.0, "y": 12.0, "rotation": 0},
+        {"reference": "T07_D2", "footprint": _RESISTOR_FP, "x": 42.0, "y": 12.0, "rotation": 0},
+        {"reference": "T07_D1", "footprint": _RESISTOR_FP, "x": 44.0, "y": 12.0, "rotation": 0},
+    ]
+    try:
+        result = _tcp_call("place_components_bulk", 10.0, path=path, components=payload)
+        assert result.get("status") == "refused", result
+        assert result.get("placed") == [], result
+        components = _tcp_call("get_components", 5.0, path=path)
+        for ref in refs:
+            assert _find_component(components, ref) is None, \
+                f"{ref} landed despite whole-batch refusal"
+    finally:
+        for ref in refs:
+            _remove_if_present(path, ref)
 
 
 def test_move_component_translation(bridge_session):
     """REQ-COV-008: place then move; new (x, y) reflected in get_components AND saved file."""
     path = _board_path()
     ref = "T08_R1"
-    _tcp_call(
-        "place_component", 5.0,
-        path=path, reference=ref, footprint=_RESISTOR_FP,
-        x=50.0, y=50.0, rotation=0,
-    )
-    # Now translate.
-    _tcp_call(
-        "move_component", 5.0,
-        path=path, reference=ref, x=55.0, y=52.0,
-    )
-    # get_components reflects the move.
-    comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
-    assert comp is not None, f"{ref} disappeared after move"
-    assert abs(comp["x"] - 55.0) < _POSITION_TOL_MM, comp
-    assert abs(comp["y"] - 52.0) < _POSITION_TOL_MM, comp
-    # Saved file reflects the move.
-    at = _find_at_in_file(path, ref)
-    assert at is not None, f"{ref} not found in saved file"
-    saved_x, saved_y, _ = at
-    assert abs(saved_x - 55.0) < _POSITION_TOL_MM, at
-    assert abs(saved_y - 52.0) < _POSITION_TOL_MM, at
+    _remove_if_present(path, ref)
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=50.0, y=50.0, rotation=0,
+        )
+        # Now translate.
+        _tcp_call(
+            "move_component", 5.0,
+            path=path, reference=ref, x=55.0, y=52.0,
+        )
+        # get_components reflects the move.
+        comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
+        assert comp is not None, f"{ref} disappeared after move"
+        assert abs(comp["x"] - 55.0) < _POSITION_TOL_MM, comp
+        assert abs(comp["y"] - 52.0) < _POSITION_TOL_MM, comp
+        # Saved file reflects the move.
+        at = _find_at_in_file(path, ref)
+        assert at is not None, f"{ref} not found in saved file"
+        saved_x, saved_y, _ = at
+        assert abs(saved_x - 55.0) < _POSITION_TOL_MM, at
+        assert abs(saved_y - 52.0) < _POSITION_TOL_MM, at
+    finally:
+        _remove_if_present(path, ref)
 
 
 _PROJECT_LIB_MOD = """\
@@ -173,13 +256,17 @@ def test_place_component_from_project_lib_table(bridge_session):
         table.write_text(f"(fp_lib_table\n  {entry}\n)\n", encoding="utf-8")
 
     ref = "T10_R1"
-    _tcp_call(
-        "place_component", 5.0,
-        path=path, reference=ref, footprint="T10_TestLib:R_Test",
-        x=90.0, y=10.0, rotation=0,
-    )
-    comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
-    assert comp is not None, f"{ref} not placed from project fp-lib-table library"
+    _remove_if_present(path, ref)
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint="T10_TestLib:R_Test",
+            x=90.0, y=10.0, rotation=0,
+        )
+        comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
+        assert comp is not None, f"{ref} not placed from project fp-lib-table library"
+    finally:
+        _remove_if_present(path, ref)
 
 
 def test_remove_component_returns_state(bridge_session):
@@ -188,6 +275,7 @@ def test_remove_component_returns_state(bridge_session):
     rotation, layer, pad→net map) that the footprint-swap path consumes."""
     path = _board_path()
     ref = "T11_R1"
+    _remove_if_present(path, ref)
     _tcp_call(
         "place_component", 5.0,
         path=path, reference=ref, footprint=_RESISTOR_FP,
@@ -225,25 +313,29 @@ def test_set_footprint_value_lands_on_live_board_and_file(bridge_session):
     the bridge's back (the #7 revert root cause)."""
     path = _board_path()
     ref = "T12_U6"
-    _tcp_call(
-        "place_component", 5.0,
-        path=path, reference=ref, footprint=_RESISTOR_FP,
-        x=130.0, y=10.0, rotation=0,
-    )
+    _remove_if_present(path, ref)
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=130.0, y=10.0, rotation=0,
+        )
 
-    result = _tcp_call(
-        "set_footprint_value", 5.0,
-        path=path, reference=ref, value="Adafruit_PMSA003I",
-    )
-    assert result["status"] == "ok", result
-    assert result["new_value"] == "Adafruit_PMSA003I", result
+        result = _tcp_call(
+            "set_footprint_value", 5.0,
+            path=path, reference=ref, value="Adafruit_PMSA003I",
+        )
+        assert result["status"] == "ok", result
+        assert result["new_value"] == "Adafruit_PMSA003I", result
 
-    # Live board reflects the new Value...
-    comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
-    assert comp is not None and comp["value"] == "Adafruit_PMSA003I", comp
-    # ...and so does the saved file.
-    text = Path(path).read_text(encoding="utf-8")
-    assert '(property "Value" "Adafruit_PMSA003I"' in text
+        # Live board reflects the new Value...
+        comp = _find_component(_tcp_call("get_components", 5.0, path=path), ref)
+        assert comp is not None and comp["value"] == "Adafruit_PMSA003I", comp
+        # ...and so does the saved file.
+        text = Path(path).read_text(encoding="utf-8")
+        assert '(property "Value" "Adafruit_PMSA003I"' in text
+    finally:
+        _remove_if_present(path, ref)
 
 
 def test_set_footprint_value_unknown_ref_errors(bridge_session):
@@ -257,16 +349,20 @@ def test_move_component_rotation(bridge_session):
     """REQ-COV-009: rotate via move_component; new rotation in saved file."""
     path = _board_path()
     ref = "T09_R1"
-    _tcp_call(
-        "place_component", 5.0,
-        path=path, reference=ref, footprint=_RESISTOR_FP,
-        x=70.0, y=50.0, rotation=0,
-    )
-    _tcp_call(
-        "move_component", 5.0,
-        path=path, reference=ref, x=70.0, y=50.0, rotation=90,
-    )
-    at = _find_at_in_file(path, ref)
-    assert at is not None, f"{ref} not found in saved file"
-    _, _, rot = at
-    assert abs(rot - 90.0) < 0.01, f"expected rotation 90, got {rot}"
+    _remove_if_present(path, ref)
+    try:
+        _tcp_call(
+            "place_component", 5.0,
+            path=path, reference=ref, footprint=_RESISTOR_FP,
+            x=70.0, y=50.0, rotation=0,
+        )
+        _tcp_call(
+            "move_component", 5.0,
+            path=path, reference=ref, x=70.0, y=50.0, rotation=90,
+        )
+        at = _find_at_in_file(path, ref)
+        assert at is not None, f"{ref} not found in saved file"
+        _, _, rot = at
+        assert abs(rot - 90.0) < 0.01, f"expected rotation 90, got {rot}"
+    finally:
+        _remove_if_present(path, ref)

@@ -14,12 +14,17 @@ See ``tests/integration/README.md`` for full setup.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import socket
+from pathlib import Path
 
 import pytest
 
 from kicad_mcp.backends.plugin_backend import _tcp_call
+
+_SCRATCH_BOARD = Path(__file__).parent.parent / "_scratch" / "test_board.kicad_pcb"
 
 
 def _integration_enabled() -> bool:
@@ -69,3 +74,70 @@ def bridge_session():
         )
 
     yield result
+
+
+# ---------------------------------------------------------------------------
+# Scratch-fixture hygiene (F2/S3, #16 — REQ-FIX-1/REQ-FIX-3)
+# ---------------------------------------------------------------------------
+
+def _scratch_ref_counts() -> dict[str, int]:
+    """Footprint-reference multiset of the scratch board on disk."""
+    if not _SCRATCH_BOARD.exists():
+        return {}
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+    content = _SCRATCH_BOARD.read_text(encoding="utf-8")
+    counts: dict[str, int] = {}
+    for m in re.finditer(r'\(footprint\s+"', content):
+        end = _walk_balanced_parens(content, m.start())
+        if end is None:
+            continue
+        block = content[m.start():end + 1]
+        ref_m = re.search(r'\(property "Reference" "([^"]+)"', block)
+        if ref_m:
+            counts[ref_m.group(1)] = counts.get(ref_m.group(1), 0) + 1
+    return counts
+
+
+@pytest.fixture(scope="session", autouse=True)
+def scratch_board_guard():
+    """REQ-FIX-3: byte-snapshot the scratch fixture at session start, restore
+    it at session end — a full integration run leaves the file byte-exact by
+    construction, so no run can accumulate corruption for the next one.
+
+    NOTE for interactive sessions: after the restore, a still-open pcbnew
+    holds a diverged in-memory board. Reopen the board (or restart pcbnew)
+    before the next live run — the #14C stale-board guard refuses mutations
+    until then. The batch protocol already relaunches pcbnew per run.
+    """
+    if not _integration_enabled() or not _SCRATCH_BOARD.exists():
+        yield None
+        return
+    snapshot = _SCRATCH_BOARD.read_bytes()
+    yield {
+        "sha256": hashlib.sha256(snapshot).hexdigest(),
+        "ref_counts": _scratch_ref_counts(),
+    }
+    if _SCRATCH_BOARD.read_bytes() != snapshot:
+        _SCRATCH_BOARD.write_bytes(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def scratch_ref_hygiene():
+    """REQ-FIX-1, loud and attributed: a test that adds a footprint ref to
+    the scratch board without removing it — or worse, creates a duplicate
+    ref (#16) — fails at ITS OWN teardown, not as mystery fallout three
+    tests later."""
+    if not _integration_enabled() or not _SCRATCH_BOARD.exists():
+        yield
+        return
+    before = _scratch_ref_counts()
+    yield
+    after = _scratch_ref_counts()
+    leaked = {ref: n for ref, n in after.items() if n > before.get(ref, 0)}
+    if leaked:
+        dupes = {ref: n for ref, n in leaked.items() if after[ref] > 1}
+        detail = f" — DUPLICATE REFS (#16 corruption): {dupes}" if dupes else ""
+        raise AssertionError(
+            f"test leaked footprint refs on the scratch board: {leaked}"
+            f"{detail}. REQ-FIX-1: remove what you place (try/finally)."
+        )

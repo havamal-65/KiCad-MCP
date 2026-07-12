@@ -92,35 +92,49 @@ def test_assign_net_covers_all_pads_with_shared_number(bridge_session):
     pad = "19"
     net = "T10_GND"
 
-    # Place the ESP32 footprint. If the system KiCad lacks RF_Module, skip.
+    # The scratch fixture usually already carries T10_U1 (the keep-out tests
+    # depend on it) — the thermal-pad behavior under test is position-agnostic,
+    # so use the existing footprint when present and only place (then remove)
+    # our own copy when it is absent (REQ-FIX-1: leave no refs behind).
+    components = _tcp_call("get_components", 5.0, path=path)
+    placed_by_test = False
+    if not any(c.get("reference") == ref for c in components):
+        try:
+            _tcp_call(
+                "place_component", 10.0,
+                path=path, reference=ref, footprint=_ESP32_FP,
+                x=100.0, y=80.0, rotation=0,
+            )
+            placed_by_test = True
+        except RuntimeError as exc:
+            if "Could not find library" in str(exc) or "not found in" in str(exc):
+                pytest.skip(f"{_ESP32_FP} not available on this KiCad install: {exc}")
+            raise
+
     try:
-        _tcp_call(
-            "place_component", 10.0,
-            path=path, reference=ref, footprint=_ESP32_FP,
-            x=100.0, y=80.0, rotation=0,
+        result = _tcp_call(
+            "assign_net", 5.0,
+            path=path, reference=ref, pad=pad, net=net,
         )
-    except RuntimeError as exc:
-        if "Could not find library" in str(exc) or "not found in" in str(exc):
-            pytest.skip(f"{_ESP32_FP} not available on this KiCad install: {exc}")
-        raise
+        assert isinstance(result, dict), f"unexpected assign_net response: {result!r}"
+        pads_updated = result.get("pads_updated", 0)
+        assert pads_updated >= 2, (
+            f"assign_net only updated {pads_updated} pad(s) for pad number {pad!r} — "
+            f"multi-rect thermal pad regression. Commit 9cea376 should have made this >=2."
+        )
 
-    result = _tcp_call(
-        "assign_net", 5.0,
-        path=path, reference=ref, pad=pad, net=net,
-    )
-    assert isinstance(result, dict), f"unexpected assign_net response: {result!r}"
-    pads_updated = result.get("pads_updated", 0)
-    assert pads_updated >= 2, (
-        f"assign_net only updated {pads_updated} pad(s) for pad number {pad!r} — "
-        f"multi-rect thermal pad regression. Commit 9cea376 should have made this >=2."
-    )
-
-    total, with_net = _count_pad_with_net(path, ref, pad, net)
-    assert total >= 2, (
-        f"expected multiple pads numbered {pad!r} on ESP32, got {total}. "
-        f"KiCad's ESP32-C3-WROOM-02 thermal pad inventory may have changed."
-    )
-    assert with_net == total, (
-        f"{with_net} of {total} pad-{pad} entries have net='{net}' in saved file — "
-        f"unassigned pads will cause DRC false-positive shorts. Commit 9cea376 regression."
-    )
+        total, with_net = _count_pad_with_net(path, ref, pad, net)
+        assert total >= 2, (
+            f"expected multiple pads numbered {pad!r} on ESP32, got {total}. "
+            f"KiCad's ESP32-C3-WROOM-02 thermal pad inventory may have changed."
+        )
+        assert with_net == total, (
+            f"{with_net} of {total} pad-{pad} entries have net='{net}' in saved file — "
+            f"unassigned pads will cause DRC false-positive shorts. Commit 9cea376 regression."
+        )
+    finally:
+        if placed_by_test:
+            try:
+                _tcp_call("remove_component", 10.0, path=path, reference=ref)
+            except RuntimeError:
+                pass

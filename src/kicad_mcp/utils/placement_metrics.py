@@ -300,12 +300,14 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
     from kicad_mcp.tools.drc import (
         _parse_board_bbox,
         _parse_placed_courtyards,
+        compute_edge_overhang_exemptions,
         run_check_courtyard_overlaps,
     )
 
     overlap_count = run_check_courtyard_overlaps(path)["overlap_count"]
 
     out_of_outline_count: int | None
+    edge_overhang_exemptions: list[dict[str, str]] = []
     outline = _parse_board_bbox(content)
     if outline is None:
         out_of_outline_count = None
@@ -313,15 +315,29 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
     else:
         oxmin, oymin, oxmax, oymax = outline
         courtyards, _ = _parse_placed_courtyards(content)
-        out_of_outline_count = 0
-        for cyd in courtyards.values():
+        offenders = [
+            ref for ref, cyd in courtyards.items()
             if (
                 cyd["xmin"] < oxmin
                 or cyd["ymin"] < oymin
                 or cyd["xmax"] > oxmax
                 or cyd["ymax"] > oymax
-            ):
-                out_of_outline_count += 1
+            )
+        ]
+        # #18 (REQ-EDGE-1/2): an edge-anchored connector whose mating face
+        # points off-board overhangs LEGALLY (USB4085 class) — exempt it from
+        # out_of_outline; every other overhang still counts. Exemptions are
+        # reported so nothing is silently waved through (R2).
+        exempt: dict[str, str] = {}
+        if offenders:
+            exempt = compute_edge_overhang_exemptions(
+                path, content, outline, courtyards, offenders,
+            )
+        out_of_outline_count = len(offenders) - len(exempt)
+        edge_overhang_exemptions = [
+            {"reference": ref, "evidence": evidence}
+            for ref, evidence in sorted(exempt.items())
+        ]
 
     orientation_consistency = _orientation_consistency(footprints)
 
@@ -355,6 +371,8 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
         "signal_net_count": signal_net_count,
         "scored_parts": scored_parts,
     }
+    if edge_overhang_exemptions:
+        bundle["edge_overhang_exemptions"] = edge_overhang_exemptions
     if warnings:
         bundle["warnings"] = warnings
     return bundle

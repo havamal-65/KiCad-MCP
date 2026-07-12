@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.2.0-s6"
+_BRIDGE_VERSION = "2.3.2-kir2s3"
 
 
 # ---------------------------------------------------------------------------
@@ -492,10 +492,16 @@ def _handle_ping() -> dict[str, Any]:
         version = "unknown"
     board_path = None
     try:
-        import pcbnew
-        board = pcbnew.GetBoard()
-        if board is not None:
-            board_path = board.GetFileName() or None
+        # #14A root cause (fixed 2.3.1): reading GetBoard() on the TCP thread
+        # races main-thread saves/refreshes and permanently corrupts the SWIG
+        # wrapper state. ALL pcbnew access goes through the main thread.
+        def _read_board_path():
+            import pcbnew
+            board = pcbnew.GetBoard()
+            if board is None:
+                return None
+            return board.GetFileName() or None
+        board_path = _run_on_main_thread(_read_board_path)
     except Exception:
         pass
     return {
@@ -737,23 +743,86 @@ def _handle_get_stackup(path: str) -> dict[str, Any]:
 
 
 def _handle_get_active_project(_path: str) -> dict[str, Any]:
-    import pcbnew
-    board = pcbnew.GetBoard()
-    result: dict[str, Any] = {"board_path": None, "project_name": None, "project_path": None}
-    if board is None:
+    # #14A root cause (fixed 2.3.1): this handler used to call
+    # pcbnew.GetBoard()/GetFileName() directly on the bridge's TCP thread —
+    # the one violation of the all-pcbnew-on-the-main-thread rule. Racing a
+    # main-thread save/refresh corrupted the SWIG wrapper state PERMANENTLY
+    # ('SwigPyObject' object has no attribute 'GetFileName' on every later
+    # call) until pcbnew restarted.
+    def _do():
+        import pcbnew
+        board = pcbnew.GetBoard()
+        result: dict[str, Any] = {"board_path": None, "project_name": None, "project_path": None}
+        if board is None:
+            return result
+        result["board_path"] = board.GetFileName()
+        try:
+            result["project_name"] = board.GetProject().GetProjectName()
+            result["project_path"] = board.GetProject().GetProjectPath()
+        except Exception:
+            pass
         return result
-    result["board_path"] = board.GetFileName()
-    try:
-        result["project_name"] = board.GetProject().GetProjectName()
-        result["project_path"] = board.GetProject().GetProjectPath()
-    except Exception:
-        pass
-    return result
+    return _run_on_main_thread(_do)
 
 
 # ---------------------------------------------------------------------------
 # Write handlers — each calls _run_on_main_thread to avoid GUI thread crashes
 # ---------------------------------------------------------------------------
+
+# #16 duplicate-ref guard (F2 REQ-DUP, KIR2 S3). This is a vendored copy of
+# the rule in kicad_mcp.backends.placement_guard — that package is not
+# importable inside pcbnew's Python, so keep the two semantically identical.
+_PLACE_POSITION_TOL_MM = 0.0127  # == placement_guard.POSITION_TOL_MM
+
+
+def _existing_footprint_state(board, reference: str):
+    """State of the footprint already carrying *reference*, or None."""
+    import pcbnew
+    fp = board.FindFootprintByReference(reference)
+    if fp is None:
+        return None
+    pos = fp.GetPosition()
+    try:
+        lib_id = str(fp.GetFPID().GetUniStringLibId())
+    except Exception:
+        lib_id = ""
+    return {
+        "reference": reference,
+        "footprint": lib_id,
+        "x": pcbnew.ToMM(pos.x),
+        "y": pcbnew.ToMM(pos.y),
+        "rotation": fp.GetOrientationDegrees(),
+        "layer": fp.GetLayerName(),
+    }
+
+
+def _check_place_against_existing(existing, footprint: str, x: float, y: float,
+                                  rotation: float, layer: str):
+    """REQ-DUP-1..3: None → proceed with create; idempotent-success payload →
+    identical placement already exists (return it, add nothing); ValueError →
+    informative refusal, never a duplicate. No force flag (REQ-DUP-6)."""
+    if existing is None:
+        return None
+    if (existing["footprint"] == footprint
+            and abs(existing["x"] - x) <= _PLACE_POSITION_TOL_MM
+            and abs(existing["y"] - y) <= _PLACE_POSITION_TOL_MM
+            and (existing["rotation"] - rotation) % 360.0 == 0.0
+            and existing["layer"] == layer):
+        payload = dict(existing)
+        payload["status"] = "success"
+        payload["idempotent"] = True
+        payload["message"] = (
+            "%s already placed identically — nothing added." % existing["reference"])
+        return payload
+    suggested = ("move_component" if existing["footprint"] == footprint
+                 else "remove_component then place_component (footprint swap)")
+    raise ValueError(
+        "Reference %r already exists on the board: %s at (%s, %s) rotation %s "
+        "on %s. Placing it again would create a silent duplicate — use %s "
+        "instead." % (existing["reference"], existing["footprint"],
+                      existing["x"], existing["y"], existing["rotation"],
+                      existing["layer"], suggested))
+
 
 def _handle_place_component(path: str, reference: str, footprint: str,
                              x: float, y: float, layer: str = "F.Cu",
@@ -761,6 +830,10 @@ def _handle_place_component(path: str, reference: str, footprint: str,
     def _do():
         import pcbnew
         board = _get_open_board(path)
+        existing = _existing_footprint_state(board, reference)
+        idem = _check_place_against_existing(existing, footprint, x, y, rotation, layer)
+        if idem is not None:
+            return idem
         fp = _load_footprint(footprint)
         fp.SetReference(reference)
         fp.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
@@ -774,12 +847,42 @@ def _handle_place_component(path: str, reference: str, footprint: str,
 
 
 def _handle_place_components_bulk(path: str, components: list) -> dict[str, Any]:
-    """Place multiple components in one wx main-thread dispatch, then save once."""
+    """Place multiple components in one wx main-thread dispatch, then save once.
+
+    #16 / REQ-DUP-4 semantics: a ref repeated within the input list refuses
+    the ENTIRE batch with the board untouched; a ref colliding with a
+    footprint already on the board gets a per-item outcome (idempotent skip
+    or refusal) while clean items proceed.
+    """
     def _do():
         import pcbnew
         board = _get_open_board(path)
+
+        seen = set()
+        batch_dupes = []
+        for comp in components:
+            ref = comp.get("reference", "")
+            if not ref:
+                continue
+            if ref in seen and ref not in batch_dupes:
+                batch_dupes.append(ref)
+            seen.add(ref)
+        if batch_dupes:
+            return {
+                "status": "refused",
+                "reason": ("duplicate reference(s) within the batch: "
+                           + ", ".join(batch_dupes)
+                           + " — batch refused, board untouched"),
+                "placed": [],
+                "idempotent": [],
+                "failed": [{"reference": ref,
+                            "reason": "duplicate reference within batch"}
+                           for ref in batch_dupes],
+            }
+
         placed = []
         failed = []
+        idempotent = []
         for comp in components:
             reference = comp.get("reference", "")
             footprint = comp.get("footprint", "")
@@ -791,6 +894,12 @@ def _handle_place_components_bulk(path: str, components: list) -> dict[str, Any]
                 failed.append({"reference": reference, "reason": "missing reference or footprint"})
                 continue
             try:
+                existing = _existing_footprint_state(board, reference)
+                idem = _check_place_against_existing(
+                    existing, footprint, x, y, rotation, layer)
+                if idem is not None:
+                    idempotent.append(reference)
+                    continue
                 fp = _load_footprint(footprint)
                 fp.SetReference(reference)
                 fp.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
@@ -801,7 +910,7 @@ def _handle_place_components_bulk(path: str, components: list) -> dict[str, Any]
             except Exception as exc:
                 failed.append({"reference": reference, "reason": str(exc)})
         _save_and_refresh(board)
-        return {"placed": placed, "failed": failed}
+        return {"placed": placed, "failed": failed, "idempotent": idempotent}
     return _run_on_main_thread(_do)
 
 
@@ -859,7 +968,15 @@ def _handle_remove_component(path: str, reference: str) -> dict[str, Any]:
                 "locked": bool(fp.IsLocked()),
                 "pad_nets": pad_nets,
             }
-            board.Remove(fp)
+            # RemoveNative, NOT Remove: pcbnew's SWIG Remove() transfers C++
+            # ownership to the Python wrapper (thisown=1), so the FOOTPRINT
+            # gets freed while the live canvas/connectivity still reference
+            # it — use-after-free heap corruption that later surfaces as the
+            # permanent "'SwigPyObject' has no attribute 'GetFileName'"
+            # poisoning (#14A root cause, fixed 2.3.2). RemoveNative unlinks
+            # identically but leaves ownership alone; the unlinked item leaks
+            # a few KB per call, bounded by the pcbnew session.
+            board.RemoveNative(fp)
             _save_and_refresh(board)
             return {"reference": reference, "removed": True, **state}
         raise ValueError(f"Component {reference!r} not found on board")
@@ -1005,7 +1122,7 @@ def _handle_add_board_outline(
             if item.GetLayer() == pcbnew.Edge_Cuts
         ]
         for item in to_remove:
-            board.Remove(item)
+            board.RemoveNative(item)  # not Remove() — see remove_component (#14A)
         rect = pcbnew.PCB_SHAPE(board)
         rect.SetShape(pcbnew.SHAPE_T_RECT)
         rect.SetLayer(pcbnew.Edge_Cuts)
@@ -1121,13 +1238,13 @@ def _handle_clear_routes(path: str, backup: bool = True) -> dict[str, Any]:
 
         tracks_removed = 0
         vias_removed = 0
-        # Snapshot to a list — board.Remove() during iteration is unsafe
+        # Snapshot to a list — removal during iteration is unsafe.
         for item in list(board.GetTracks()):
             if isinstance(item, pcbnew.PCB_VIA):
                 vias_removed += 1
             else:
                 tracks_removed += 1
-            board.Remove(item)
+            board.RemoveNative(item)  # not Remove() — see remove_component (#14A)
 
         # Pass the filename captured before mutation (#14A) — an in-place
         # mutation can detach the board's filename mid-handler.

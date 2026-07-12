@@ -62,6 +62,12 @@ def _board(
             lines += [
                 f'    (fp_text user "PCB edge" (at {ex} {ey} 0) (layer "Dwgs.User"))',
             ]
+        if "pcb_edge_line" in fp:
+            (sx, sy), (ex2, ey2) = fp["pcb_edge_line"]
+            lines += [
+                f'    (fp_line (start {sx} {sy}) (end {ex2} {ey2}) '
+                f'(stroke (width 0.1) (type dash)) (layer "Dwgs.User"))',
+            ]
         for px, py in fp.get("pads", []):
             lines += [
                 f'    (pad "1" smd rect (at {px} {py}) (size 1 1) (layers "F.Cu"))',
@@ -205,6 +211,76 @@ def test_north_edge_courtyard_offset(tmp_path: Path):
     assert y == pytest.approx(8.5, abs=0.01), (
         f"Expected y=8.5 (origin after 180° rot, north offset), got y={y}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PCB-Edge marker line as the placement datum (REQ-EDGE-3, F2/S3 #18)
+# ---------------------------------------------------------------------------
+
+def test_pcb_edge_marker_line_is_the_datum(tmp_path: Path):
+    """With a Dwgs.User 'PCB edge' fp_line, that line — not courtyard+offset —
+    lands exactly on the target edge (the USB4085 datasheet-overhang case)."""
+    board = _write(tmp_path, "marker_datum.kicad_pcb", _board(
+        (0, 0, 80, 70),
+        {
+            "ref": "J1", "at_x": 0.0, "at_y": 0.0, "rotation": 0,
+            "pcb_edge": (0.0, 3.65),                    # local +y mating face
+            # Datasheet: board edge sits at local y=+4.0; body overhangs past it.
+            "pcb_edge_line": ((-3.0, 4.0), (3.0, 4.0)),  # horizontal, y=4.0
+            "courtyard": (-2.0, -1.5, 4.0, 6.5),
+        },
+    ))
+    result = _call_tool(board, reference="J1", edge="south", offset_mm=2.0)
+    assert result["status"] == "success"
+
+    from kicad_mcp.tools.drc import compute_edge_placement
+    plan = compute_edge_placement(board, "J1", "south")
+    assert plan["datum"] == "pcb_edge_marker"
+    # south edge at y=70, rotation 0 keeps the line at origin_y + 4.0:
+    # origin_y + 4.0 == 70 → origin_y = 66.0 (offset_mm plays no part).
+    _, y, rot = _read_placement(board, "J1")
+    assert rot == 0.0
+    assert y == pytest.approx(66.0, abs=0.01), (
+        f"marker line must sit ON the south edge: expected y=66.0, got {y}"
+    )
+
+
+def test_pcb_edge_marker_line_rotated_edge(tmp_path: Path):
+    """The marker datum follows the footprint rotation (east edge → 90°)."""
+    board = _write(tmp_path, "marker_datum_east.kicad_pcb", _board(
+        (0, 0, 80, 70),
+        {
+            "ref": "J1", "at_x": 0.0, "at_y": 0.0, "rotation": 0,
+            "pcb_edge": (0.0, 3.65),
+            "pcb_edge_line": ((-3.0, 4.0), (3.0, 4.0)),
+            "courtyard": (-2.0, -1.5, 4.0, 6.5),
+        },
+    ))
+    from kicad_mcp.tools.drc import compute_edge_placement
+    plan = compute_edge_placement(board, "J1", "east")
+    assert plan["status"] == "success"
+    assert plan["datum"] == "pcb_edge_marker"
+    assert plan["target_rotation"] == 90.0
+    # Local horizontal line y=4.0 rotated by 90° (CCW-on-screen, y-down file
+    # coords) becomes the vertical line x=+4.0: origin_x + 4.0 == 80.
+    assert plan["target_x"] == pytest.approx(76.0, abs=0.01)
+
+
+def test_no_marker_line_keeps_courtyard_offset(tmp_path: Path):
+    """REQ-EDGE-4: without the fp_line datum the courtyard+offset math is
+    byte-for-byte the previous behavior (regression pin for the fallback)."""
+    board = _write(tmp_path, "no_marker_line.kicad_pcb", _board(
+        (0, 0, 80, 70),
+        {
+            "ref": "J1", "at_x": 0.0, "at_y": 0.0, "rotation": 0,
+            "pcb_edge": (0.0, 3.65),
+            "courtyard": (-2.0, -1.5, 4.0, 6.5),
+        },
+    ))
+    from kicad_mcp.tools.drc import compute_edge_placement
+    plan = compute_edge_placement(board, "J1", "south", offset_mm=2.0)
+    assert plan["datum"] == "courtyard_offset"
+    assert plan["target_y"] == pytest.approx(61.5, abs=0.01)  # 70 - 2.0 - 6.5
 
 
 # ---------------------------------------------------------------------------

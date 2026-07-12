@@ -772,6 +772,43 @@ class TestPlaceComponent:
         assert write_board.save_count == 0  # nothing landed, nothing saved
 
 
+class TestPlaceComponentDupGuard:
+    """#16 / REQ-DUP on the IPC path (F2/S3): the guard runs BEFORE the create
+    attempt, so idempotent hits and refusals serve over IPC — they never fall
+    through to the bridge and never open a commit."""
+
+    @staticmethod
+    def _existing_r1():
+        from kipy.common_types import LibraryIdentifier
+        from kipy.geometry import Vector2
+        from kipy.util.units import from_mm
+        fp = _real_footprint("R1")
+        lib_id = LibraryIdentifier()
+        lib_id.library = "Resistor_SMD"
+        lib_id.name = "R_0805_2012Metric"
+        fp.definition.id = lib_id
+        fp.position = Vector2.from_xy(from_mm(25.0), from_mm(30.0))
+        return fp
+
+    def test_idempotent_replace_no_commit(self, write_ops, write_board):
+        write_board.footprints = [self._existing_r1()]
+        result = write_ops.place_component(
+            BOARD_PATH, "R1", "Resistor_SMD:R_0805_2012Metric", 25.0, 30.0)
+        assert result["status"] == "success"
+        assert result["idempotent"] is True
+        assert write_board.commits_begun == []   # nothing opened
+        assert write_board.created == []         # nothing added
+
+    def test_differing_replace_refuses_before_commit(self, write_ops, write_board):
+        from kicad_mcp.backends.placement_guard import DuplicateRefError
+        write_board.footprints = [self._existing_r1()]
+        with pytest.raises(DuplicateRefError) as exc_info:
+            write_ops.place_component(
+                BOARD_PATH, "R1", "Resistor_SMD:R_0805_2012Metric", 90.0, 90.0)
+        assert exc_info.value.existing.x == 25.0
+        assert write_board.commits_begun == []
+
+
 class TestMoveComponent:
     def test_moves_and_returns_bridge_shape(self, write_ops, write_board):
         from kipy.util.units import to_mm

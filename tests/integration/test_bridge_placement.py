@@ -41,40 +41,66 @@ def test_auto_place_anchors_immobile(bridge_session):
     path = _board_path()
     refs = ["T14_R1", "T14_R2", "T14_R3", "T14_R4"]
     initial_positions = [(10.0, 10.0), (15.0, 10.0), (20.0, 10.0), (25.0, 10.0)]
-    bulk_payload = [
-        {"reference": r, "footprint": _RESISTOR_FP, "x": x, "y": y, "rotation": 0}
-        for r, (x, y) in zip(refs, initial_positions)
-    ]
-    bulk_result = _tcp_call("place_components_bulk", 10.0, path=path, components=bulk_payload)
-    assert bulk_result.get("failed") == [], f"setup placement failed: {bulk_result!r}"
 
-    auto_result = _tcp_call(
-        "auto_place", 10.0,
-        path=path,
-        board_x=0.0, board_y=0.0,
-        board_width=80.0, board_height=80.0,
-        anchors=["T14_R1", "T14_R2"],
-    )
-    assert isinstance(auto_result, dict), f"unexpected auto_place response: {auto_result!r}"
-    placed = auto_result.get("placed", [])
-    warnings = auto_result.get("warnings", [])
-    assert "T14_R3" in placed, f"T14_R3 missing from placed: placed={placed!r}, warnings={warnings!r}"
-    assert "T14_R4" in placed, f"T14_R4 missing from placed: placed={placed!r}, warnings={warnings!r}"
-    # Anchored refs must NOT appear in placed (they were skipped).
-    assert "T14_R1" not in placed, f"anchored T14_R1 was placed: {placed!r}"
-    assert "T14_R2" not in placed, f"anchored T14_R2 was placed: {placed!r}"
-
-    # Final positions: anchors unchanged.
+    # Setup on a shared scratch fixture (#16/REQ-FIX-1): the T14_* refs are
+    # canonical fixture content — MOVE existing ones to the wanted pose and
+    # only place (then remove) the missing ones; every ref this test touched
+    # is restored/removed in the finally.
     components = _tcp_call("get_components", 5.0, path=path)
-    for ref, (ix, iy) in zip(refs[:2], initial_positions[:2]):
-        comp = _find_component(components, ref)
-        assert comp is not None, f"anchored {ref} disappeared"
-        assert abs(comp["x"] - ix) < _TOL_MM, (
-            f"anchored {ref} moved from x={ix} to x={comp['x']} — auto_place must NOT move anchors"
+    existing = {c["reference"]: c for c in components if c.get("reference") in refs}
+    pose_snapshot = {
+        r: (c["x"], c["y"], c.get("rotation", 0.0)) for r, c in existing.items()
+    }
+    placed_by_test: list[str] = []
+    for r, (x, y) in zip(refs, initial_positions):
+        if r in existing:
+            _tcp_call("move_component", 5.0, path=path, reference=r,
+                      x=x, y=y, rotation=0)
+        else:
+            _tcp_call(
+                "place_component", 5.0,
+                path=path, reference=r, footprint=_RESISTOR_FP,
+                x=x, y=y, rotation=0,
+            )
+            placed_by_test.append(r)
+
+    try:
+        auto_result = _tcp_call(
+            "auto_place", 10.0,
+            path=path,
+            board_x=0.0, board_y=0.0,
+            board_width=80.0, board_height=80.0,
+            anchors=["T14_R1", "T14_R2"],
         )
-        assert abs(comp["y"] - iy) < _TOL_MM, (
-            f"anchored {ref} moved from y={iy} to y={comp['y']} — auto_place must NOT move anchors"
-        )
+        assert isinstance(auto_result, dict), f"unexpected auto_place response: {auto_result!r}"
+        placed = auto_result.get("placed", [])
+        warnings = auto_result.get("warnings", [])
+        assert "T14_R3" in placed, f"T14_R3 missing from placed: placed={placed!r}, warnings={warnings!r}"
+        assert "T14_R4" in placed, f"T14_R4 missing from placed: placed={placed!r}, warnings={warnings!r}"
+        # Anchored refs must NOT appear in placed (they were skipped).
+        assert "T14_R1" not in placed, f"anchored T14_R1 was placed: {placed!r}"
+        assert "T14_R2" not in placed, f"anchored T14_R2 was placed: {placed!r}"
+
+        # Final positions: anchors unchanged.
+        components = _tcp_call("get_components", 5.0, path=path)
+        for ref, (ix, iy) in zip(refs[:2], initial_positions[:2]):
+            comp = _find_component(components, ref)
+            assert comp is not None, f"anchored {ref} disappeared"
+            assert abs(comp["x"] - ix) < _TOL_MM, (
+                f"anchored {ref} moved from x={ix} to x={comp['x']} — auto_place must NOT move anchors"
+            )
+            assert abs(comp["y"] - iy) < _TOL_MM, (
+                f"anchored {ref} moved from y={iy} to y={comp['y']} — auto_place must NOT move anchors"
+            )
+    finally:
+        for r in placed_by_test:
+            try:
+                _tcp_call("remove_component", 10.0, path=path, reference=r)
+            except RuntimeError:
+                pass
+        for r, (ox, oy, orot) in pose_snapshot.items():
+            _tcp_call("move_component", 5.0, path=path, reference=r,
+                      x=ox, y=oy, rotation=orot)
 
 
 def test_add_board_outline_creates_edge_cuts_polygon(bridge_session):

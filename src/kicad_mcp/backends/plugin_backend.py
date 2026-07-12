@@ -35,6 +35,13 @@ from kicad_mcp.backends.base import (
     BoardOps,
     KiCadBackend,
 )
+from kicad_mcp.backends.placement_guard import (
+    DuplicateRefError,
+    check_placement,
+    find_batch_duplicate_refs,
+    idempotent_success,
+    index_existing,
+)
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.models.errors import BackendNotAvailableError
 
@@ -237,6 +244,14 @@ class PluginBoardOps(BoardOps):
         self, path: Path, reference: str, footprint: str,
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
+        # Duplicate-ref guard (#16, REQ-DUP-1..3), applied client-side so the
+        # installed bridge needs no change: read the live board's refs first,
+        # never send a place that would append a second copy.
+        existing = index_existing(self._call("get_components", path)).get(reference)
+        if check_placement(existing, reference, footprint,
+                           x, y, rotation, layer) == "idempotent":
+            assert existing is not None
+            return idempotent_success(existing)
         return self._call("place_component", path,
                           reference=reference, footprint=footprint,
                           x=x, y=y, layer=layer, rotation=rotation)
@@ -370,7 +385,61 @@ class PluginBoardOps(BoardOps):
     def place_components_bulk(
         self, path: Path, components: list[dict],
     ) -> dict[str, Any]:
-        return self._call("place_components_bulk", path, components=components)
+        # #16 / REQ-DUP-4: in-batch repeated ref = malformed input → refuse the
+        # whole batch before any TCP write; on-board collisions get a per-item
+        # outcome (idempotent skip / refusal) while clean items go to the bridge.
+        batch_dupes = find_batch_duplicate_refs(components)
+        if batch_dupes:
+            return {
+                "status": "refused",
+                "reason": (
+                    "duplicate reference(s) within the batch: "
+                    + ", ".join(batch_dupes)
+                    + " — batch refused, board untouched"
+                ),
+                "placed": [],
+                "idempotent": [],
+                "failed": [
+                    {"reference": ref, "reason": "duplicate reference within batch"}
+                    for ref in batch_dupes
+                ],
+            }
+
+        on_board = index_existing(self._call("get_components", path))
+        to_send: list[dict] = []
+        idempotent: list[str] = []
+        failed: list[dict] = []
+        for comp in components:
+            reference = comp.get("reference", "")
+            existing = on_board.get(reference) if reference else None
+            if existing is None:
+                to_send.append(comp)  # bridge handles missing-field failures
+                continue
+            try:
+                check_placement(
+                    existing, reference, comp.get("footprint", ""),
+                    float(comp.get("x", 0.0)), float(comp.get("y", 0.0)),
+                    float(comp.get("rotation", 0.0)), comp.get("layer", "F.Cu"),
+                )
+                idempotent.append(reference)
+            except DuplicateRefError as dup:
+                entry = dup.to_refusal()
+                failed.append({
+                    "reference": reference,
+                    "reason": entry["reason"],
+                    "existing": entry["existing"],
+                    "suggested_tool": entry["suggested_tool"],
+                })
+
+        if to_send:
+            result = self._call("place_components_bulk", path, components=to_send)
+        else:
+            result = {"placed": [], "failed": []}
+        return {
+            "placed": result.get("placed", []),
+            "failed": list(result.get("failed", [])) + failed,
+            "idempotent": idempotent,
+        }
 
     def export_dsn(self, path: Path, dsn_path: Path) -> dict[str, Any]:
         return self._call("export_dsn", path, dsn_path=str(dsn_path))

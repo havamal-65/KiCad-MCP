@@ -597,6 +597,70 @@ def _scan_footprint_for_edge_marker(block: str) -> tuple[float, float] | None:
     return None
 
 
+def _scan_footprint_edge_marker_line(block: str) -> tuple[str, float] | None:
+    """The Dwgs.User "PCB edge" ``fp_line`` datum (REQ-EDGE-3, F2/S3).
+
+    Connector footprints that legally overhang the board (USB4085 class) draw
+    a Dwgs.User line at exactly where Edge.Cuts must sit, annotated by the
+    "PCB edge" fp_text that :func:`_scan_footprint_for_edge_marker` detects.
+    Returns ``(axis, coord)`` in the footprint-local frame — ``("x", c)`` for
+    a vertical line at local x=c, ``("y", c)`` for a horizontal line at local
+    y=c — or None when the footprint has no marker text, no axis-aligned
+    Dwgs.User line, or the line is diagonal. With several candidate lines the
+    one closest to the marker text wins.
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    marker_pos = _scan_footprint_for_edge_marker(block)
+    if marker_pos is None:
+        return None
+
+    line_pat = re.compile(
+        r'\(start\s+([-\d.]+)\s+([-\d.]+)\).*?\(end\s+([-\d.]+)\s+([-\d.]+)\)',
+        re.DOTALL,
+    )
+    best: tuple[str, float] | None = None
+    best_dist = float("inf")
+
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token != "fp_line":
+            i += 1
+            continue
+        end_idx = _walk_balanced_parens(block, i)
+        if end_idx is None:
+            i += 1
+            continue
+        sub = block[i : end_idx + 1]
+        i = end_idx + 1
+        if '"Dwgs.User"' not in sub:
+            continue
+        m = line_pat.search(sub)
+        if m is None:
+            continue
+        x1, y1, x2, y2 = (float(m.group(k)) for k in range(1, 5))
+        if abs(x1 - x2) < 1e-6 and abs(y1 - y2) >= 1e-6:
+            axis, coord = "x", x1        # vertical line: local x = const
+            dist = abs(marker_pos[0] - coord)
+        elif abs(y1 - y2) < 1e-6 and abs(x1 - x2) >= 1e-6:
+            axis, coord = "y", y1        # horizontal line: local y = const
+            dist = abs(marker_pos[1] - coord)
+        else:
+            continue                     # diagonal — not an edge datum
+        if dist < best_dist:
+            best = (axis, coord)
+            best_dist = dist
+    return best
+
+
 def _scan_footprint_courtyard_center(block: str) -> tuple[float, float] | None:
     """Centroid of the F.CrtYd rectangle (or fp_line extents) in local frame."""
     from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
@@ -1142,14 +1206,118 @@ def compute_edge_placement(
         target_x = board_xmin + offset_mm - r_xmin
         target_y = (board_ymin + board_ymax) / 2.0 - (r_ymin + r_ymax) / 2.0
 
+    # REQ-EDGE-3 (F2/S3): when the footprint carries a Dwgs.User "PCB edge"
+    # fp_line, that line is the connector's own datasheet statement of where
+    # Edge.Cuts must sit — align it exactly to the target edge, overriding the
+    # courtyard+offset math on the edge-normal axis (offset_mm is ignored on
+    # that axis; centering along the edge stays courtyard-derived). Without a
+    # marker line the courtyard+offset behavior above is unchanged (REQ-EDGE-4).
+    datum = "courtyard_offset"
+    evidence = connector["evidence"]
+    marker_line = _scan_footprint_edge_marker_line(block)
+    if marker_line is not None:
+        axis, coord = marker_line
+        if axis == "x":
+            point, direction = (coord, 0.0), (0.0, 1.0)
+        else:
+            point, direction = (0.0, coord), (1.0, 0.0)
+        px, py = _rotate_vec(point[0], point[1], target_rotation)
+        dx, dy = _rotate_vec(direction[0], direction[1], target_rotation)
+        line_is_vertical = abs(dy) > abs(dx)   # board-frame x = const
+        if edge in ("east", "west") and line_is_vertical:
+            edge_x = board_xmax if edge == "east" else board_xmin
+            target_x = edge_x - px
+            datum = "pcb_edge_marker"
+        elif edge in ("north", "south") and not line_is_vertical:
+            edge_y = board_ymin if edge == "north" else board_ymax
+            target_y = edge_y - py
+            datum = "pcb_edge_marker"
+        if datum == "pcb_edge_marker":
+            evidence += (
+                f"; PCB-Edge marker line (local {axis}={coord}) aligned to the "
+                f"{edge} edge — offset_mm not applied"
+            )
+
     return {
         "status": "success",
         "target_x": target_x,
         "target_y": target_y,
         "target_rotation": target_rotation,
         "local_mating_face": local_face,
-        "evidence": connector["evidence"],
+        "datum": datum,
+        "evidence": evidence,
     }
+
+
+def compute_edge_overhang_exemptions(
+    pcb_path: Path,
+    content: str,
+    outline: tuple[float, float, float, float],
+    courtyards: dict[str, dict[str, float]],
+    candidate_refs: list[str],
+) -> dict[str, str]:
+    """REQ-EDGE-1/2 (#18, F2/S3): which out-of-outline candidates are LEGAL
+    edge-connector overhang. Returns ``{ref: evidence}`` for the exempt ones.
+
+    A candidate is exempt ONLY when all of these hold (narrow scope — R2, no
+    masking; anything else keeps failing the gate):
+
+    * it is a detected edge-facing connector (:func:`run_identify_edge_facing_connectors`);
+    * its courtyard crosses exactly ONE board edge (a corner or oversized
+      crossing is not a mating overhang);
+    * its mating face points off-board at that edge. The face comes from the
+      PCB-Edge marker when present (identify signal 1) or pad-vs-courtyard
+      geometry; when the connector is name-matched but its face is
+      indeterminate, the single crossed edge itself is accepted as the mating
+      direction (F2-Q2 fallback: the crossed edge's outward normal).
+    """
+    identify = run_identify_edge_facing_connectors(pcb_path)
+    by_ref = {c["ref"]: c for c in identify["connectors"]}
+    oxmin, oymin, oxmax, oymax = outline
+    exempt: dict[str, str] = {}
+
+    for ref in candidate_refs:
+        connector = by_ref.get(ref)
+        if connector is None:
+            continue  # not a connector → genuine out_of_outline (REQ-EDGE-2)
+        cyd = courtyards.get(ref)
+        if cyd is None:
+            continue
+        crossed = [
+            edge for edge, is_crossed in (
+                ("west", cyd["xmin"] < oxmin),
+                ("east", cyd["xmax"] > oxmax),
+                ("north", cyd["ymin"] < oymin),
+                ("south", cyd["ymax"] > oymax),
+            ) if is_crossed
+        ]
+        if len(crossed) != 1:
+            continue
+        edge = crossed[0]
+
+        local_face = connector.get("mating_face")
+        if local_face is not None:
+            placement = _get_footprint_placement(content, ref)
+            if placement is None:
+                continue
+            _, _, rotation = placement
+            fx, fy = _FACE_VECTORS[local_face]
+            bx, by = _rotate_vec(fx, fy, rotation)
+            if _vec_to_face(bx, by) != _EDGE_OUTWARD_FACE[edge]:
+                continue  # overhangs an edge its mating face doesn't point at
+            face_evidence = (
+                f"mating face {local_face} rotated {rotation}° points off-board"
+            )
+        else:
+            face_evidence = (
+                "mating face indeterminate — single crossed edge accepted as "
+                "the mating direction (F2-Q2 fallback)"
+            )
+        exempt[ref] = (
+            f"edge-connector overhang at the {edge} edge: {face_evidence} "
+            f"({connector['evidence']})"
+        )
+    return exempt
 
 
 def run_validate_connector_orientations(pcb_path: Path) -> dict[str, Any]:

@@ -164,7 +164,7 @@ def _run_pcbnew_script(script: str, timeout: int = 60) -> tuple[bool, str]:
             existing = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = ":".join(kicad_paths + ([existing] if existing else []))
 
-    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     try:
         result = subprocess.run(
             [str(kicad_python), "-S", "-u", "-c", script],

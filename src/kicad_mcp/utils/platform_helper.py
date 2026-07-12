@@ -214,7 +214,7 @@ def _any_process_running(names: tuple[str, ...]) -> bool:
     platform = get_platform()
     try:
         if platform == "windows":
-            flags = subprocess.CREATE_NO_WINDOW
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             for stem in names:
                 image = f"{stem}.exe"
                 result = subprocess.run(
@@ -329,7 +329,7 @@ def launch_kicad(project_path: Path | None = None) -> bool:
         if platform == "windows":
             subprocess.Popen(
                 args,
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
             )
         else:
             subprocess.Popen(args)
@@ -396,7 +396,7 @@ def launch_pcbnew(pcb_path: Path) -> bool:
         if platform == "windows":
             subprocess.Popen(
                 args,
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
             )
         else:
             subprocess.Popen(args)

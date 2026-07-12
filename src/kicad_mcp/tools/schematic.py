@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastmcp import FastMCP
 
-from kicad_mcp.backends.base import BackendProtocol
+from kicad_mcp.backends.base import BackendProtocol, BoardOps
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -22,7 +22,7 @@ from kicad_mcp.utils.validation import (
 logger = get_logger("tools.schematic")
 
 
-def _format_validator_refusal_message(sf: dict) -> str:
+def _format_validator_refusal_message(sf: dict[str, Any]) -> str:
     """One-line summary of a §6.2 validator failure naming up to 3 problems.
 
     Avoids dumping a large blob into the tool result (the full lists are still
@@ -105,7 +105,9 @@ def suggest_footprint_candidates(
         return []
 
 
-def _attempt_footprint_swap(pcb_p: Path, ref: str, new_fp: str, board_ops=None) -> dict:
+def _attempt_footprint_swap(
+    pcb_p: Path, ref: str, new_fp: str, board_ops: BoardOps | None = None
+) -> dict[str, Any]:
     """Swap a PCB footprint for *new_fp*, preserving position/rotation/layer/nets.
 
     The three mutations (remove → place → re-net) route through *board_ops* — the
@@ -576,7 +578,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_ops()
 
         if references:
-            batch: dict = {}
+            batch: dict[str, Any] = {}
             for ref in references:
                 validate_reference(ref)
                 batch[ref] = ops.get_symbol_pin_positions(p, ref)
@@ -660,7 +662,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
-    def add_components(path: str, components: list[dict]) -> str:
+    def add_components(path: str, components: list[dict[str, Any]]) -> str:
         """Add multiple component symbols in a single call. Prefer over looping add_component.
 
         Each list entry is a dict with the same fields as add_component:
@@ -713,7 +715,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
-    def add_power_symbols(path: str, symbols: list[dict]) -> str:
+    def add_power_symbols(path: str, symbols: list[dict[str, Any]]) -> str:
         """Add multiple power symbols in a single call. Prefer over looping add_power_symbol.
 
         Each list entry is a dict with:
@@ -811,7 +813,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
-    def add_no_connects(path: str, points: list[dict]) -> str:
+    def add_no_connects(path: str, points: list[dict[str, Any]]) -> str:
         """Mark multiple unused pins with no-connect (X) markers in one call.
 
         Each entry: {"x": float, "y": float}. Place each marker exactly on
@@ -850,7 +852,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return json.dumps({"status": "success", **result}, indent=2)
 
     @mcp.tool()
-    def move_components(path: str, moves: list[dict]) -> str:
+    def move_components(path: str, moves: list[dict[str, Any]]) -> str:
         """Move multiple schematic components in one call.
 
         Each entry: {"reference": str, "x": float, "y": float,
@@ -899,7 +901,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         )
         return json.dumps({"status": "success", **result}, indent=2)
 
-    def _remove_schematic_component(sch_p: Path, reference: str) -> dict:
+    def _remove_schematic_component(sch_p: Path, reference: str) -> dict[str, Any]:
         backup = create_backup(sch_p)
         ops = backend.get_schematic_modify_ops()
         result = ops.remove_component(sch_p, reference)
@@ -911,7 +913,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         )
         return result
 
-    def _remove_board_component(pcb_p: Path, reference: str) -> dict:
+    def _remove_board_component(pcb_p: Path, reference: str) -> dict[str, Any]:
         """Bridge-first footprint removal with file-backend fallback (#3)."""
         from kicad_mcp.backends.file_backend import FileBoardOps
         from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
@@ -983,7 +985,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         sch_p = validate_kicad_path(str(base.with_suffix(".kicad_sch")), ".kicad_sch")
         pcb_p = validate_kicad_path(str(base.with_suffix(".kicad_pcb")), ".kicad_pcb")
 
-        sides: dict[str, dict] = {}
+        sides: dict[str, dict[str, Any]] = {}
         errors = 0
         try:
             sides["schematic"] = _remove_schematic_component(sch_p, reference)
@@ -1256,7 +1258,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # Build dicts keyed by reference, filtering out power symbols.
         # Multi-unit components appear once per unit; merge so the footprint
         # from whichever unit carries it is preserved.
-        sch_by_ref: dict[str, dict] = {}
+        sch_by_ref: dict[str, dict[str, Any]] = {}
         for sym in sch_data.get("symbols", []):
             ref = sym.get("reference", "")
             if not ref or ref.startswith("#"):
@@ -1268,7 +1270,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             elif sym.get("footprint") and not sch_by_ref[ref].get("footprint"):
                 sch_by_ref[ref]["footprint"] = sym["footprint"]
 
-        pcb_by_ref: dict[str, dict] = {}
+        pcb_by_ref: dict[str, dict[str, Any]] = {}
         for comp in pcb_data.get("components", []):
             ref = comp.get("reference", "")
             if ref:
@@ -1499,7 +1501,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # Build dicts keyed by reference, filtering out power symbols.
         # Multi-unit components appear once per unit; merge so the footprint
         # from whichever unit carries it is preserved.
-        sch_by_ref: dict[str, dict] = {}
+        sch_by_ref: dict[str, dict[str, Any]] = {}
         conflicting_fp_refs: set[str] = set()
         for sym in sch_data.get("symbols", []):
             ref = sym.get("reference", "")
@@ -1517,14 +1519,14 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 # ambiguous for the swap path, skip-with-reason there.
                 conflicting_fp_refs.add(ref)
 
-        pcb_by_ref: dict[str, dict] = {}
+        pcb_by_ref: dict[str, dict[str, Any]] = {}
         for comp in pcb_data.get("components", []):
             ref = comp.get("reference", "")
             if ref:
                 pcb_by_ref[ref] = comp
 
-        actions: list[dict] = []
-        warnings: list[dict] = []
+        actions: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
 
         # §6.3 soft gate: nudge (don't block — sync is iterative) when the
         # schematic hasn't passed validate_schematic_for_pcb against its current
@@ -1546,6 +1548,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # (it returns an ops object without probing the bridge), then every individual
         # place_component / assign_net call failed with [WinError 10061] and was
         # silently turned into a warning, producing status:"success" with 0 placements.
+        board_modify_ops: BoardOps
         if isinstance(pcb_ops, FileBoardOps):
             board_modify_ops = FileBoardOps()
         else:
@@ -1692,8 +1695,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         # Check mismatches for pre-existing components, and update values for all
         # (including newly placed, which start with the footprint name as Value).
-        footprint_changes_applied: list[dict] = []
-        footprint_changes_skipped: list[dict] = []
+        footprint_changes_applied: list[dict[str, Any]] = []
+        footprint_changes_skipped: list[dict[str, Any]] = []
         for ref in sorted(set(sch_by_ref) & (set(pcb_by_ref) | placed_refs)):
             sch_sym = sch_by_ref[ref]
             pcb_comp = pcb_by_ref.get(ref)
@@ -1754,7 +1757,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 # which is the #7 revert root cause), else the file backend.
                 if board_modify_ops is not None:
                     try:
-                        board_modify_ops.set_footprint_value(pcb_p, ref, sch_val)
+                        cast(FileBoardOps, board_modify_ops).set_footprint_value(
+                            pcb_p, ref, sch_val
+                        )
                         actions.append({
                             "type": "value_updated",
                             "reference": ref,

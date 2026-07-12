@@ -26,9 +26,9 @@ jobs:
   typecheck:
     name: mypy
     runs-on: ubuntu-latest
-    # Informational only — mypy errors are tracked but do not block merges.
-    # Remove continue-on-error once strict type coverage is achieved.
-    continue-on-error: true
+    # BLOCKING: whole-repo `mypy src/` is clean (0 errors as of 2026-07-12) and
+    # is now enforced. A new type error fails CI. (The stricter `typecheck-strict`
+    # job below additionally holds the hot files to `mypy --strict`.)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

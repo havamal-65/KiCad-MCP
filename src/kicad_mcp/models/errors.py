@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class KiCadMCPError(Exception):
     """Base exception for all KiCad MCP errors."""
 
-    def __init__(self, message: str, details: dict | None = None):
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.details = details or {}
 

@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 from kicad_mcp.logging_config import get_logger
 
@@ -31,7 +32,7 @@ _BOARD_CLEAN_TIMEOUT_SECONDS = 300
 # pcbnew import helpers
 # ---------------------------------------------------------------------------
 
-def _get_pcbnew():
+def _get_pcbnew() -> "ModuleType | None":
     """Try to import pcbnew module.
 
     Returns:
@@ -41,7 +42,8 @@ def _get_pcbnew():
     add_kicad_to_sys_path()
     try:
         import pcbnew
-        return pcbnew
+        module: ModuleType = pcbnew
+        return module
     except ImportError:
         return None
 

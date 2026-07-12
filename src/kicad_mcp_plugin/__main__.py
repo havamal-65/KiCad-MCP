@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Any
 
 from kicad_mcp import __version__
 from kicad_mcp.config import LogLevel, TransportType
@@ -58,7 +59,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    overrides: dict = {}
+    overrides: dict[str, Any] = {}
     if args.transport:
         overrides["transport"] = TransportType(args.transport)
     if args.log_level:

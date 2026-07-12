@@ -30,7 +30,7 @@ class CLIExportOps(ExportOps):
     def __init__(self, cli_path: Path) -> None:
         self._cli = cli_path
 
-    def _run(self, args: list[str], timeout: int = CLI_TIMEOUT) -> subprocess.CompletedProcess:
+    def _run(self, args: list[str], timeout: int = CLI_TIMEOUT) -> subprocess.CompletedProcess[str]:
         cmd = [str(self._cli)] + args
         logger.debug("Running: %s", " ".join(cmd))
         try:
@@ -211,7 +211,7 @@ class CLIDRCOps(DRCOps):
     def __init__(self, cli_path: Path) -> None:
         self._cli = cli_path
 
-    def _run(self, args: list[str], timeout: int = CLI_TIMEOUT) -> subprocess.CompletedProcess:
+    def _run(self, args: list[str], timeout: int = CLI_TIMEOUT) -> subprocess.CompletedProcess[str]:
         cmd = [str(self._cli)] + args
         logger.debug("Running: %s", " ".join(cmd))
         try:

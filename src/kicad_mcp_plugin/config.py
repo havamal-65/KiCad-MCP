@@ -15,7 +15,7 @@ from kicad_mcp.config import KiCadMCPConfig
 class KiCadPluginConfig(KiCadMCPConfig):
     """Config for the plugin entry point."""
 
-    model_config = {  # type: ignore[assignment]
+    model_config = {
         "env_prefix": "KICAD_PLUGIN_",
         "env_file": ".env.plugin",
         "env_file_encoding": "utf-8",

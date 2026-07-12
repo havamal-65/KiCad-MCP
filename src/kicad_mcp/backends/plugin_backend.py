@@ -113,7 +113,7 @@ def _get_op_timeout() -> float:
 # Low-level transport
 # ---------------------------------------------------------------------------
 
-def _tcp_call(method: str, timeout: float, **kwargs) -> Any:
+def _tcp_call(method: str, timeout: float, **kwargs: Any) -> Any:
     """Send one JSON request to the bridge and return the result payload.
 
     Raises:
@@ -193,7 +193,7 @@ class PluginBoardOps(BoardOps):
     # Set by PluginDirectBackend to reset its _bridge_available flag.
     _on_disconnect: "Any | None" = None
 
-    def _call(self, method: str, path: Path | str | None = None, **kwargs) -> Any:
+    def _call(self, method: str, path: Path | str | None = None, **kwargs: Any) -> Any:
         kw = kwargs
         if path is not None:
             kw = {"path": str(path), **kwargs}
@@ -240,25 +240,32 @@ class PluginBoardOps(BoardOps):
         return {"info": info, "components": components, "nets": nets, "tracks": tracks}
 
     def get_board_info(self, path: Path) -> dict[str, Any]:
-        return self._call("get_board_info", path)
+        result: dict[str, Any] = self._call("get_board_info", path)
+        return result
 
     def get_components(self, path: Path) -> list[dict[str, Any]]:
-        return self._call("get_components", path)
+        result: list[dict[str, Any]] = self._call("get_components", path)
+        return result
 
     def get_nets(self, path: Path) -> list[dict[str, Any]]:
-        return self._call("get_nets", path)
+        result: list[dict[str, Any]] = self._call("get_nets", path)
+        return result
 
     def get_tracks(self, path: Path) -> list[dict[str, Any]]:
-        return self._call("get_tracks", path)
+        result: list[dict[str, Any]] = self._call("get_tracks", path)
+        return result
 
     def get_board_info_extended(self, path: Path) -> dict[str, Any]:
-        return self._call("get_board_info", path)
+        result: dict[str, Any] = self._call("get_board_info", path)
+        return result
 
     def get_design_rules(self, path: Path) -> dict[str, Any]:
-        return self._call("get_design_rules", path)
+        result: dict[str, Any] = self._call("get_design_rules", path)
+        return result
 
     def get_stackup(self, path: Path) -> dict[str, Any]:
-        return self._call("get_stackup", path)
+        result: dict[str, Any] = self._call("get_stackup", path)
+        return result
 
     # -- Write ---------------------------------------------------------------
 
@@ -274,9 +281,10 @@ class PluginBoardOps(BoardOps):
                            x, y, rotation, layer) == "idempotent":
             assert existing is not None
             return idempotent_success(existing)
-        return self._call("place_component", path,
+        result: dict[str, Any] = self._call("place_component", path,
                           reference=reference, footprint=footprint,
                           x=x, y=y, layer=layer, rotation=rotation)
+        return result
 
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
@@ -285,60 +293,71 @@ class PluginBoardOps(BoardOps):
         kwargs: dict[str, Any] = {"reference": reference, "x": x, "y": y}
         if rotation is not None:
             kwargs["rotation"] = rotation
-        return self._call("move_component", path, **kwargs)
+        result: dict[str, Any] = self._call("move_component", path, **kwargs)
+        return result
 
     def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
-        return self._call("remove_component", path, reference=reference)
+        result: dict[str, Any] = self._call("remove_component", path, reference=reference)
+        return result
 
     def add_track(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float, width: float,
         layer: str = "F.Cu", net: str = "",
     ) -> dict[str, Any]:
-        return self._call("add_track", path,
+        result: dict[str, Any] = self._call("add_track", path,
                           start_x=start_x, start_y=start_y,
                           end_x=end_x, end_y=end_y,
                           width=width, layer=layer, net=net)
+        return result
 
     def add_via(
         self, path: Path, x: float, y: float,
         size: float = 0.8, drill: float = 0.4,
         net: str = "", via_type: str = "through",
     ) -> dict[str, Any]:
-        return self._call("add_via", path,
+        result: dict[str, Any] = self._call("add_via", path,
                           x=x, y=y, size=size, drill=drill,
                           net=net, via_type=via_type)
+        return result
 
     def assign_net(
         self, path: Path, reference: str, pad: str, net: str,
     ) -> dict[str, Any]:
-        return self._call("assign_net", path,
+        result: dict[str, Any] = self._call("assign_net", path,
                           reference=reference, pad=pad, net=net)
+        return result
 
     def set_footprint_value(
         self, path: Path, reference: str, value: str,
     ) -> dict[str, Any]:
-        return self._call("set_footprint_value", path,
+        result: dict[str, Any] = self._call("set_footprint_value", path,
                           reference=reference, value=value)
+        return result
 
     def refill_zones(self, path: Path) -> dict[str, Any]:
-        return self._call("refill_zones", path)
+        result: dict[str, Any] = self._call("refill_zones", path)
+        return result
 
     def save_board(self, path: Path) -> dict[str, Any]:
-        return self._call("save_board", path)
+        result: dict[str, Any] = self._call("save_board", path)
+        return result
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
-        return self._call("clear_routes", path, backup=backup)
+        result: dict[str, Any] = self._call("clear_routes", path, backup=backup)
+        return result
 
     def reload_board(self, path: Path) -> dict[str, Any]:
-        return self._call("reload_board", path)
+        result: dict[str, Any] = self._call("reload_board", path)
+        return result
 
     def add_board_outline(
         self, path: Path, x: float, y: float,
         width: float, height: float, line_width: float = 0.05,
     ) -> dict[str, Any]:
-        return self._call("add_board_outline", path,
+        result: dict[str, Any] = self._call("add_board_outline", path,
                           x=x, y=y, width=width, height=height, line_width=line_width)
+        return result
 
     def auto_place(
         self, path: Path, board_x: float, board_y: float,
@@ -348,11 +367,12 @@ class PluginBoardOps(BoardOps):
     ) -> dict[str, Any]:
         if strategy == "row":
             # Legacy geometry packer runs inside pcbnew (bridge), unchanged.
-            return self._call("auto_place", path,
+            row_result: dict[str, Any] = self._call("auto_place", path,
                               board_x=board_x, board_y=board_y,
                               board_width=board_width, board_height=board_height,
                               clearance_mm=clearance_mm,
                               anchors=anchors or [])
+            return row_result
 
         # Net-aware: the engine is pure Python and lives here on the server side.
         # We refresh the on-disk board from the live session, compute the plan
@@ -405,7 +425,7 @@ class PluginBoardOps(BoardOps):
         }
 
     def place_components_bulk(
-        self, path: Path, components: list[dict],
+        self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
         # #16 / REQ-DUP-4: in-batch repeated ref = malformed input → refuse the
         # whole batch before any TCP write; on-board collisions get a per-item
@@ -428,9 +448,9 @@ class PluginBoardOps(BoardOps):
             }
 
         on_board = index_existing(self._call("get_components", path))
-        to_send: list[dict] = []
+        to_send: list[dict[str, Any]] = []
         idempotent: list[str] = []
-        failed: list[dict] = []
+        failed: list[dict[str, Any]] = []
         for comp in components:
             reference = comp.get("reference", "")
             existing = on_board.get(reference) if reference else None
@@ -464,10 +484,12 @@ class PluginBoardOps(BoardOps):
         }
 
     def export_dsn(self, path: Path, dsn_path: Path) -> dict[str, Any]:
-        return self._call("export_dsn", path, dsn_path=str(dsn_path))
+        result: dict[str, Any] = self._call("export_dsn", path, dsn_path=str(dsn_path))
+        return result
 
     def import_ses(self, path: Path, ses_path: Path) -> dict[str, Any]:
-        return self._call("import_ses", path, ses_path=str(ses_path))
+        result: dict[str, Any] = self._call("import_ses", path, ses_path=str(ses_path))
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +539,8 @@ class PluginBackend(KiCadBackend):
     def get_version(self) -> str | None:
         try:
             result = _tcp_call("ping", _get_ping_timeout())
-            return result.get("kicad_version")
+            version: str | None = result.get("kicad_version")
+            return version
         except Exception:
             return None
 
@@ -526,6 +549,7 @@ class PluginBackend(KiCadBackend):
 
     def get_active_project(self) -> dict[str, Any]:
         try:
-            return _tcp_call("get_active_project", _get_op_timeout())
+            result: dict[str, Any] = _tcp_call("get_active_project", _get_op_timeout())
+            return result
         except Exception as exc:
             raise RuntimeError(f"Plugin bridge get_active_project failed: {exc}") from exc

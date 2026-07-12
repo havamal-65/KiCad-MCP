@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from kicad_mcp.logging_config import get_logger
 
@@ -231,6 +232,7 @@ def _any_process_running(names: tuple[str, ...]) -> bool:
                 result = subprocess.run(
                     ["pgrep", "-x", stem],
                     capture_output=True,
+                    text=True,
                     timeout=5,
                 )
                 if result.returncode == 0:
@@ -741,7 +743,7 @@ def download_freerouting(target_dir: Path | None = None) -> Path | None:
         return None
 
 
-def get_platform_info() -> dict:
+def get_platform_info() -> dict[str, Any]:
     """Return comprehensive platform information."""
     return {
         "platform": get_platform(),

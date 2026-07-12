@@ -51,7 +51,7 @@ def check_gate(file_path: Path, validator_name: str) -> dict[str, Any] | None:
     return None
 
 
-def _gate_message(validator_name: str, gated_tool: str, gap: dict, fix_hint: str) -> str:
+def _gate_message(validator_name: str, gated_tool: str, gap: dict[str, Any], fix_hint: str) -> str:
     if not gap["ran"]:
         return (
             f"{gated_tool} requires {validator_name} to have passed on the current "

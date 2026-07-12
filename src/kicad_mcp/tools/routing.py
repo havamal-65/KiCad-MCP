@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from fastmcp import FastMCP
 
@@ -98,7 +99,7 @@ def _is_boardless_bridge_error(err: object) -> bool:
     )
 
 
-def _export_dsn_subprocess(p: Path, dsn_path: Path) -> dict:
+def _export_dsn_subprocess(p: Path, dsn_path: Path) -> dict[str, Any]:
     """Headless DSN export: load the on-disk board in a subprocess pcbnew and run
     ExportSpecctraDSN.
 
@@ -131,7 +132,7 @@ print("DSN_OK" if ok else "DSN_FAIL")
     return {"success": True, "dsn_path": str(dsn_path), "via": "subprocess"}
 
 
-def _export_dsn_with_fallback(backend: BackendProtocol, p: Path, dsn_path: Path) -> dict:
+def _export_dsn_with_fallback(backend: BackendProtocol, p: Path, dsn_path: Path) -> dict[str, Any]:
     """Export DSN via the live bridge, falling back to a headless subprocess.
 
     The bridge path reads pcbnew's live in-memory board (preferred — it reflects
@@ -155,7 +156,7 @@ def _export_dsn_with_fallback(backend: BackendProtocol, p: Path, dsn_path: Path)
         raise
 
 
-def _import_ses_subprocess(p: Path, ses_path: Path) -> dict:
+def _import_ses_subprocess(p: Path, ses_path: Path) -> dict[str, Any]:
     """Headless SES import: load the on-disk board in a subprocess pcbnew, run
     ImportSpecctraSES, and save back to disk.
 
@@ -219,7 +220,7 @@ print("SES_OK %d %d" % (before, after))
     }
 
 
-def _import_ses_with_fallback(backend: BackendProtocol, p: Path, ses_path: Path) -> dict:
+def _import_ses_with_fallback(backend: BackendProtocol, p: Path, ses_path: Path) -> dict[str, Any]:
     """Import SES via the live bridge, falling back to a headless subprocess.
 
     The bridge path imports into pcbnew's live in-memory board and saves. But
@@ -362,7 +363,7 @@ def _detect_freerouting_is_v2(
         return False
 
 
-def _select_via_ladder_winner(rungs: list[dict]) -> tuple[dict, bool]:
+def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
     """Pick the best via-cost rung — REQ-FR-6.
 
     Prefers a **fully-routed** (0 unrouted) rung with the **fewest vias**
@@ -375,7 +376,7 @@ def _select_via_ladder_winner(rungs: list[dict]) -> tuple[dict, bool]:
     """
     inf = float("inf")
 
-    def _via_key(r: dict) -> tuple:
+    def _via_key(r: dict[str, Any]) -> tuple[Any, ...]:
         return (
             r.get("vias") if r.get("vias") is not None else inf,
             r.get("track_length") if r.get("track_length") is not None else inf,
@@ -386,7 +387,7 @@ def _select_via_ladder_winner(rungs: list[dict]) -> tuple[dict, bool]:
     if complete:
         return min(complete, key=_via_key), True
 
-    def _unrouted_key(r: dict) -> tuple:
+    def _unrouted_key(r: dict[str, Any]) -> tuple[Any, ...]:
         u = r.get("unrouted")
         return (u if u is not None else inf, *_via_key(r))
 
@@ -585,7 +586,7 @@ def _impl_run_freerouter(
                 "unrouted count, so completeness is unverified here."
             )
 
-    response: dict = {
+    response: dict[str, Any] = {
         "status": status,
         "ses_path": str(ses),
         "ses_size_bytes": ses.stat().st_size,
@@ -749,7 +750,7 @@ print(f"TRACKS={{tracks}}")
 # NPTH keepout injection helpers
 # ---------------------------------------------------------------------------
 
-def _extract_npth_pads(pcb_path: Path) -> list[dict]:
+def _extract_npth_pads(pcb_path: Path) -> list[dict[str, Any]]:
     """Return absolute positions and drill sizes for all NPTH pads in a .kicad_pcb file.
 
     Parses each footprint block, rotates the pad's local offset by the footprint
@@ -767,7 +768,7 @@ def _extract_npth_pads(pcb_path: Path) -> list[dict]:
     drill_re  = _re.compile(r'\(drill\s+([-\d.]+)')
     pat_at_re = _re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
 
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     i = 0
     n = len(content)
 
@@ -834,7 +835,7 @@ def _extract_npth_pads(pcb_path: Path) -> list[dict]:
 
 def _inject_npth_keepouts_into_dsn(
     dsn_path: Path,
-    npth_pads: list[dict],
+    npth_pads: list[dict[str, Any]],
     expansion_mm: float = 0.22,
 ) -> int:
     """Append keepout circles for NPTH pads into the DSN (structure ...) block.
@@ -1121,7 +1122,7 @@ def register_tools(
         p = validate_kicad_path(path, ".kicad_pcb")
         dsn = p.parent / "freerouting.dsn"
         ses = p.parent / "freerouting.ses"
-        report: dict = {"status": "success", "steps": []}
+        report: dict[str, Any] = {"status": "success", "steps": []}
 
         # Step 0: Connector-orientation gate (Phase 6.1.4).
         # autoroute refuses to start if validate_connector_orientations has not
@@ -1235,7 +1236,7 @@ def register_tools(
 
         if is_v2 and adaptive_via_cost:
             ladder = via_cost_ladder or _VIA_COST_LADDER
-            rungs: list[dict] = []
+            rungs: list[dict[str, Any]] = []
             for vc in ladder:
                 ses_vc = p.parent / f"freerouting_vc{vc}.ses"
                 temp_ses.append(ses_vc)

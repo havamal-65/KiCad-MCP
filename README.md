@@ -8,19 +8,20 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **102 MCP Tools** across 9 categories:
-  - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project via IPC (Linux-safe fallback when `GetOpenDocuments` is unavailable), PCB workflow reference, plan capture and retrieval, **startup gate checklist**
-  - 📐 **Schematic Operations** (26 tools): Create schematics from scratch, place/remove/move components, wire routing, labels, no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
-  - 🔌 **PCB Board Operations** (16 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
+- **110 MCP Tools** across 10 categories:
+  - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project (IPC-first, with bridge fallback), PCB workflow reference, plan capture and retrieval, **7-item startup gate checklist**
+  - 📐 **Schematic Operations** (28 tools): Create schematics from scratch, place/remove/move components, wire routing, labels (add/remove/edit label text), no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution **and audited rotation/mirror math against eeschema**), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
+  - 🔌 **PCB Board Operations** (17 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), **board-size verification gate**, full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
-  - ✅ **Design Rule Checks** (10 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **pre-sync schematic completeness check**, **fast courtyard overlap check**, **detect edge-facing connectors** (USB-C, JST, audio jacks, etc.), **validate connector orientations** with autoroute hash-gate that refuses to route over inward-facing connectors
-  - 📤 **Export Operations** (7 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models**
-  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clear all routes for re-placement**
+  - ✅ **Design Rule Checks** (13 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **symbol/footprint pad-match validator**, **pre-sync schematic completeness check**, **fast courtyard overlap check**, **placement-quality gate** (keep-out intrusion + net-aware metric), **detect edge-facing connectors** (USB-C, JST, audio jacks, etc.), **validate connector orientations** with autoroute hash-gate that refuses to route over inward-facing connectors
+  - 📤 **Export Operations** (8 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models**, **verify 3D model references resolve on disk**
+  - 🏭 **Manufacturing** (1 tool): One-call **manufacturing-readiness audit** — DRC + board-size + courtyard + 3D-model + all five fab artifacts with a structured ship/no-ship verdict
+  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clean board for routing**, **clear all routes for re-placement**
   - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
 
 - **Plugin Backend Architecture**: `PluginDirectBackend` routes each operation to the right subsystem — no fallback ambiguity:
-  - **Board read/write** → TCP bridge to KiCad's embedded `pcbnew` Python (requires KiCad open)
+  - **Board read/write** → KiCad IPC API (`kicad-python`/`kipy`) as the primary live path, TCP bridge to embedded `pcbnew` as fallback, then the file backend when KiCad is closed (writes safe-refuse rather than clobber a live board). Requires KiCad open for live ops.
   - **Schematic read/write** → Pure Python file backend (no KiCad instance required)
   - **DRC / export** → `kicad-cli` subprocess
   - **Library search/management** → Pure Python file backend
@@ -274,15 +275,17 @@ python -m kicad_mcp_plugin
 - `get_pcb_workflow`: Return a structured 11-step PCB design workflow reference (JSON) showing the recommended tool sequence from project creation through DRC
 - `plan_project`: Record a structured project plan into a `project_plan.json` file. When `board_width_mm`/`board_height_mm` are 0 (default) and footprint IDs are included in `key_components`, auto-estimates board dimensions from courtyard bounds. Emits a `size_warning` when provided dimensions are more than 15% smaller than the estimate.
 - `read_project_plan`: Read back the saved project plan for a given project directory
-- `get_startup_checklist`: Run a six-item PASS/FAIL gate before any board operation: KiCad running · bridge reachable · bridge version · PCB editor open · kicad-cli on PATH · active project loaded. Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
+- `get_startup_checklist`: Run a seven-item PASS/FAIL gate before any board operation: KiCad running (counts pcbnew/eeschema too) · IPC API server reachable · bridge reachable · bridge version · PCB editor open (board-ready aware — distinguishes "still loading" from "no board") · kicad-cli on PATH · active project loaded. A down bridge is a non-blocking WARN whenever the IPC path already serves the open board (and vice-versa). Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
 
-### Schematic Operations (26 tools)
+### Schematic Operations (28 tools)
 - `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
 - `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
 - `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
 - `add_components`: **Bulk** — place N components in one call (single file read/write). Prefer over looping `add_component`.
 - `add_wire`: Draw wire connections between two points
 - `add_label`: Add net labels (net, global, hierarchical)
+- `remove_label`: Remove a net label by its position
+- `set_label_text`: Change the text of an existing net label
 - `add_no_connect`: Add no-connect (X) markers to unused pins
 - `add_no_connects`: **Bulk** — mark N unused pins in one call.
 - `add_power_symbol`: Add power symbols (+3V3, GND, VCC, etc.) with auto-incrementing references
@@ -295,7 +298,7 @@ python -m kicad_mcp_plugin
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
 - `move_components`: **Bulk** — reposition N components in one call (single file read/write).
 - `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
-- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol; resolves `extends` chains so symbols like ATtiny85-20S and AMS1117-3.3 work correctly
+- `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol; resolves `extends` chains so symbols like ATtiny85-20S and AMS1117-3.3 work correctly, and applies KiCad's rotation/mirror transform (audited against eeschema's own placement so rotated/mirrored symbols resolve correctly)
 - `get_pin_net`: Get the net name connected to a specific pin of a symbol
 - `get_net_connections`: Get all connections (pins, labels, wires) on a named net
 - `get_sheet_hierarchy`: Get the hierarchical sheet tree from a root schematic
@@ -304,7 +307,7 @@ python -m kicad_mcp_plugin
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (16 tools)
+### PCB Board Operations (17 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
@@ -317,6 +320,7 @@ python -m kicad_mcp_plugin
 - `get_design_rules`: Get the board's design rules (clearances, track widths, via sizes)
 - `refill_zones`: Refill all copper pour zones on a board
 - `get_stackup`: Get the layer stackup definition for a board
+- `verify_board_size`: Gate that asserts the chosen board size accommodates the placed parts plus manufacturing tolerances (panelization keepout, mounting holes, fiducials, routing channels). Returns `{passed, total_required_mm2, available_mm2, shortfall_breakdown, suggested_min_dimensions}` and is a precondition on `auto_place`.
 - `set_board_design_rules`: Write manufacturing-enforceable design rules into the `.kicad_pro` `net_settings.classes` Default entry. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
 - `auto_place`: Geometry-driven bin-packing placement. Reads the courtyard extents for every footprint, sorts by component class (connectors → ICs → discretes → transistors → LEDs → others), and packs components into rows with a guaranteed courtyard-to-courtyard gap ≥ `clearance_mm`. Returns `utilization_pct` (courtyard area / board area) and warns when >70%. Accepts an optional `anchors=[ref,...]` list — those refs are skipped so `place_at_edge`'s work survives bulk placement. Groups components by schematic sheet path (or explicit `PlacementIntent: cluster:NAME`) so circuit blocks land near each other.
 - `diff_board`: Detect changes between two PCB board snapshots. Compares component positions and track counts between two `.kicad_pcb` files. Returns `added_components`, `removed_components`, `moved_components`, and `track_delta`. Useful for confirming `autoroute` added tracks or `auto_place` moved all components.
@@ -343,9 +347,12 @@ python -m kicad_mcp_plugin
 - `import_footprint`: Copy a footprint from one .pretty directory to another
 - `register_project_library`: Register a library in a project's sym-lib-table or fp-lib-table
 
-### Design Rule Checks (10 tools)
+### Design Rule Checks (13 tools)
 - `run_drc`: Run Design Rule Check on a PCB board
 - `run_erc`: Run Electrical Rules Check on a schematic
+- `validate_symbol_footprint_pairs`: Verify every symbol's `Footprint` field resolves to a real `.kicad_mod` with matching pad numbering and count. A hard precondition on `sync_schematic_to_pcb` — blocks sync when a pad-count/numbering mismatch would produce unassigned pads.
+- `placement_quality`: Report placement-quality metrics for a board (net-aware HPWL metric, decap proximity, keep-out intrusion) without gating.
+- `validate_placement_quality`: Blocking placement-quality gate — fails on `keepout_intrusion` (a footprint courtyard inside a keep-out zone) and reports the net-aware `placement_metric`. `autoroute` refuses to run when this most-recent check is missing or failed for the current board hash.
 - `validate_schematic`: File-based electrical rules validation (no kicad-cli required)
 - `validate_schematic_cli`: Validate schematic loadability using kicad-cli's strict C++ symbol loader. Exercises symbol geometry and `extends` chain resolution that the Python API accepts but kicad-cli export may reject. Returns `{"passed": bool, "backend": "kicad-cli", "message": "..."}` or `{"status": "unavailable"}` when kicad-cli is not installed.
 - `validate_board`: File-based pre-flight checks for a PCB board (no kicad-cli required). Checks: Edge.Cuts outline present (error), duplicate reference designators (error), footprints at (0, 0) (warning), design rules block absent (warning). Returns `{"passed": bool, "violations": [...], "error_count": n, "warning_count": n}`.
@@ -355,7 +362,7 @@ python -m kicad_mcp_plugin
 - `identify_edge_facing_connectors`: Detect connectors that need outward-facing placement at a board edge (USB-C, JST PH/XH, audio jacks, barrel jacks, RJ45, HDMI, etc.). Uses three signals, highest confidence first: KiCad library's `Dwgs.User` "PCB edge" marker, F.SilkS centroid asymmetry, and footprint-name heuristics. Returns each ref's `mating_face` in footprint-local frame plus `confidence` and `evidence`. Use this as Phase 4a's survey step in `/build-pcb`.
 - `validate_connector_orientations`: Placement-quality gate for edge-facing connectors. For each ref from `identify_edge_facing_connectors`, applies the placed rotation to the mating-face vector, checks it points toward the closest board edge within ±30°, and accepts any of multiple equidistant edges within 2 mm (corner-placement tolerance). Returns `passed` bool, `violations` (with `suggested_edge` and `suggested_rotation`), and `indeterminate` (refs needing manual review). **Side effect**: writes the result to `<board>.validation_cache.json` so `autoroute` can refuse to run when this most-recent check is missing or failed for the current board hash. **Must pass before calling `autoroute`.**
 
-### Export Operations (7 tools)
+### Export Operations (8 tools)
 - `export_gerbers`: Export Gerber manufacturing files from a PCB board
 - `export_drill`: Export drill files (Excellon format)
 - `export_bom`: Export Bill of Materials (CSV, JSON, etc.)
@@ -363,6 +370,10 @@ python -m kicad_mcp_plugin
 - `export_pdf`: Export a board or schematic to PDF. Verifies kicad-cli is on PATH before attempting export and confirms the output file was actually created. On failure, surfaces the exact kicad-cli command attempted and stderr so you can diagnose the root cause.
 - `export_step`: Export a 3D STEP model from a PCB board for mechanical integration. Requires kicad-cli.
 - `export_vrml`: Export a 3D VRML model from a PCB board for 3D rendering and simulation tools. Requires kicad-cli.
+- `verify_3d_models`: Walk every footprint's `(model …)` clause, expand KiCad path variables (`${KICAD9_3DMODEL_DIR}`, etc.), and check each referenced 3D model resolves on disk (with a `.wrl`↔`.step` sibling fallback) before `export_step` fails at render time. Distinguishes `file_not_found` from `unresolved_variable`.
+
+### Manufacturing (1 tool)
+- `manufacturing_readiness_audit`: One call returns a structured ship/no-ship verdict covering DRC, board-size verification, courtyard overlaps, 3D-model resolution, and all five fab artifacts (Gerbers, drill, BOM, pick-and-place, STEP). Returns `{ready_to_ship, checks: [{name, passed, detail, artifact_path}], blocking_issues}`. `/build-pcb` Phase 7 uses this instead of running each export individually.
 
 ### Auto-Routing (6 tools) - Optional
 **Requires:** [FreeRouting](https://github.com/freerouting/freerouting) and Java
@@ -391,11 +402,11 @@ These tools index and search third-party KiCad library sources (GitHub releases,
 
 ### Plugin Entry Point Backend Routing
 
-`kicad_mcp_plugin` (the recommended entry point on Windows) uses `PluginDirectBackend` with fixed routing — no auto-detection fallbacks:
+`kicad_mcp_plugin` (the recommended entry point on Windows) uses `PluginDirectBackend` with a defined routing order — the primary live path first, then explicit fallbacks:
 
 | Operation | Backend |
 |-----------|---------|
-| Board read/write (place, move, track, via, zones, outline, DSN/SES) | Plugin bridge (TCP → `pcbnew`) |
+| Board read/write (place, move, track, via, zones, outline, DSN/SES) | KiCad IPC API (`kipy`) → plugin bridge (TCP → `pcbnew`) → file backend (KiCad closed only; writes safe-refuse rather than clobber a live board) |
 | Schematic read/write | File backend |
 | DRC / export (Gerbers, drill, BOM, PDF, STEP, VRML) | kicad-cli |
 | Library search / management | File backend |
@@ -404,7 +415,7 @@ These tools index and search third-party KiCad library sources (GitHub releases,
 
 | Operation | Subsystem | KiCad required? |
 |-----------|-----------|-----------------|
-| Board read/write | TCP bridge → pcbnew | Yes (PCB editor open) |
+| Board read/write | IPC API (`kipy`) → TCP bridge → pcbnew | Yes (PCB editor open) |
 | Schematic read/write | File backend | No |
 | DRC / ERC / export | kicad-cli | Yes (kicad-cli on PATH) |
 | Library search/manage | File backend | No |
@@ -477,7 +488,7 @@ KiCad-MCP/
 │   ├── backends/
 │   │   └── plugin_direct.py  # PluginDirectBackend — explicit routing, no fallbacks
 │   ├── config.py          # Plugin entry point config (KICAD_PLUGIN_ env prefix)
-│   ├── server.py          # MCP server — registers all 102 tools
+│   ├── server.py          # MCP server — registers all 110 tools
 │   └── __main__.py        # CLI entry point: python -m kicad_mcp_plugin
 ├── kicad_plugin/
 │   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
@@ -522,7 +533,7 @@ The skill enforces the seven-phase workflow described above (Environment & Requi
 
 ### Does KiCad-MCP require FreeRouting?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 96 tools work without FreeRouting or Java.
+**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 104 tools work without FreeRouting or Java.
 
 If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
 
@@ -567,7 +578,7 @@ Installs to:
 
 ### Known Limitations (Plugin Backend)
 
-- **Board switching**: `open_kicad` polls `get_active_project` for up to 10 s after launching pcbnew with a new board. If the board hasn't finished loading it returns `"bridge": "pending"` — call `open_kicad` again in a few seconds. If switching still fails, open the board manually in the PCB editor and retry.
+- **Board switching / startup race**: `open_kicad` waits for the board to be *ready* (polls `get_active_project` for up to 10 s), not just for the bridge port to open — while pcbnew is still loading it returns `"bridge": "pending"`, so call `open_kicad` again in a few seconds. A board op issued against a not-yet-loaded board gets a clean, recognizable `no_board` refusal (never a raw crash), and `get_startup_checklist` reports "still loading" rather than "no board" during the launch window. If switching still fails, open the board manually in the PCB editor and retry.
 - **Bridge reinstall required after source updates**: The installed bridge (`3rdparty/plugins/kicad_mcp_bridge/__init__.py`) is a snapshot. Re-run the install script and restart pcbnew after any bridge source changes.
 
 ### Subsystem Not Available

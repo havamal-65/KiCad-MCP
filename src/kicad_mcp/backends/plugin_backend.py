@@ -74,6 +74,24 @@ class StaleBoardError(RuntimeError):
         self.loaded_mtime = loaded_mtime
 
 
+class NoBoardError(RuntimeError):
+    """The bridge is reachable but no board is loaded in pcbnew yet (#20).
+
+    Emitted by the bridge as a structured ``{error_code: "no_board"}`` response
+    when ``pcbnew.GetBoard()`` is None — the editor is up (or the port is bound)
+    but the board has not finished loading, or no board is open at all.
+
+    Kept a plain ``RuntimeError`` (like ``StaleBoardError``), NOT a
+    ``BackendNotAvailableError``: the file-fallback decision is made in
+    ``_resolve_live_ops`` *before* the op call, so a ``no_board`` raised at
+    call-time never triggers file fallback regardless of base class;
+    ``PluginBoardOps._call`` only self-heals ``StaleBoardError`` and only
+    disconnects on ``BridgeTemporarilyUnavailableError``. So this propagates
+    cleanly to the tool layer, which surfaces it as an actionable
+    "wait for / open a board, then retry" refusal.
+    """
+
+
 _DEFAULT_PORT = 9760
 _DEFAULT_PING_TIMEOUT = 2.0
 _DEFAULT_OP_TIMEOUT = 10.0
@@ -126,6 +144,10 @@ def _tcp_call(method: str, timeout: float, **kwargs) -> Any:
                 response.get("message", "board on disk is newer than in-memory copy"),
                 response.get("disk_mtime"),
                 response.get("loaded_mtime"),
+            )
+        if response.get("error_code") == "no_board":
+            raise NoBoardError(
+                response.get("message", "No board is currently open in KiCad")
             )
         raise RuntimeError(f"Plugin bridge error: {response.get('message', 'unknown')}")
     return response.get("result")

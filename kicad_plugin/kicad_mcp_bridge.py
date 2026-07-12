@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.3.2-kir2s3"
+_BRIDGE_VERSION = "2.3.3-noboard"
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +125,18 @@ class _StaleBoardError(Exception):
         )
 
 
+class _NoBoardError(Exception):
+    """No board is open in pcbnew yet (#20 startup race).
+
+    Raised by _get_open_board when pcbnew.GetBoard() is None — the editor is
+    launched (or the port is bound) but the board has not finished loading, or
+    no board is open at all. The dispatcher emits a structured
+    ``{error_code: "no_board"}`` response so the client can surface a clean,
+    recognizable "board not loaded — wait/open, then retry" refusal rather than
+    an opaque error string. Mirrors the _StaleBoardError → stale_board pattern.
+    """
+
+
 def _norm_board_path(filename: str) -> str:
     return os.path.normcase(os.path.normpath(filename))
 
@@ -195,7 +207,7 @@ def _get_open_board(path: str):
     import pcbnew
     board = pcbnew.GetBoard()
     if board is None:
-        raise ValueError("No board is currently open in KiCad")
+        raise _NoBoardError("No board is currently open in KiCad")
     try:
         board_path = board.GetFileName()
     except AttributeError:
@@ -204,7 +216,7 @@ def _get_open_board(path: str):
         # propagates as a clear error.
         board = pcbnew.GetBoard()
         if board is None:
-            raise ValueError("No board is currently open in KiCad")
+            raise _NoBoardError("No board is currently open in KiCad")
         board_path = board.GetFileName()
     if os.path.normcase(os.path.normpath(board_path)) != os.path.normcase(os.path.normpath(path)):
         raise ValueError(
@@ -1457,6 +1469,14 @@ def _dispatch_request(request: dict) -> dict:
             "message": str(exc),
             "disk_mtime": exc.disk_mtime,
             "loaded_mtime": exc.loaded_mtime,
+        }
+    except _NoBoardError as exc:
+        # #20: pcbnew is reachable but no board is loaded yet. Structured so the
+        # client can distinguish "wait/open a board and retry" from a hard error.
+        return {
+            "status": "error",
+            "error_code": "no_board",
+            "message": str(exc),
         }
     except Exception as exc:
         return {"status": "error", "message": str(exc)}

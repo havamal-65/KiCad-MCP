@@ -22,6 +22,7 @@ def _run(**overrides):
       ipc_board      (str|None, default None) — board name over IPC; "" means a
                      document exists but is still loading; None means no board
       ipc_enabled    (bool, default True)  — KICAD_MCP_IPC_ENABLED state
+      recent_launch  (bool, default False) — #20/R1: server just launched pcbnew
     """
     kicad_running = overrides.get("kicad_running", True)
     bridge_pong = overrides.get("bridge_pong", True)
@@ -31,6 +32,7 @@ def _run(**overrides):
     ipc_reachable = overrides.get("ipc_reachable", False)
     ipc_board = overrides.get("ipc_board", None)
     ipc_on = overrides.get("ipc_enabled", True)
+    recent_launch = overrides.get("recent_launch", False)
 
     def fake_tcp_call(method: str, timeout: float, **kwargs):
         if bridge_error:
@@ -62,6 +64,7 @@ def _run(**overrides):
          patch("kicad_mcp.backends.plugin_backend._get_ping_timeout", return_value=2.0), \
          patch("kicad_mcp.backends.ipc_connection.IPCConnection", return_value=FakeIPCConn()), \
          patch("kicad_mcp.backends.ipc_connection.ipc_enabled", return_value=ipc_on), \
+         patch("kicad_mcp.utils.startup_state.recent_launch", return_value=recent_launch), \
          patch("kicad_mcp.backends.ipc_connection.connection_remedy",
                return_value="Enable the IPC API server."):
         from kicad_mcp.tools.project import run_startup_checklist
@@ -229,6 +232,43 @@ def test_no_board_loaded():
     statuses = {item["item"]: item["status"] for item in result["checklist"]}
     assert statuses["pcb_editor_open"] == "FAIL"
     assert statuses["project_loaded"] == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# #20/R1 — bridge-only path distinguishes "still loading" from "no board"
+# ---------------------------------------------------------------------------
+
+def test_bridge_only_recent_launch_reports_still_loading():
+    """IPC down + bridge up + empty board, but the server just launched pcbnew:
+    report 'still loading — wait' (parity with open_kicad's pending), not
+    'no board'."""
+    result = _run(ipc_reachable=False, active_board="", recent_launch=True)
+    assert result["ready_for_pcb"] is False
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert statuses["pcb_editor_open"] == "FAIL"
+    assert "still loading" in details["pcb_editor_open"]
+    assert any("Wait for the board" in action for action in result["required_actions"])
+
+
+def test_bridge_only_no_recent_launch_reports_no_board():
+    """Same path but no recent launch: keep the existing 'no board' wording +
+    open-a-board action (the documented R1 limitation)."""
+    result = _run(ipc_reachable=False, active_board="", recent_launch=False)
+    assert result["ready_for_pcb"] is False
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert "No board loaded" in details["pcb_editor_open"]
+    assert any("Open a .kicad_pcb" in action for action in result["required_actions"])
+
+
+def test_recent_launch_does_not_override_a_ready_board():
+    """A recent launch must not mask a genuinely-loaded board."""
+    result = _run(ipc_reachable=False, active_board="/board.kicad_pcb",
+                  recent_launch=True)
+    statuses = {item["item"]: item["status"] for item in result["checklist"]}
+    details = {item["item"]: item["detail"] for item in result["checklist"]}
+    assert statuses["pcb_editor_open"] == "PASS"
+    assert "still loading" not in details["pcb_editor_open"]
 
 
 # ---------------------------------------------------------------------------

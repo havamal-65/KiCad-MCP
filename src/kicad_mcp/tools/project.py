@@ -30,6 +30,7 @@ def run_startup_checklist() -> dict[str, Any]:
     already serves the open board, and vice versa.
     """
     from kicad_mcp.utils.platform_helper import find_kicad_cli, is_kicad_running
+    from kicad_mcp.utils.startup_state import recent_launch
 
     checklist: list[dict[str, Any]] = []
     required_actions: list[str] = []
@@ -173,9 +174,17 @@ def run_startup_checklist() -> dict[str, Any]:
         except Exception as exc:
             board_path_str = f"(error: {exc})"
 
+    # #20/R1: on a bridge-only path the bridge can't tell "loading" from
+    # "no board" (both report board_path empty). If the MCP server itself just
+    # launched pcbnew, treat an empty board as still-loading during the launch
+    # window — matching open_kicad's own "pending" and the IPC still-loading
+    # branch. Only covers server-initiated launches (see startup_state).
+    bridge_only_loading = (
+        not ipc_still_loading and bridge_ok and not pcb_editor_ok and recent_launch()
+    )
     if pcb_editor_ok:
         pcb_editor_detail = f"PCB editor open with: {board_path_str}"
-    elif ipc_still_loading:
+    elif ipc_still_loading or bridge_only_loading:
         # REQ-GATE-3: distinguish still-loading from no-board so callers wait
         # instead of hitting partial-state errors.
         pcb_editor_detail = "Board is still loading — wait and re-run the checklist."
@@ -189,7 +198,7 @@ def run_startup_checklist() -> dict[str, Any]:
         "detail": pcb_editor_detail,
     })
     if (ipc_reachable or bridge_ok) and not pcb_editor_ok:
-        if ipc_still_loading:
+        if ipc_still_loading or bridge_only_loading:
             required_actions.append(
                 "Wait for the board to finish loading, then re-run get_startup_checklist."
             )

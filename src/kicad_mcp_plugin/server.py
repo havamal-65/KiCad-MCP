@@ -26,6 +26,7 @@ from kicad_mcp.tools import (
     schematic,
 )
 from kicad_mcp.utils.change_log import ChangeLog
+from kicad_mcp.utils.startup_state import note_launch
 from kicad_mcp.utils.platform_helper import (
     cleanup_stale_session_files,
     is_kicad_running,
@@ -306,6 +307,10 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
                     "status": "error",
                     "error": "Failed to launch pcbnew. Verify KiCad is installed.",
                 }, indent=2)
+
+            # #20/R1: start the load window so a bridge-only get_startup_checklist
+            # can report "board still loading" (not "no board") while pcbnew opens.
+            note_launch()
 
             def _launch_response(bridge: str, message: str) -> str:
                 payload: dict = {"status": "success", "bridge": bridge, "message": message}

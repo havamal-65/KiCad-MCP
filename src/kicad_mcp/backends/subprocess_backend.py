@@ -46,6 +46,33 @@ def _get_pcbnew():
         return None
 
 
+_pcbnew_probe_cache: dict[str, bool] = {}
+
+
+def _python_can_import_pcbnew(interpreter: Path) -> bool:
+    """True if *interpreter* can ``import pcbnew`` (result cached per path).
+
+    Used to validate a *generic* system Python before treating it as a
+    pcbnew-capable interpreter: some Linux distros install pcbnew into the
+    system python, but a bare runner (e.g. headless CI) has ``/usr/bin/python3``
+    WITHOUT pcbnew. Probing avoids returning an interpreter that would only
+    ``ModuleNotFoundError`` at run time.
+    """
+    key = str(interpreter)
+    cached = _pcbnew_probe_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        ok = subprocess.run(
+            [str(interpreter), "-c", "import pcbnew"],
+            capture_output=True, timeout=15,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    _pcbnew_probe_cache[key] = ok
+    return ok
+
+
 def _get_kicad_python() -> Path | None:
     """Return the path to KiCad's bundled Python interpreter, or None if not found."""
     from kicad_mcp.utils.platform_helper import get_platform
@@ -71,9 +98,14 @@ def _get_kicad_python() -> Path | None:
             if snap_python.exists():
                 return snap_python
 
+        # Generic system pythons are only valid if pcbnew is ACTUALLY importable
+        # there (unlike the KiCad-bundled interpreters above, which have it by
+        # definition). A bare runner has /usr/bin/python3 without pcbnew — return
+        # None in that case so callers skip/degrade cleanly instead of hitting a
+        # ModuleNotFoundError inside the subprocess.
         for candidate_path in ["/usr/bin/python3", "/usr/local/bin/python3"]:
             candidate = Path(candidate_path)
-            if candidate.exists():
+            if candidate.exists() and _python_can_import_pcbnew(candidate):
                 return candidate
 
     return None

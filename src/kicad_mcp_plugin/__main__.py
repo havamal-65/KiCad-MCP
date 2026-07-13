@@ -76,6 +76,9 @@ def main() -> None:
     from kicad_mcp_plugin.server import create_plugin_server
     mcp = create_plugin_server(config)
 
+    from kicad_mcp.utils.health_ui import maybe_launch_health_ui
+    maybe_launch_health_ui()  # env-gated; no-op unless KICAD_MCP_HEALTH_UI set
+
     if config.transport == TransportType.STREAMABLE_HTTP:
         # Served at http://<host>:<port>/mcp — point a dev .mcp.json at that URL.
         mcp.run(

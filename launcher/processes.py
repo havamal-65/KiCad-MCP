@@ -130,11 +130,6 @@ def start_mcp_http(cfg: LauncherConfig) -> Result:
         return Result("mcp", "already_up", "MCP server already running")
     if state == "foreign":
         return Result("mcp", "failed", "port in use by a foreign process")
-    import os
-
-    env = dict(os.environ)
-    # The health UI runs with the MCP server the launcher owns (M1 wire / AC7).
-    env.setdefault("KICAD_MCP_HEALTH_UI", "1")
     try:
         subprocess.Popen(
             [
@@ -149,7 +144,6 @@ def start_mcp_http(cfg: LauncherConfig) -> Result:
                 str(cfg.mcp_port),
             ],
             cwd=str(REPO_ROOT),
-            env=env,
             creationflags=_detached_flags(),
         )
         return Result("mcp", "started", f"http://{cfg.mcp_host}:{cfg.mcp_port}/mcp")

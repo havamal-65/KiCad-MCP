@@ -29,8 +29,6 @@ import launcher.config
 import launcher.recents
 import launcher.orchestrator
 import launcher.processes
-import launcher.status
-import kicad_mcp.utils.health_ui
 
 assert "tkinter" not in sys.modules, "a core module imported tkinter at load"
 print("IMPORT_SAFE_OK")
@@ -60,7 +58,6 @@ def test_gui_modules_are_the_only_tkinter_importers():
         "launcher.recents",
         "launcher.orchestrator",
         "launcher.processes",
-        "launcher.status",
     ):
         mod = importlib.import_module(name)
         assert mod is not None

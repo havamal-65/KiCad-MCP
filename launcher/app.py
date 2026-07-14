@@ -1,20 +1,21 @@
-"""Tkinter launcher window (GUI-only — imports tkinter).
+"""Unified launcher window (GUI-only — imports tkinter).
 
-The one window that brings up the stack. Live status comes from a daemon poller
-thread that reads `launcher.processes` (KiCad/MCP — what the launcher controls)
-and `launcher.status.get_status()` (board, reusing the health monitor). Actions
-run off the Tk thread; results and status snapshots are marshalled back to the
-UI through a queue and applied on a `root.after` tick.
+ONE window that is both the control surface and the live health panel. It does
+not reinvent the health display: it loads the existing
+`scripts/mcp_health_monitor.py` and reuses its `Poller` + `MonitorApp` to render
+the full rich status (bridge / MCP server / board / checklist / backends /
+activity / errors / overall), then injects the launcher controls (project
+picker + Start-everything / Restart-MCP / Stop-MCP) above it in the same root.
+The monitor file is never edited (AR1); its widgets and poller are reused as-is.
 
-Nothing this window starts is torn down when the window closes (REQ-WIN-004):
-the poller is a daemon thread and launched processes are detached.
+Nothing this window starts is torn down when it closes (REQ-WIN-004): launched
+processes are detached; only the poller (which owns no external process) stops.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import queue
-import subprocess
-import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -23,16 +24,21 @@ from typing import Any
 
 from launcher.config import LauncherConfig
 from launcher import processes, recents
-from launcher import status as status_mod
 from launcher.orchestrator import classify_failures, plan_bringup
 
-POLL_INTERVAL_S = 2.5
+_MONITOR_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mcp_health_monitor.py"
+
 UI_TICK_MS = 250
 
-_GREEN = "#2ecc71"
-_RED = "#e74c3c"
-_GREY = "#888888"
-_AMBER = "#f39c12"
+
+def _load_monitor() -> Any:
+    """Import the health monitor module by file path (GUI layer only)."""
+    spec = importlib.util.spec_from_file_location("kicad_mcp_health_monitor", _MONITOR_PATH)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load health monitor at {_MONITOR_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class LauncherApp:
@@ -40,74 +46,81 @@ class LauncherApp:
         self.root = root
         self.cfg = cfg
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self._stop = threading.Event()
         self._selected_board: Path | None = None
         self._picker_items: list[recents.PickerItem] = []
 
-        root.title("KiCad-MCP Launcher")
-        root.minsize(420, 300)
+        # Reuse the monitor: its theme constants, its poller, and its rich UI.
+        self._m = _load_monitor()
+        self._poller = self._m.Poller()
+        self._poller.start()
 
-        self._build_ui()
+        # 1) launcher controls at the top (packed first -> above the health panel)
+        self._build_controls()
         self._refresh_picker()
-        self._start_poller()
-        self.root.after(UI_TICK_MS, self._ui_tick)
+
+        # 2) the full health panel below, rendered by the monitor's own MonitorApp
+        self._monitor_app = self._m.MonitorApp(root, self._poller)
+
+        # MonitorApp set its own title/geometry; make the combined window ours.
+        root.title("KiCad-MCP Launcher")
+        root.geometry("600x1000")
+        root.minsize(520, 820)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(UI_TICK_MS, self._ui_tick)
 
-    # --- UI construction ---------------------------------------------------
+    # --- controls ----------------------------------------------------------
 
-    def _build_ui(self) -> None:
-        frm = ttk.Frame(self.root)
-        frm.pack(fill="both", expand=True, padx=8, pady=8)
+    def _c(self, name: str, default: str) -> str:
+        """Monitor theme color by attribute name, with a fallback."""
+        return str(getattr(self._m, name, default))
 
-        ttk.Label(frm, text="KiCad-MCP Launcher", font=("Segoe UI", 13, "bold")).pack(
-            anchor="w"
+    def _build_controls(self) -> None:
+        bg = self._c("BG", "#0b0f18")
+        card = self._c("CARD", "#141b29")
+        fg = self._c("FG", "#e6edf3")
+        muted = self._c("MUTED", "#8b98a9")
+
+        bar = tk.Frame(self.root, bg=bg)
+        bar.pack(fill="x", side="top", padx=14, pady=(12, 0))
+        tk.Label(
+            bar, text="KiCad-MCP Launcher", bg=bg, fg=fg,
+            font=("Segoe UI Semibold", 14),
+        ).pack(side="left")
+
+        picker = tk.Frame(self.root, bg=bg)
+        picker.pack(fill="x", side="top", padx=14, pady=(8, 4))
+        tk.Label(picker, text="Project:", bg=bg, fg=muted, font=("Segoe UI", 9)).pack(
+            side="left"
         )
-
-        rows = ttk.Frame(frm)
-        rows.pack(fill="x", padx=10, pady=4)
-        self._dots: dict[str, tk.Label] = {}
-        self._texts: dict[str, ttk.Label] = {}
-        for key, label in (("kicad", "KiCad"), ("mcp", "MCP server"), ("board", "Board")):
-            r = ttk.Frame(rows)
-            r.pack(fill="x")
-            ttk.Label(r, text=f"{label}", width=12).pack(side="left")
-            dot = tk.Label(r, text="●", fg=_GREY)
-            dot.pack(side="left")
-            txt = ttk.Label(r, text="checking…")
-            txt.pack(side="left", padx=6)
-            self._dots[key] = dot
-            self._texts[key] = txt
-
-        picker = ttk.Frame(frm)
-        picker.pack(fill="x", padx=10, pady=4)
-        ttk.Label(picker, text="Project:").pack(side="left")
         self._picker_var = tk.StringVar()
         self._combo = ttk.Combobox(
             picker, textvariable=self._picker_var, state="readonly"
         )
-        self._combo.pack(side="left", fill="x", expand=True, padx=6)
+        self._combo.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self._combo.bind("<<ComboboxSelected>>", self._on_pick)
 
-        btns = ttk.Frame(frm)
-        btns.pack(fill="x", padx=10, pady=4)
-        ttk.Button(btns, text="Start everything", command=self._on_start_everything).pack(
-            side="left"
-        )
-        ttk.Button(btns, text="Restart MCP", command=self._on_restart_mcp).pack(
-            side="left", padx=4
-        )
-        ttk.Button(btns, text="Stop MCP", command=self._on_stop_mcp).pack(side="left")
-        ttk.Button(btns, text="Health monitor", command=self._on_open_monitor).pack(
-            side="left", padx=4
-        )
+        btns = tk.Frame(self.root, bg=bg)
+        btns.pack(fill="x", side="top", padx=14, pady=(0, 4))
 
-        self._ontop_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm, text="Always on top", variable=self._ontop_var, command=self._on_ontop
-        ).pack(anchor="w", padx=10, pady=4)
+        def _btn(text: str, cmd: Any, accent: str | None = None) -> tk.Button:
+            b = tk.Button(
+                btns, text=text, command=cmd, bg=accent or card, fg=fg, bd=0,
+                font=("Segoe UI", 9), activebackground="#26324a", activeforeground=fg,
+                padx=10, pady=3,
+            )
+            b.pack(side="left", padx=(0, 8))
+            return b
 
-        self._log = tk.Text(frm, height=7, width=52, state="disabled", wrap="word")
-        self._log.pack(fill="both", expand=True, padx=10, pady=4)
+        _btn("Start everything", self._on_start_everything, self._c("GREEN", "#2ecc71"))
+        _btn("Restart MCP", self._on_restart_mcp)
+        _btn("Stop MCP", self._on_stop_mcp)
+
+        self._action_log = tk.Text(
+            self.root, height=4, bg=card, fg=fg, bd=0, font=("Consolas", 9),
+            highlightthickness=0, wrap="word",
+        )
+        self._action_log.pack(fill="x", side="top", padx=14, pady=(2, 6))
+        self._action_log.configure(state="disabled")
 
     # --- picker ------------------------------------------------------------
 
@@ -165,6 +178,11 @@ class LauncherApp:
         if board is not None:
             recents.promote(self.cfg, board)
             self._events.put(("refresh_picker", None))
+        # Nudge the health panel to re-poll now that things changed.
+        try:
+            self._poller.refresh_now()
+        except Exception:
+            pass
 
     def _on_restart_mcp(self) -> None:
         self._run_async(self._simple_action, "restart")
@@ -180,100 +198,34 @@ class LauncherApp:
             r = processes.stop_mcp_http(self.cfg)
         reason = f" — {r.reason}" if r.reason else ""
         self._log_line(f"{r.piece}: {r.action}{reason}")
-
-    def _on_open_monitor(self) -> None:
-        script = self.cfg.venv_pythonw
-        monitor = Path(__file__).resolve().parents[1] / "scripts" / "mcp_health_monitor.py"
-        flags = 0
-        if sys.platform == "win32":
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-                subprocess, "DETACHED_PROCESS", 0
-            )
         try:
-            subprocess.Popen([str(script), str(monitor)], creationflags=flags)
-            self._log_line("Opened health monitor.")
-        except Exception as exc:
-            self._log_line(f"Could not open health monitor: {exc}")
-
-    def _on_ontop(self) -> None:
-        self.root.attributes("-topmost", bool(self._ontop_var.get()))
-
-    # --- poller + UI tick --------------------------------------------------
-
-    def _start_poller(self) -> None:
-        threading.Thread(target=self._poller, daemon=True).start()
-
-    def _poller(self) -> None:
-        while not self._stop.is_set():
-            try:
-                snap = self._collect_snapshot()
-                self._events.put(("status", snap))
-            except Exception as exc:
-                self._events.put(("status_error", str(exc)))
-            self._stop.wait(POLL_INTERVAL_S)
-
-    def _collect_snapshot(self) -> dict[str, Any]:
-        kicad = processes.pcbnew_running()
-        mcp = processes.mcp_http_running(self.cfg)
-        board_name: str | None = None
-        board_ok = False
-        try:
-            raw = status_mod.get_status()
-            b = raw.get("board") or {}
-            board_name = b.get("open_board")
-            board_ok = bool(board_name) and b.get("status") != "none"
+            self._poller.refresh_now()
         except Exception:
             pass
-        return {"kicad": kicad, "mcp": mcp, "board_name": board_name, "board_ok": board_ok}
+
+    # --- UI tick (drains the action-log queue) -----------------------------
 
     def _ui_tick(self) -> None:
         try:
             while True:
                 kind, payload = self._events.get_nowait()
-                if kind == "status":
-                    self._apply_status(payload)
-                elif kind == "log":
+                if kind == "log":
                     self._append_log(payload)
                 elif kind == "refresh_picker":
                     self._refresh_picker()
-                elif kind == "status_error":
-                    self._append_log(f"status error: {payload}")
         except queue.Empty:
             pass
         self.root.after(UI_TICK_MS, self._ui_tick)
 
-    def _apply_status(self, snap: dict[str, Any]) -> None:
-        # KiCad
-        if snap["kicad"]:
-            self._set_row("kicad", _GREEN, "running")
-        else:
-            self._set_row("kicad", _RED, "not running")
-        # MCP
-        mcp = snap["mcp"]
-        if mcp == "ours":
-            self._set_row("mcp", _GREEN, "running")
-        elif mcp == "foreign":
-            self._set_row("mcp", _AMBER, "port in use (foreign)")
-        else:
-            self._set_row("mcp", _RED, "stopped")
-        # Board
-        if snap["board_ok"]:
-            self._set_row("board", _GREEN, snap["board_name"] or "loaded")
-        elif snap["board_name"]:
-            self._set_row("board", _AMBER, f"{snap['board_name']} (impaired)")
-        else:
-            self._set_row("board", _GREY, "(none)")
-
-    def _set_row(self, key: str, color: str, text: str) -> None:
-        self._dots[key].configure(fg=color)
-        self._texts[key].configure(text=text)
-
     def _append_log(self, text: str) -> None:
-        self._log.configure(state="normal")
-        self._log.insert("end", text + "\n")
-        self._log.see("end")
-        self._log.configure(state="disabled")
+        self._action_log.configure(state="normal")
+        self._action_log.insert("end", text + "\n")
+        self._action_log.see("end")
+        self._action_log.configure(state="disabled")
 
     def _on_close(self) -> None:
-        self._stop.set()
+        try:
+            self._poller.stop()
+        except Exception:
+            pass
         self.root.destroy()

@@ -45,6 +45,8 @@ dev = [
 launcher = [
     "pywebview>=5.0",
     "psutil>=5.9",       # process/liveness checks (also used by the health monitor)
+    "pystray>=0.19",     # status tray icon + bridge drop/recover notifications
+    "pillow>=10.0",      # tray icon rendering (pystray dependency in practice)
 ]
 
 [project.scripts]

@@ -55,7 +55,35 @@ def claude_cli_available() -> bool:
     return shutil.which("claude") is not None
 
 
-def _iter_server_pids() -> list[int]:
+def _cmdline_port(cmdline: list[str]) -> int | None:
+    """The --port value in a server cmdline, or None if not specified."""
+    for i, part in enumerate(cmdline):
+        s = str(part)
+        if s == "--port" and i + 1 < len(cmdline):
+            try:
+                return int(cmdline[i + 1])
+            except (TypeError, ValueError):
+                return None
+        if s.startswith("--port="):
+            try:
+                return int(s.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _matches_server(cmdline: list[str], port: int) -> bool:
+    """True if a cmdline is a kicad MCP HTTP server bound to `port`.
+
+    Port-aware: a server on a different port is NOT ours for this config
+    (an unspecified --port means the 8765 default)."""
+    joined = " ".join(str(p) for p in cmdline)
+    if _SERVER_MODULE_MARKER not in joined or _SERVER_HTTP_MARKER not in joined:
+        return False
+    return (_cmdline_port([str(p) for p in cmdline]) or 8765) == port
+
+
+def _iter_server_pids(cfg: LauncherConfig) -> list[int]:
     try:
         import psutil
     except Exception:
@@ -63,8 +91,7 @@ def _iter_server_pids() -> list[int]:
     pids: list[int] = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmd = " ".join(str(p) for p in (proc.info.get("cmdline") or []))
-            if _SERVER_MODULE_MARKER in cmd and _SERVER_HTTP_MARKER in cmd:
+            if _matches_server(proc.info.get("cmdline") or [], cfg.mcp_port):
                 pids.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -84,7 +111,7 @@ def _port_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
 def mcp_http_running(cfg: LauncherConfig) -> McpState:
     """Classify the MCP HTTP server: our own process, a foreign listener on the
     port, or down."""
-    if _iter_server_pids():
+    if _iter_server_pids(cfg):
         return "ours"
     if _port_reachable(cfg.mcp_host, cfg.mcp_port):
         return "foreign"
@@ -152,7 +179,7 @@ def start_mcp_http(cfg: LauncherConfig) -> Result:
 
 
 def stop_mcp_http(cfg: LauncherConfig) -> Result:
-    pids = _iter_server_pids()
+    pids = _iter_server_pids(cfg)
     if not pids:
         return Result("mcp", "stopped", "no launcher-owned MCP server running")
     try:
@@ -182,6 +209,122 @@ def restart_mcp_http(cfg: LauncherConfig) -> Result:
             break
         time.sleep(0.25)
     return start_mcp_http(cfg)
+
+
+def _pcbnew_pids() -> list[int]:
+    try:
+        import psutil
+    except Exception:
+        return []
+    pids: list[int] = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if (proc.info.get("name") or "").lower() == "pcbnew.exe":
+                pids.append(proc.info["pid"])
+        except Exception:
+            continue
+    return pids
+
+
+def stop_pcbnew() -> Result:
+    """Close pcbnew (only pcbnew.exe by name — never other KiCad windows)."""
+    pids = _pcbnew_pids()
+    if not pids:
+        return Result("kicad", "already_up", "pcbnew not running")
+    try:
+        import psutil
+    except Exception:
+        return Result("kicad", "failed", "psutil unavailable")
+    stopped = 0
+    for pid in pids:
+        try:
+            psutil.Process(pid).terminate()
+            stopped += 1
+        except Exception:
+            continue
+    return Result("kicad", "stopped", f"closed {stopped} pcbnew process(es)")
+
+
+def stop_everything(cfg: LauncherConfig) -> list[Result]:
+    """Mirror of Start everything: stop the launcher-owned MCP + close pcbnew.
+    Never touches processes it can't attribute to the stack."""
+    return [stop_mcp_http(cfg), stop_pcbnew()]
+
+
+def identify_port_owner(cfg: LauncherConfig) -> dict[str, Any] | None:
+    """Best-effort: which process is LISTENing on the MCP port? None if unknown
+    (psutil absent, access denied, or nothing found)."""
+    try:
+        import psutil
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == cfg.mcp_port
+                and conn.pid
+            ):
+                try:
+                    name = psutil.Process(conn.pid).name()
+                except Exception:
+                    name = "?"
+                return {"pid": conn.pid, "name": name}
+    except Exception:
+        pass
+    return None
+
+
+def stop_foreign_server(cfg: LauncherConfig) -> Result:
+    """Stop the identified foreign holder of the MCP port — only that PID."""
+    owner = identify_port_owner(cfg)
+    if owner is None:
+        return Result("mcp", "failed", "could not identify the port owner")
+    try:
+        import psutil
+
+        psutil.Process(owner["pid"]).terminate()
+        return Result("mcp", "stopped", f"terminated {owner['name']} (pid {owner['pid']})")
+    except Exception as exc:
+        return Result("mcp", "failed", f"{type(exc).__name__}: {exc}")
+
+
+def reveal_in_explorer(board: Path) -> Result:
+    """Open the board's folder in the OS file manager, with the file selected."""
+    board = Path(board)
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(board)])
+        else:
+            subprocess.Popen(["xdg-open", str(board.parent)])
+        return Result("explorer", "started", str(board.parent))
+    except Exception as exc:
+        return Result("explorer", "failed", f"{type(exc).__name__}: {exc}")
+
+
+def reinstall_bridge() -> Result:
+    """Run the vetted bridge installer (never reimplemented). Blocking — call
+    off the UI thread. User must restart the PCB editor afterwards."""
+    script = REPO_ROOT / "kicad_plugin" / "install_bridge.ps1"
+    if not script.exists():
+        return Result("bridge", "failed", f"{script.name} not found")
+    try:
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            creationflags=_detached_flags(),
+        )
+        if proc.returncode == 0:
+            return Result("bridge", "started", "bridge reinstalled — restart the PCB editor")
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return Result("bridge", "failed", tail[-1] if tail else f"exit {proc.returncode}")
+    except FileNotFoundError:
+        return Result("bridge", "failed", "pwsh not found on PATH")
+    except subprocess.TimeoutExpired:
+        return Result("bridge", "failed", "installer timed out (120s)")
+    except Exception as exc:
+        return Result("bridge", "failed", f"{type(exc).__name__}: {exc}")
 
 
 def launch_claude(cfg: LauncherConfig, project_dir: Path) -> Result:

@@ -40,6 +40,12 @@ dev = [
     "mypy>=1.0",
     "watchfiles>=0.21",  # dev hot-reload server (scripts/dev_server.*)
 ]
+# Standalone desktop launcher (launcher/ package, run from source). Not part of
+# the MCP server install. On Windows the webview uses the system WebView2 runtime.
+launcher = [
+    "pywebview>=5.0",
+    "psutil>=5.9",       # process/liveness checks (also used by the health monitor)
+]
 
 [project.scripts]
 kicad-mcp-plugin = "kicad_mcp_plugin.__main__:main"

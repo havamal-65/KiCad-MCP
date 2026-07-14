@@ -1,38 +1,35 @@
-"""Unified launcher window (GUI-only — imports tkinter).
+"""Webview launcher window (GUI layer — imports pywebview).
 
-ONE window that is both the control surface and the live health panel. It does
-not reinvent the health display: it loads the existing
-`scripts/mcp_health_monitor.py` and reuses its `Poller` + `MonitorApp` to render
-the full rich status (bridge / MCP server / board / checklist / backends /
-activity / errors / overall), then injects the launcher controls (project
-picker + Start-everything / Restart-MCP / Stop-MCP) above it in the same root.
-The monitor file is never edited (AR1); its widgets and poller are reused as-is.
+Renders the design's real HTML/CSS (launcher/ui/index.html) in a WebView2
+window and exposes a Python `LauncherApi` to it. Live status comes from the
+health monitor's own `Poller` (reused, not reinvented), reshaped by
+`launcher.dashboard.build_state` into the UI's state; actions run through
+`launcher.processes` / `launcher.orchestrator`. No mock data — the JS renders
+whatever real state Python hands it.
 
-Nothing this window starts is torn down when it closes (REQ-WIN-004): launched
-processes are detached; only the poller (which owns no external process) stops.
+Only this module imports pywebview; the core (`config`/`recents`/`orchestrator`/
+`processes`/`dashboard`) stays import-safe and GUI-free.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import queue
 import threading
-import tkinter as tk
+import time
 from pathlib import Path
-from tkinter import ttk
 from typing import Any
 
-from launcher.config import LauncherConfig
-from launcher import processes, recents
+import webview
+
+from launcher import dashboard, processes, recents
+from launcher.config import LauncherConfig, load_config
 from launcher.orchestrator import classify_failures, plan_bringup
 
+_UI_HTML = Path(__file__).resolve().parent / "ui" / "index.html"
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mcp_health_monitor.py"
-
-UI_TICK_MS = 250
 
 
 def _load_monitor() -> Any:
-    """Import the health monitor module by file path (GUI layer only)."""
     spec = importlib.util.spec_from_file_location("kicad_mcp_health_monitor", _MONITOR_PATH)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise ImportError(f"cannot load health monitor at {_MONITOR_PATH}")
@@ -41,191 +38,120 @@ def _load_monitor() -> Any:
     return mod
 
 
-class LauncherApp:
-    def __init__(self, root: tk.Tk, cfg: LauncherConfig) -> None:
-        self.root = root
-        self.cfg = cfg
-        self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self._selected_board: Path | None = None
-        self._picker_items: list[recents.PickerItem] = []
+def _fmt(result: processes.Result) -> str:
+    return f"{result.piece}: {result.action}" + (f" — {result.reason}" if result.reason else "")
 
-        # Reuse the monitor: its theme constants, its poller, and its rich UI.
+
+class LauncherApi:
+    """Bridged to the webview as `window.pywebview.api`."""
+
+    def __init__(self, cfg: LauncherConfig) -> None:
+        self.cfg = cfg
+        self._projects = recents.list_for_picker(cfg)
+        self._selected = 0
+        self._busy_phase: str | None = None
+        self._busy_until = 0.0
         self._m = _load_monitor()
         self._poller = self._m.Poller()
         self._poller.start()
 
-        # 1) launcher controls at the top (packed first -> above the health panel)
-        self._build_controls()
-        self._refresh_picker()
+    # --- helpers ---
+    def _busy(self) -> str | None:
+        if self._busy_phase and time.time() < self._busy_until:
+            return self._busy_phase
+        self._busy_phase = None
+        return None
 
-        # 2) the full health panel below, rendered by the monitor's own MonitorApp
-        self._monitor_app = self._m.MonitorApp(root, self._poller)
+    def _current_board(self) -> Path | None:
+        if 0 <= self._selected < len(self._projects):
+            return self._projects[self._selected].path
+        return None
 
-        # MonitorApp set its own title/geometry; make the combined window ours.
-        root.title("KiCad-MCP Launcher")
-        root.geometry("600x1000")
-        root.minsize(520, 820)
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(UI_TICK_MS, self._ui_tick)
+    # --- exposed to JS ---
+    def get_state(self) -> dict[str, Any]:
+        snap = self._poller.state  # {} until first poll
+        return dashboard.build_state(snap, self._projects, self._selected, self._busy())
 
-    # --- controls ----------------------------------------------------------
+    def select_project(self, index: Any) -> dict[str, Any]:
+        try:
+            self._selected = int(index)
+        except (TypeError, ValueError):
+            pass
+        self._poller.refresh_now()
+        return {"ok": True}
 
-    def _c(self, name: str, default: str) -> str:
-        """Monitor theme color by attribute name, with a fallback."""
-        return str(getattr(self._m, name, default))
-
-    def _build_controls(self) -> None:
-        bg = self._c("BG", "#0b0f18")
-        card = self._c("CARD", "#141b29")
-        fg = self._c("FG", "#e6edf3")
-        muted = self._c("MUTED", "#8b98a9")
-
-        bar = tk.Frame(self.root, bg=bg)
-        bar.pack(fill="x", side="top", padx=14, pady=(12, 0))
-        tk.Label(
-            bar, text="KiCad-MCP Launcher", bg=bg, fg=fg,
-            font=("Segoe UI Semibold", 14),
-        ).pack(side="left")
-
-        picker = tk.Frame(self.root, bg=bg)
-        picker.pack(fill="x", side="top", padx=14, pady=(8, 4))
-        tk.Label(picker, text="Project:", bg=bg, fg=muted, font=("Segoe UI", 9)).pack(
-            side="left"
-        )
-        self._picker_var = tk.StringVar()
-        self._combo = ttk.Combobox(
-            picker, textvariable=self._picker_var, state="readonly"
-        )
-        self._combo.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self._combo.bind("<<ComboboxSelected>>", self._on_pick)
-
-        btns = tk.Frame(self.root, bg=bg)
-        btns.pack(fill="x", side="top", padx=14, pady=(0, 4))
-
-        def _btn(text: str, cmd: Any, accent: str | None = None) -> tk.Button:
-            b = tk.Button(
-                btns, text=text, command=cmd, bg=accent or card, fg=fg, bd=0,
-                font=("Segoe UI", 9), activebackground="#26324a", activeforeground=fg,
-                padx=10, pady=3,
-            )
-            b.pack(side="left", padx=(0, 8))
-            return b
-
-        _btn("Start everything", self._on_start_everything, self._c("GREEN", "#2ecc71"))
-        _btn("Restart MCP", self._on_restart_mcp)
-        _btn("Stop MCP", self._on_stop_mcp)
-
-        self._action_log = tk.Text(
-            self.root, height=4, bg=card, fg=fg, bd=0, font=("Consolas", 9),
-            highlightthickness=0, wrap="word",
-        )
-        self._action_log.pack(fill="x", side="top", padx=14, pady=(2, 6))
-        self._action_log.configure(state="disabled")
-
-    # --- picker ------------------------------------------------------------
-
-    def _refresh_picker(self) -> None:
-        self._picker_items = recents.list_for_picker(self.cfg)
-        labels = [f"{it.name}  ({it.path})" for it in self._picker_items]
-        self._combo["values"] = labels
-        if self._picker_items and self._selected_board is None:
-            self._combo.current(0)
-            self._selected_board = self._picker_items[0].path
-
-    def _on_pick(self, _evt: Any = None) -> None:
-        idx = self._combo.current()
-        if 0 <= idx < len(self._picker_items):
-            self._selected_board = self._picker_items[idx].path
-
-    # --- actions (run off the Tk thread) -----------------------------------
-
-    def _run_async(self, target: Any, *args: Any) -> None:
-        threading.Thread(target=target, args=args, daemon=True).start()
-
-    def _log_line(self, text: str) -> None:
-        self._events.put(("log", text))
-
-    def _on_start_everything(self) -> None:
-        self._run_async(self._start_everything_worker, self._selected_board)
-
-    def _start_everything_worker(self, board: Path | None) -> None:
-        signals = processes.collect_signals(self.cfg, board)
-        diags = classify_failures(signals)
+    def start_everything(self) -> dict[str, Any]:
+        board = self._current_board()
+        diags = classify_failures(processes.collect_signals(self.cfg, board))
         blocking = [d for d in diags if d.blocking]
         if blocking:
-            for d in blocking:
-                self._log_line(f"✗ {d.message}")
-            return
-        for d in diags:
-            self._log_line(f"⚠ {d.message}")
+            return {"ok": False, "messages": [d.message for d in blocking]}
+        self._busy_phase = "starting"
+        self._busy_until = time.time() + 14
+        warnings = [d.message for d in diags if not d.blocking]
+        threading.Thread(target=self._do_start, args=(board,), daemon=True).start()
+        return {"ok": True, "messages": warnings + ["starting…"]}
 
-        steps = plan_bringup(processes.collect_status(self.cfg), board)
-        for step in steps:
-            if step.action != "start":
-                self._log_line(f"{step.piece}: skip — {step.reason}")
-                continue
-            if step.piece == "kicad" and board is not None:
-                r = processes.launch_pcbnew(board)
-            elif step.piece == "mcp":
-                r = processes.start_mcp_http(self.cfg)
-            elif step.piece == "claude" and board is not None:
-                r = processes.launch_claude(self.cfg, board.parent)
-            else:
-                continue
-            reason = f" — {r.reason}" if r.reason else ""
-            self._log_line(f"{r.piece}: {r.action}{reason}")
-
-        if board is not None:
-            recents.promote(self.cfg, board)
-            self._events.put(("refresh_picker", None))
-        # Nudge the health panel to re-poll now that things changed.
+    def _do_start(self, board: Path | None) -> None:
         try:
+            for step in plan_bringup(processes.collect_status(self.cfg), board):
+                if step.action != "start":
+                    continue
+                if step.piece == "kicad" and board is not None:
+                    processes.launch_pcbnew(board)
+                elif step.piece == "mcp":
+                    processes.start_mcp_http(self.cfg)
+                elif step.piece == "claude" and board is not None:
+                    processes.launch_claude(self.cfg, board.parent)
+            if board is not None:
+                recents.promote(self.cfg, board)
+                self._projects = recents.list_for_picker(self.cfg)
+        finally:
             self._poller.refresh_now()
-        except Exception:
-            pass
 
-    def _on_restart_mcp(self) -> None:
-        self._run_async(self._simple_action, "restart")
+    def restart_mcp(self) -> dict[str, Any]:
+        self._busy_phase = "restarting"
+        self._busy_until = time.time() + 9
+        threading.Thread(target=self._do_restart, daemon=True).start()
+        return {"ok": True, "messages": ["restarting MCP server…"]}
 
-    def _on_stop_mcp(self) -> None:
-        self._run_async(self._simple_action, "stop")
-
-    def _simple_action(self, which: str) -> None:
-        if which == "restart":
-            self._log_line("Restarting MCP server…")
-            r = processes.restart_mcp_http(self.cfg)
-        else:
-            r = processes.stop_mcp_http(self.cfg)
-        reason = f" — {r.reason}" if r.reason else ""
-        self._log_line(f"{r.piece}: {r.action}{reason}")
+    def _do_restart(self) -> None:
         try:
+            processes.restart_mcp_http(self.cfg)
+        finally:
             self._poller.refresh_now()
-        except Exception:
-            pass
 
-    # --- UI tick (drains the action-log queue) -----------------------------
+    def stop_mcp(self) -> dict[str, Any]:
+        self._busy_phase = None
+        r = processes.stop_mcp_http(self.cfg)
+        self._poller.refresh_now()
+        return {"ok": True, "messages": [_fmt(r)]}
 
-    def _ui_tick(self) -> None:
-        try:
-            while True:
-                kind, payload = self._events.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "refresh_picker":
-                    self._refresh_picker()
-        except queue.Empty:
-            pass
-        self.root.after(UI_TICK_MS, self._ui_tick)
+    def open_pcb_editor(self) -> dict[str, Any]:
+        board = self._current_board()
+        if board is None:
+            return {"ok": False, "messages": ["no project selected"]}
+        self._busy_phase = "starting"
+        self._busy_until = time.time() + 12
+        r = processes.launch_pcbnew(board)
+        self._poller.refresh_now()
+        return {"ok": r.action != "failed", "messages": [_fmt(r)]}
 
-    def _append_log(self, text: str) -> None:
-        self._action_log.configure(state="normal")
-        self._action_log.insert("end", text + "\n")
-        self._action_log.see("end")
-        self._action_log.configure(state="disabled")
 
-    def _on_close(self) -> None:
-        try:
-            self._poller.stop()
-        except Exception:
-            pass
-        self.root.destroy()
+def main() -> None:
+    cfg = load_config()
+    api = LauncherApi(cfg)
+    webview.create_window(
+        "KiCad-MCP Launcher",
+        str(_UI_HTML),
+        js_api=api,
+        width=536,
+        height=960,
+        min_size=(480, 640),
+        background_color="#0d1117",
+    )
+    webview.start()
+
+
+if __name__ == "__main__":
+    main()

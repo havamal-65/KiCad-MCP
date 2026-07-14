@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KiCad-MCP Launcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --green:#42d17f; --amber:#f2b13c; --red:#f2647a; --blue:#5b9dff; --dim:#5f6b7c;
+    --sans:system-ui,-apple-system,'Segoe UI',sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,'Consolas',monospace;
+    --disp:'Space Grotesk',var(--sans);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:#08090d;color:#e6e9ef;font-family:var(--sans)}
+  body{padding:0}
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#1c2230;border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+  @keyframes lspin{to{transform:rotate(360deg)}}
+  @keyframes lslide{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+  .feed>*{animation:lslide .28s ease}
+  select.sel{appearance:none;-webkit-appearance:none}
+  button{font-family:var(--sans)}
+  .toast{
+    position:fixed;left:50%;bottom:16px;transform:translateX(-50%);
+    background:#1c2230;border:1px solid rgba(255,255,255,.1);border-radius:9px;
+    padding:9px 14px;font:500 12px/1.4 var(--mono);color:#c8cfda;max-width:88%;
+    box-shadow:0 8px 24px rgba(0,0,0,.5);opacity:0;transition:opacity .25s;pointer-events:none;z-index:9;
+    white-space:pre-wrap
+  }
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast" class="toast"></div>
+
+<script>
+const GREEN='#42d17f', AMBER='#f2b13c', RED='#f2647a', BLUE='#5b9dff', DIM='#5f6b7c';
+const CHECK_LABEL = {
+  kicad_running:'kicad_running', bridge_reachable:'bridge_reachable',
+  bridge_version_ok:'bridge_version_ok', pcb_editor_open:'pcb_editor_open',
+  kicad_cli_available:'kicad_cli_available', project_loaded:'project_loaded'
+};
+const CHECK_ORDER = ['kicad_running','bridge_reachable','bridge_version_ok','pcb_editor_open','kicad_cli_available','project_loaded'];
+const BACKENDS = [
+  {key:'plugin', name:'plugin', desc:'live pcbnew edits · TCP :9760', cap:'bridge'},
+  {key:'file', name:'file', desc:'direct .kicad_pcb / .kicad_sch parsing', cap:'4 caps'},
+  {key:'cli', name:'cli', desc:'kicad-cli: DRC/ERC, gerber/BOM/pdf', cap:'8 caps'},
+  {key:'subprocess', name:'subprocess', desc:'headless pcbnew — DSN fallback when bridge down', cap:''},
+];
+
+function colorFor(k){
+  if(k==='up'||k==='running'||k==='ok'||k===true) return GREEN;
+  if(k==='starting'||k==='restarting'||k==='partial') return AMBER;
+  if(k==='down'||k==='unresponsive'||k==='err'||k==='error'||k==='stopped'||k===false) return RED;
+  return DIM;
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtUptime(sec){
+  if(sec==null||sec<0) return '—';
+  sec=Math.floor(sec); const d=Math.floor(sec/86400); sec-=d*86400;
+  const h=Math.floor(sec/3600); sec-=h*3600; const m=Math.floor(sec/60);
+  return `${d}d ${h}h ${m}m`;
+}
+
+function renderVals(st){
+  const starting = st.phase==='starting' || st.phase==='restarting';
+  const cl = st.checklist||{};
+  const readyCount = CHECK_ORDER.filter(k=>cl[k]).length;
+  const readyTotal = 6;
+  const ready = readyCount===readyTotal;
+  const readyColor = ready?GREEN:(starting?AMBER:RED);
+  const readyText = ready?'READY':(starting?'STARTING…':'NOT READY');
+  const readyBg = ready?'#42d17f14':(starting?'#f2b13c14':'#f2647a14');
+  const readyPct = Math.round(readyCount/readyTotal*100);
+
+  const checklist = CHECK_ORDER.map(k=>{
+    const ok=!!cl[k];
+    return {label:CHECK_LABEL[k], color: ok?GREEN:(starting?AMBER:DIM), labelColor: ok?'#a9e9c6':(starting?'#f2d19a':'#9aa4b2')};
+  });
+
+  const bMap={running:'RUNNING',starting:'CONNECTING',unresponsive:'UNRESPONSIVE'};
+  const bridge=st.bridge||{};
+  const bridgeColor=colorFor(bridge.status);
+  const bridgeLabel=bMap[bridge.status]||String(bridge.status||'').toUpperCase();
+  const bridgeDetail1=bridge.detail||'';
+  const bridgeDetail2='board: '+(bridge.board||'none open');
+
+  const server=st.server||{};
+  const serverRunning=server.status==='running';
+  const serverColor=colorFor(server.status);
+  const serverLabel=serverRunning?'RUNNING':'STOPPED';
+  const serverDetail1=serverRunning?('pid '+(server.pid==null?'—':server.pid)):'process not running';
+  const serverDetail2=serverRunning?('uptime '+fmtUptime(server.uptimeSeconds)):'start to launch';
+
+  const be=st.backends||{};
+  const backends=BACKENDS.map(b=>{
+    const s=be[b.key]||'idle'; const c=colorFor(s);
+    return {name:b.name, desc:b.desc, cap:b.cap, color:c, nameColor: s==='up'?'#e6e9ef':c};
+  });
+
+  const activity=(st.activity||[]).map(a=>({time:a.time, tool:a.tool, status:a.status, color:colorFor(a.status)}));
+  const activityRate=serverRunning?(ready?'live':'idle'):'offline';
+  const logs=(st.logs||[]).map(l=>({time:l.time, level:l.level, msg:l.msg,
+    levelColor: l.level==='WARNING'?AMBER:(l.level==='ERROR'||l.level==='CRITICAL'?RED:BLUE)}));
+
+  let g=null;
+  if(!starting){
+    if(!serverRunning) g={accent:BLUE,title:'MCP server is stopped',body:'Nothing is listening. Start the launcher to bring the server, bridge and board online.',action:'Start everything',fn:'start'};
+    else if(bridge.status!=='running') g={accent:AMBER,title:'pcbnew bridge is unreachable',body:'No live board path. Launch KiCad and open the PCB editor, or enable the IPC API server under Preferences → Plugins.',action:'Open PCB editor',fn:'openPcb'};
+    else if(!ready) g={accent:AMBER,title:'Startup almost complete',body:'The bridge is up but the project has not finished loading. Give it a moment or reopen the board.',action:'Reload board',fn:'openPcb'};
+  }
+
+  const startLabel=starting?'Starting…':(ready?'Everything up':'Start everything');
+  const startDisabled=starting||ready;
+  const restartDisabled=starting||!serverRunning;
+  const stopDisabled=starting||!serverRunning;
+
+  return {starting, readyCount, readyTotal, ready, readyColor, readyText, readyBg, readyPct, checklist,
+    bridgeColor, bridgeLabel, bridgeDetail1, bridgeDetail2,
+    serverColor, serverLabel, serverDetail1, serverDetail2,
+    backends, activity, activityRate, logs, g,
+    startLabel, startDisabled, restartDisabled, stopDisabled,
+    projects: st.projects||[], projectIndex: st.projectIndex||0, projectPath: st.projectPath||''};
+}
+
+function tpl(st, v){
+  const startBtn = `display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:1;padding:11px 14px;border-radius:10px;border:none;font:600 13px/1 var(--sans);cursor:${v.startDisabled?'default':'pointer'};background:${v.startDisabled?'#1c2230':GREEN};color:${v.startDisabled?DIM:'#0d1117'};opacity:${v.startDisabled&&!v.starting?'.75':'1'};transition:all .2s`;
+  const secBtn = `white-space:nowrap;padding:11px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);font:600 13px/1 var(--sans);background:#161b26;color:#c8cfda;cursor:pointer;transition:all .2s`;
+  const secBtnDis = secBtn+';opacity:.5;cursor:default';
+  const spin = v.starting?`width:12px;height:12px;border-radius:50%;border:2px solid #0d111740;border-top-color:#0d1117;animation:lspin .7s linear infinite;display:inline-block`:'display:none';
+
+  const options = v.projects.map(p=>`<option value="${esc(p.value)}" ${String(p.value)===String(v.projectIndex)?'selected':''}>${esc(p.label)}</option>`).join('');
+  const checks = v.checklist.map(c=>`<div style="display:flex;align-items:center;gap:9px">
+      <span style="width:7px;height:7px;border-radius:50%;background:${c.color};flex:none;box-shadow:0 0 7px ${c.color}"></span>
+      <span style="font:500 12.5px/1.3 var(--mono);color:${c.labelColor}">${esc(c.label)}</span></div>`).join('');
+  const backends = v.backends.map(b=>`<div style="display:flex;align-items:center;gap:11px;padding:6px 0">
+      <span style="width:8px;height:8px;border-radius:50%;background:${b.color};flex:none;box-shadow:0 0 8px ${b.color}"></span>
+      <span style="font:600 12.5px/1 var(--mono);color:${b.nameColor};width:82px;flex:none">${esc(b.name)}</span>
+      <span style="flex:1;min-width:0;font:400 12px/1.4 var(--sans);color:#9aa4b2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.desc)}</span>
+      <span style="font:500 11px/1 var(--mono);color:#5f6b7c;flex:none">${esc(b.cap)}</span></div>`).join('');
+  const activity = v.activity.length ? v.activity.map(a=>`<div style="display:flex;align-items:center;gap:12px;font:400 12px/1.7 var(--mono)">
+      <span style="color:#5f6b7c;flex:none">${esc(a.time)}</span>
+      <span style="flex:1;min-width:0;color:#c8cfda;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.tool)}</span>
+      <span style="color:${a.color};flex:none">${esc(a.status)}</span></div>`).join('')
+      : `<div style="font:400 12px/1.6 var(--mono);color:#5f6b7c">no recent tool calls</div>`;
+  const logs = v.logs.length ? v.logs.map(l=>`<div style="font:400 11.5px/1.55 var(--mono);color:#9aa4b2">
+      <span style="color:#5f6b7c">${esc(l.time)}</span> <span style="color:${l.levelColor};font-weight:600">[${esc(l.level)}]</span> ${esc(l.msg)}</div>`).join('')
+      : `<div style="font:400 11.5px/1.5 var(--mono);color:#5f6b7c">no recent warnings</div>`;
+
+  const guidance = v.g ? `<div style="margin:0 22px 18px;background:${v.g.accent}12;border:1px solid ${v.g.accent}38;border-radius:13px;padding:15px 17px">
+      <div style="display:flex;align-items:center;gap:9px;margin-bottom:7px">
+        <span style="width:16px;height:16px;border-radius:50%;background:${v.g.accent};display:flex;align-items:center;justify-content:center;font:700 11px var(--sans);color:#0d1117">!</span>
+        <span style="font:600 13.5px/1 var(--disp);color:${v.g.accent}">${esc(v.g.title)}</span>
+      </div>
+      <div style="font:400 12.5px/1.6 var(--sans);color:#c8cfda;margin-bottom:12px">${esc(v.g.body)}</div>
+      <button data-act="${v.g.fn}" style="background:${v.g.accent};color:#0d1117;border:none;border-radius:8px;padding:8px 15px;font:600 12.5px/1 var(--sans);cursor:pointer">${esc(v.g.action)} →</button>
+    </div>` : '';
+
+  return `
+  <div style="width:100%;min-height:100vh;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
+    <div style="padding:20px 22px 18px;border-bottom:1px solid rgba(255,255,255,.06)">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="width:26px;height:26px;border-radius:7px;background:#42d17f1a;border:1px solid #42d17f40;display:flex;align-items:center;justify-content:center;font:700 13px var(--disp);color:#42d17f">K</span>
+        <div style="font:600 15px/1 var(--disp);letter-spacing:-.01em">KiCad · MCP Launcher</div>
+        <div style="flex:1"></div>
+        <div style="display:flex;align-items:center;gap:7px;padding:4px 10px;border-radius:20px;white-space:nowrap;background:${v.readyBg};border:1px solid ${v.readyColor}40">
+          <span style="width:7px;height:7px;border-radius:50%;background:${v.readyColor};box-shadow:0 0 8px ${v.readyColor}"></span>
+          <span style="font:600 11px/1 var(--mono);letter-spacing:.06em;color:${v.readyColor}">${esc(v.readyText)}</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:16px">
+        <span style="font:500 11px/1 var(--mono);color:#5f6b7c;text-transform:uppercase;letter-spacing:.08em">Project</span>
+        <select id="proj" class="sel" style="flex:1;min-width:0;background:#161b26;border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:9px 12px;color:#e6e9ef;font:500 13px/1 var(--sans);cursor:pointer">${options}</select>
+      </div>
+      <div style="font:400 11px/1.4 var(--mono);color:#5f6b7c;margin-top:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.projectPath)}</div>
+    </div>
+
+    <div style="display:flex;gap:9px;padding:16px 22px">
+      <button data-act="start" ${v.startDisabled?'disabled':''} style="${startBtn}"><span style="${spin}"></span>${esc(v.startLabel)}</button>
+      <button data-act="restart" ${v.restartDisabled?'disabled':''} style="${v.restartDisabled?secBtnDis:secBtn}">Restart MCP</button>
+      <button data-act="stop" ${v.stopDisabled?'disabled':''} style="${v.stopDisabled?secBtnDis:secBtn}">Stop MCP</button>
+    </div>
+
+    <div style="display:flex;gap:12px;padding:0 22px 18px">
+      <div style="flex:1;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
+        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">pcbnew bridge</div>
+        <div style="display:flex;align-items:center;gap:9px;margin:13px 0 11px">
+          <span style="width:9px;height:9px;border-radius:50%;background:${v.bridgeColor};box-shadow:0 0 10px ${v.bridgeColor}"></span>
+          <span style="font:600 21px/1 var(--disp);color:${v.bridgeColor};letter-spacing:-.01em">${esc(v.bridgeLabel)}</span>
+        </div>
+        <div style="font:400 12px/1.55 var(--mono);color:#9aa4b2">${esc(v.bridgeDetail1)}</div>
+        <div style="font:400 12px/1.55 var(--mono);color:#5f6b7c">${esc(v.bridgeDetail2)}</div>
+      </div>
+      <div style="flex:1;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
+        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">MCP server process</div>
+        <div style="display:flex;align-items:center;gap:9px;margin:13px 0 11px">
+          <span style="width:9px;height:9px;border-radius:50%;background:${v.serverColor};box-shadow:0 0 10px ${v.serverColor}"></span>
+          <span style="font:600 21px/1 var(--disp);color:${v.serverColor};letter-spacing:-.01em">${esc(v.serverLabel)}</span>
+        </div>
+        <div style="font:400 12px/1.55 var(--mono);color:#9aa4b2">${esc(v.serverDetail1)}</div>
+        <div style="font:400 12px/1.55 var(--mono);color:#5f6b7c">${esc(v.serverDetail2)}</div>
+      </div>
+    </div>
+
+    ${guidance}
+
+    <div style="margin:0 22px 18px;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
+        <span style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">ready_for_pcb gate</span>
+        <span style="font:600 12px/1 var(--mono);color:${v.readyColor}">${v.readyCount}/${v.readyTotal} checks</span>
+      </div>
+      <div style="height:6px;border-radius:6px;background:#0d1117;overflow:hidden;margin-bottom:15px">
+        <div style="height:100%;border-radius:6px;background:${v.readyColor};width:${v.readyPct}%;transition:width .5s ease"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px 18px">${checks}</div>
+    </div>
+
+    <div style="margin:0 22px 18px;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
+      <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:13px">backends <span style="color:#404b5c">— how the MCP reaches KiCad</span></div>
+      ${backends}
+    </div>
+
+    <div style="padding:0 22px 22px;display:flex;flex-direction:column;gap:12px">
+      <div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:15px 17px">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:11px">
+          <span style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">tool activity</span>
+          <span style="font:500 11px/1 var(--mono);color:#5b9dff">${esc(v.activityRate)}</span>
+        </div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:3px">${activity}</div>
+      </div>
+      <div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:15px 17px">
+        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:11px">server.log <span style="color:#404b5c">— recent</span></div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:6px">${logs}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+let _toastTimer=null;
+function toast(msg){
+  if(!msg) return;
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer=setTimeout(()=>el.classList.remove('show'), 4200);
+}
+
+let _lastProjOpen=false;
+function render(st){
+  const app=document.getElementById('app');
+  const sel=document.getElementById('proj');
+  // Don't clobber an open dropdown mid-interaction.
+  if(sel && document.activeElement===sel) return;
+  const v=renderVals(st);
+  app.innerHTML=tpl(st, v);
+  document.getElementById('proj').addEventListener('change', onProjectChange);
+  app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
+}
+
+async function api(){ return (window.pywebview && window.pywebview.api) ? window.pywebview.api : null; }
+
+async function refresh(){
+  const a=await api(); if(!a) return;
+  try{ const st=await a.get_state(); render(st); }catch(e){ /* transient */ }
+}
+
+async function onProjectChange(e){
+  const a=await api(); if(!a) return;
+  await a.select_project(e.target.value);
+  refresh();
+}
+
+async function onAction(e){
+  const act=e.currentTarget.getAttribute('data-act');
+  const a=await api(); if(!a) return;
+  let res=null;
+  try{
+    if(act==='start') res=await a.start_everything();
+    else if(act==='restart') res=await a.restart_mcp();
+    else if(act==='stop') res=await a.stop_mcp();
+    else if(act==='openPcb') res=await a.open_pcb_editor();
+  }catch(err){ toast('action failed: '+err); }
+  if(res && res.messages && res.messages.length) toast(res.messages.join('\n'));
+  refresh();
+}
+
+function boot(){
+  refresh();
+  setInterval(refresh, 1500);
+}
+if(window.pywebview){ boot(); }
+else { window.addEventListener('pywebviewready', boot); }
+</script>
+</body>
+</html>

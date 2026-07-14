@@ -54,6 +54,26 @@ class LauncherApi:
         self._m = _load_monitor()
         self._poller = self._m.Poller()
         self._poller.start()
+        # Window auto-fit state (set by bind_window; used by fit_height).
+        self._window: Any = None
+        self._width = 0
+        self._outer_h = 0
+        self._chrome: int | None = None  # native title-bar/border height, computed once
+        self._max_h: int | None = None
+
+    def bind_window(self, window: Any, width: int, height: int) -> None:
+        self._window = window
+        self._width = width
+        self._outer_h = height
+
+    def _screen_height(self) -> int:
+        try:
+            screens = webview.screens
+            if screens:
+                return int(screens[0].height) - 72  # leave room for the taskbar
+        except Exception:
+            pass
+        return 1300
 
     # --- helpers ---
     def _busy(self) -> str | None:
@@ -71,6 +91,33 @@ class LauncherApi:
     def get_state(self) -> dict[str, Any]:
         snap = self._poller.state  # {} until first poll
         return dashboard.build_state(snap, self._projects, self._selected, self._busy())
+
+    def fit_height(self, content: Any, viewport: Any) -> dict[str, Any]:
+        """Resize the window so its content area exactly fits `content` px.
+
+        `viewport` is the webview's inner height; the native chrome (title bar +
+        borders) is the difference between the outer window and the viewport,
+        computed once and reused. Clamped to the screen height."""
+        if self._window is None:
+            return {"ok": False}
+        try:
+            content_px = int(content)
+            viewport_px = int(viewport)
+        except (TypeError, ValueError):
+            return {"ok": False}
+        if self._chrome is None and viewport_px > 0 and self._outer_h > 0:
+            self._chrome = max(0, self._outer_h - viewport_px)
+        if self._max_h is None:
+            self._max_h = self._screen_height()
+        target = content_px + (self._chrome or 0)
+        target = max(400, min(target, self._max_h))
+        if abs(target - self._outer_h) > 2:
+            self._outer_h = target
+            try:
+                self._window.resize(self._width, target)
+            except Exception:
+                pass
+        return {"ok": True, "height": target}
 
     def select_project(self, index: Any) -> dict[str, Any]:
         try:
@@ -141,15 +188,17 @@ class LauncherApi:
 def main() -> None:
     cfg = load_config()
     api = LauncherApi(cfg)
-    webview.create_window(
+    width, height = 504, 900
+    window = webview.create_window(
         "KiCad-MCP Launcher",
         str(_UI_HTML),
         js_api=api,
-        width=536,
-        height=960,
-        min_size=(480, 640),
+        width=width,
+        height=height,
+        min_size=(460, 420),
         background_color="#0d1117",
     )
+    api.bind_window(window, width, height)
     webview.start()
 
 

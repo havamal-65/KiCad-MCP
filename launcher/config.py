@@ -65,6 +65,13 @@ def _env_projects_roots() -> list[Path]:
     return [Path(part) for part in raw.split(os.pathsep) if part.strip()]
 
 
+def connect_info(cfg: LauncherConfig) -> dict[str, object]:
+    """The MCP client config for the launcher-owned HTTP server — what a user
+    pastes into an MCP client to connect (matches the .mcp.dev.json shape)."""
+    url = f"http://{cfg.mcp_host}:{cfg.mcp_port}/mcp"
+    return {"mcpServers": {"kicad": {"type": "http", "url": url}}}
+
+
 def load_config(root: Path | None = None) -> LauncherConfig:
     """Build a `LauncherConfig` from the environment.
 

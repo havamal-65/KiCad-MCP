@@ -16,7 +16,6 @@
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{background:#08090d;color:#e6e9ef;font-family:var(--sans)}
-  body{padding:0}
   ::-webkit-scrollbar{width:9px;height:9px}
   ::-webkit-scrollbar-thumb{background:#1c2230;border-radius:6px}
   ::-webkit-scrollbar-track{background:transparent}
@@ -25,6 +24,9 @@
   .feed>*{animation:lslide .28s ease}
   select.sel{appearance:none;-webkit-appearance:none}
   button{font-family:var(--sans)}
+  .tool{white-space:nowrap;padding:7px 11px;border-radius:8px;border:1px solid rgba(255,255,255,.08);
+    font:500 11.5px/1 var(--sans);background:#12172250;color:#9aa4b2;cursor:pointer;transition:all .15s}
+  .tool:hover{background:#1c2230;color:#c8cfda}
   .toast{
     position:fixed;left:50%;bottom:16px;transform:translateX(-50%);
     background:#1c2230;border:1px solid rgba(255,255,255,.1);border-radius:9px;
@@ -82,7 +84,9 @@ function renderVals(st){
 
   const checklist = CHECK_ORDER.map(k=>{
     const ok=!!cl[k];
-    return {label:CHECK_LABEL[k], color: ok?GREEN:(starting?AMBER:DIM), labelColor: ok?'#a9e9c6':(starting?'#f2d19a':'#9aa4b2')};
+    return {label:CHECK_LABEL[k], ok, color: ok?GREEN:(starting?AMBER:DIM),
+      labelColor: ok?'#a9e9c6':(starting?'#f2d19a':'#9aa4b2'),
+      chipBg: ok?'#42d17f10':(starting?'#f2b13c10':'#f2647a0d')};
   });
 
   const bMap={running:'RUNNING',starting:'CONNECTING',unresponsive:'UNRESPONSIVE'};
@@ -127,45 +131,119 @@ function renderVals(st){
     serverColor, serverLabel, serverDetail1, serverDetail2,
     backends, activity, activityRate, logs, g,
     startLabel, startDisabled, restartDisabled, stopDisabled,
+    diags: st.diags||[], variant: st.variant||'console', trayAvailable: !!st.trayAvailable,
     projects: st.projects||[], projectIndex: st.projectIndex||0, projectPath: st.projectPath||''};
 }
 
-function tpl(st, v){
-  const startBtn = `display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:1;padding:11px 14px;border-radius:10px;border:none;font:600 13px/1 var(--sans);cursor:${v.startDisabled?'default':'pointer'};background:${v.startDisabled?'#1c2230':GREEN};color:${v.startDisabled?DIM:'#0d1117'};opacity:${v.startDisabled&&!v.starting?'.75':'1'};transition:all .2s`;
-  const secBtn = `white-space:nowrap;padding:11px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);font:600 13px/1 var(--sans);background:#161b26;color:#c8cfda;cursor:pointer;transition:all .2s`;
-  const secBtnDis = secBtn+';opacity:.5;cursor:default';
-  const spin = v.starting?`width:12px;height:12px;border-radius:50%;border:2px solid #0d111740;border-top-color:#0d1117;animation:lspin .7s linear infinite;display:inline-block`:'display:none';
+/* ---------- shared fragments ---------- */
 
-  const options = v.projects.map(p=>`<option value="${esc(p.value)}" ${String(p.value)===String(v.projectIndex)?'selected':''}>${esc(p.label)}</option>`).join('');
-  const checks = v.checklist.map(c=>`<div style="display:flex;align-items:center;gap:9px">
-      <span style="width:7px;height:7px;border-radius:50%;background:${c.color};flex:none;box-shadow:0 0 7px ${c.color}"></span>
-      <span style="font:500 12.5px/1.3 var(--mono);color:${c.labelColor}">${esc(c.label)}</span></div>`).join('');
-  const backends = v.backends.map(b=>`<div style="display:flex;align-items:center;gap:11px;padding:6px 0">
+function btnStyles(v){
+  return {
+    start: `display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:1;padding:11px 14px;border-radius:10px;border:none;font:600 13px/1 var(--sans);cursor:${v.startDisabled?'default':'pointer'};background:${v.startDisabled?'#1c2230':GREEN};color:${v.startDisabled?DIM:'#0d1117'};opacity:${v.startDisabled&&!v.starting?'.75':'1'};transition:all .2s`,
+    sec: `white-space:nowrap;padding:11px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);font:600 13px/1 var(--sans);background:#161b26;color:#c8cfda;cursor:pointer;transition:all .2s`,
+    secDis: `white-space:nowrap;padding:11px 14px;border-radius:10px;border:1px solid rgba(255,255,255,.1);font:600 13px/1 var(--sans);background:#161b26;color:#c8cfda;opacity:.5;cursor:default;transition:all .2s`,
+    spin: v.starting?`width:12px;height:12px;border-radius:50%;border:2px solid #0d111740;border-top-color:#0d1117;animation:lspin .7s linear infinite;display:inline-block`:'display:none'
+  };
+}
+
+function fragToolbar(v, pad){
+  const tray = v.trayAvailable ? `<button class="tool" data-act="tray">Tray</button>` : '';
+  const layout = v.variant==='bento'
+    ? `<button class="tool" data-act="variantConsole">Narrow layout</button>`
+    : `<button class="tool" data-act="variantBento">Wide layout</button>`;
+  return `<div style="display:flex;flex-wrap:wrap;gap:7px;padding:${pad}">
+    <button class="tool" data-act="stopAll">Stop everything</button>
+    <button class="tool" data-act="browse">Add project…</button>
+    <button class="tool" data-act="rescan">Rescan</button>
+    <button class="tool" data-act="reveal">Reveal in Explorer</button>
+    <button class="tool" data-act="copyCfg">Copy MCP config</button>
+    <button class="tool" data-act="reinstallBridge">Reinstall bridge</button>
+    ${layout}${tray}
+  </div>`;
+}
+
+function fragDiags(v, margin){
+  if(!v.diags.length) return '';
+  return v.diags.map(d=>{
+    const accent = d.blocking ? RED : AMBER;
+    const owner = d.owner ? ` <span style="font:500 11px var(--mono);color:#9aa4b2">${esc(d.owner)}</span>` : '';
+    const action = d.action ? `<button data-act="${esc(d.action)}" style="flex:none;background:${accent};color:#0d1117;border:none;border-radius:8px;padding:7px 12px;font:600 12px/1 var(--sans);cursor:pointer">Stop that process</button>` : '';
+    return `<div style="margin:${margin};background:${accent}12;border:1px solid ${accent}38;border-radius:11px;padding:11px 14px;display:flex;align-items:center;gap:11px">
+      <span style="width:14px;height:14px;border-radius:50%;background:${accent};display:flex;align-items:center;justify-content:center;font:700 10px var(--sans);color:#0d1117;flex:none">!</span>
+      <span style="flex:1;min-width:0;font:400 12px/1.5 var(--sans);color:#c8cfda">${esc(d.message)}${owner}</span>
+      ${action}
+    </div>`;
+  }).join('');
+}
+
+function fragGuidance(v, margin, horizontal){
+  if(!v.g) return '';
+  if(horizontal){
+    return `<div style="grid-column:1 / -1;background:${v.g.accent}12;border:1px solid ${v.g.accent}38;border-radius:15px;padding:17px 20px;display:flex;align-items:center;gap:16px">
+      <span style="width:22px;height:22px;border-radius:50%;background:${v.g.accent};display:flex;align-items:center;justify-content:center;font:700 13px var(--sans);color:#0d1117;flex:none">!</span>
+      <div style="flex:1;min-width:0">
+        <div style="font:600 13.5px/1 var(--disp);color:${v.g.accent};margin-bottom:5px">${esc(v.g.title)}</div>
+        <div style="font:400 12.5px/1.5 var(--sans);color:#c8cfda">${esc(v.g.body)}</div>
+      </div>
+      <button data-act="${v.g.fn}" style="flex:none;background:${v.g.accent};color:#0d1117;border:none;border-radius:9px;padding:10px 16px;font:600 12.5px/1 var(--sans);cursor:pointer">${esc(v.g.action)} →</button>
+    </div>`;
+  }
+  return `<div style="margin:${margin};background:${v.g.accent}12;border:1px solid ${v.g.accent}38;border-radius:13px;padding:15px 17px">
+    <div style="display:flex;align-items:center;gap:9px;margin-bottom:7px">
+      <span style="width:16px;height:16px;border-radius:50%;background:${v.g.accent};display:flex;align-items:center;justify-content:center;font:700 11px var(--sans);color:#0d1117">!</span>
+      <span style="font:600 13.5px/1 var(--disp);color:${v.g.accent}">${esc(v.g.title)}</span>
+    </div>
+    <div style="font:400 12.5px/1.6 var(--sans);color:#c8cfda;margin-bottom:12px">${esc(v.g.body)}</div>
+    <button data-act="${v.g.fn}" style="background:${v.g.accent};color:#0d1117;border:none;border-radius:8px;padding:8px 15px;font:600 12.5px/1 var(--sans);cursor:pointer">${esc(v.g.action)} →</button>
+  </div>`;
+}
+
+function fragCard(label, color, big, d1, d2, radius){
+  return `<div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:${radius}px;padding:16px 18px">
+    <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">${label}</div>
+    <div style="display:flex;align-items:center;gap:9px;margin:13px 0 11px">
+      <span style="width:9px;height:9px;border-radius:50%;background:${color};box-shadow:0 0 10px ${color}"></span>
+      <span style="font:600 21px/1 var(--disp);color:${color};letter-spacing:-.01em">${esc(big)}</span>
+    </div>
+    <div style="font:400 12px/1.55 var(--mono);color:#9aa4b2">${esc(d1)}</div>
+    <div style="font:400 12px/1.55 var(--mono);color:#5f6b7c">${esc(d2)}</div>
+  </div>`;
+}
+
+function fragBackendRows(v, hairline){
+  return v.backends.map(b=>`<div style="display:flex;align-items:center;gap:11px;padding:6px 0;${hairline?'border-bottom:1px solid rgba(255,255,255,.04)':''}">
       <span style="width:8px;height:8px;border-radius:50%;background:${b.color};flex:none;box-shadow:0 0 8px ${b.color}"></span>
       <span style="font:600 12.5px/1 var(--mono);color:${b.nameColor};width:82px;flex:none">${esc(b.name)}</span>
       <span style="flex:1;min-width:0;font:400 12px/1.4 var(--sans);color:#9aa4b2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(b.desc)}</span>
       <span style="font:500 11px/1 var(--mono);color:#5f6b7c;flex:none">${esc(b.cap)}</span></div>`).join('');
-  const activity = v.activity.length ? v.activity.map(a=>`<div style="display:flex;align-items:center;gap:12px;font:400 12px/1.7 var(--mono)">
+}
+
+function fragActivity(v){
+  return v.activity.length ? v.activity.map(a=>`<div style="display:flex;align-items:center;gap:12px;font:400 12px/1.7 var(--mono)">
       <span style="color:#5f6b7c;flex:none">${esc(a.time)}</span>
-      <span style="flex:1;min-width:0;color:#c8cfda;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(a.tool)}</span>
+      <span style="flex:1;min-width:0;color:#c8cfda;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(a.tool)}">${esc(a.tool)}</span>
       <span style="color:${a.color};flex:none">${esc(a.status)}</span></div>`).join('')
       : `<div style="font:400 12px/1.6 var(--mono);color:#5f6b7c">no recent tool calls</div>`;
-  const logs = v.logs.length ? v.logs.map(l=>`<div style="font:400 11.5px/1.55 var(--mono);color:#9aa4b2">
+}
+
+function fragLogs(v){
+  return v.logs.length ? v.logs.map(l=>`<div style="font:400 11.5px/1.55 var(--mono);color:#9aa4b2">
       <span style="color:#5f6b7c">${esc(l.time)}</span> <span style="color:${l.levelColor};font-weight:600">[${esc(l.level)}]</span> ${esc(l.msg)}</div>`).join('')
       : `<div style="font:400 11.5px/1.5 var(--mono);color:#5f6b7c">no recent warnings</div>`;
+}
 
-  const guidance = v.g ? `<div style="margin:0 22px 18px;background:${v.g.accent}12;border:1px solid ${v.g.accent}38;border-radius:13px;padding:15px 17px">
-      <div style="display:flex;align-items:center;gap:9px;margin-bottom:7px">
-        <span style="width:16px;height:16px;border-radius:50%;background:${v.g.accent};display:flex;align-items:center;justify-content:center;font:700 11px var(--sans);color:#0d1117">!</span>
-        <span style="font:600 13.5px/1 var(--disp);color:${v.g.accent}">${esc(v.g.title)}</span>
-      </div>
-      <div style="font:400 12.5px/1.6 var(--sans);color:#c8cfda;margin-bottom:12px">${esc(v.g.body)}</div>
-      <button data-act="${v.g.fn}" style="background:${v.g.accent};color:#0d1117;border:none;border-radius:8px;padding:8px 15px;font:600 12.5px/1 var(--sans);cursor:pointer">${esc(v.g.action)} →</button>
-    </div>` : '';
+/* ---------- console (narrow) variant ---------- */
+
+function tplConsole(v){
+  const b = btnStyles(v);
+  const options = v.projects.map(p=>`<option value="${esc(p.value)}" ${String(p.value)===String(v.projectIndex)?'selected':''}>${esc(p.label)}</option>`).join('');
+  const checks = v.checklist.map(c=>`<div style="display:flex;align-items:center;gap:9px">
+      <span style="width:7px;height:7px;border-radius:50%;background:${c.color};flex:none;box-shadow:0 0 7px ${c.color}"></span>
+      <span style="font:500 12.5px/1.3 var(--mono);color:${c.labelColor}">${esc(c.label)}</span></div>`).join('');
 
   return `
   <div id="root" style="width:100%;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
-    <div style="padding:20px 22px 18px;border-bottom:1px solid rgba(255,255,255,.06)">
+    <div style="padding:20px 22px 14px;border-bottom:1px solid rgba(255,255,255,.06)">
       <div style="display:flex;align-items:center;gap:10px">
         <span style="width:26px;height:26px;border-radius:7px;background:#42d17f1a;border:1px solid #42d17f40;display:flex;align-items:center;justify-content:center;font:700 13px var(--disp);color:#42d17f">K</span>
         <div style="font:600 15px/1 var(--disp);letter-spacing:-.01em">KiCad · MCP Launcher</div>
@@ -182,34 +260,21 @@ function tpl(st, v){
       <div style="font:400 11px/1.4 var(--mono);color:#5f6b7c;margin-top:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.projectPath)}</div>
     </div>
 
-    <div style="display:flex;gap:9px;padding:16px 22px">
-      <button data-act="start" ${v.startDisabled?'disabled':''} style="${startBtn}"><span style="${spin}"></span>${esc(v.startLabel)}</button>
-      <button data-act="restart" ${v.restartDisabled?'disabled':''} style="${v.restartDisabled?secBtnDis:secBtn}">Restart MCP</button>
-      <button data-act="stop" ${v.stopDisabled?'disabled':''} style="${v.stopDisabled?secBtnDis:secBtn}">Stop MCP</button>
+    <div style="display:flex;gap:9px;padding:16px 22px 6px">
+      <button data-act="start" ${v.startDisabled?'disabled':''} style="${b.start}"><span style="${b.spin}"></span>${esc(v.startLabel)}</button>
+      <button data-act="restart" ${v.restartDisabled?'disabled':''} style="${v.restartDisabled?b.secDis:b.sec}">Restart MCP</button>
+      <button data-act="stop" ${v.stopDisabled?'disabled':''} style="${v.stopDisabled?b.secDis:b.sec}">Stop MCP</button>
     </div>
+
+    ${fragToolbar(v, '4px 22px 12px')}
+    ${fragDiags(v, '0 22px 12px')}
 
     <div style="display:flex;gap:12px;padding:0 22px 18px">
-      <div style="flex:1;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
-        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">pcbnew bridge</div>
-        <div style="display:flex;align-items:center;gap:9px;margin:13px 0 11px">
-          <span style="width:9px;height:9px;border-radius:50%;background:${v.bridgeColor};box-shadow:0 0 10px ${v.bridgeColor}"></span>
-          <span style="font:600 21px/1 var(--disp);color:${v.bridgeColor};letter-spacing:-.01em">${esc(v.bridgeLabel)}</span>
-        </div>
-        <div style="font:400 12px/1.55 var(--mono);color:#9aa4b2">${esc(v.bridgeDetail1)}</div>
-        <div style="font:400 12px/1.55 var(--mono);color:#5f6b7c">${esc(v.bridgeDetail2)}</div>
-      </div>
-      <div style="flex:1;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
-        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">MCP server process</div>
-        <div style="display:flex;align-items:center;gap:9px;margin:13px 0 11px">
-          <span style="width:9px;height:9px;border-radius:50%;background:${v.serverColor};box-shadow:0 0 10px ${v.serverColor}"></span>
-          <span style="font:600 21px/1 var(--disp);color:${v.serverColor};letter-spacing:-.01em">${esc(v.serverLabel)}</span>
-        </div>
-        <div style="font:400 12px/1.55 var(--mono);color:#9aa4b2">${esc(v.serverDetail1)}</div>
-        <div style="font:400 12px/1.55 var(--mono);color:#5f6b7c">${esc(v.serverDetail2)}</div>
-      </div>
+      <div style="flex:1">${fragCard('pcbnew bridge', v.bridgeColor, v.bridgeLabel, v.bridgeDetail1, v.bridgeDetail2, 13)}</div>
+      <div style="flex:1">${fragCard('MCP server process', v.serverColor, v.serverLabel, v.serverDetail1, v.serverDetail2, 13)}</div>
     </div>
 
-    ${guidance}
+    ${fragGuidance(v, '0 22px 18px', false)}
 
     <div style="margin:0 22px 18px;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
       <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
@@ -224,7 +289,7 @@ function tpl(st, v){
 
     <div style="margin:0 22px 18px;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
       <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:13px">backends <span style="color:#404b5c">— how the MCP reaches KiCad</span></div>
-      ${backends}
+      ${fragBackendRows(v, false)}
     </div>
 
     <div style="padding:0 22px 22px;display:flex;flex-direction:column;gap:12px">
@@ -233,15 +298,87 @@ function tpl(st, v){
           <span style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">tool activity</span>
           <span style="font:500 11px/1 var(--mono);color:#5b9dff">${esc(v.activityRate)}</span>
         </div>
-        <div class="feed" style="display:flex;flex-direction:column;gap:3px">${activity}</div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:3px">${fragActivity(v)}</div>
       </div>
       <div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:15px 17px">
         <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:11px">server.log <span style="color:#404b5c">— recent</span></div>
-        <div class="feed" style="display:flex;flex-direction:column;gap:6px">${logs}</div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:6px">${fragLogs(v)}</div>
       </div>
     </div>
   </div>`;
 }
+
+/* ---------- bento (wide) variant ---------- */
+
+function tplBento(v){
+  const b = btnStyles(v);
+  const options = v.projects.map(p=>`<option value="${esc(p.value)}" ${String(p.value)===String(v.projectIndex)?'selected':''}>${esc(p.label)}</option>`).join('');
+  const pills = v.checklist.map(c=>`<span style="display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:20px;background:${c.chipBg};border:1px solid ${c.color}33">
+      <span style="width:6px;height:6px;border-radius:50%;background:${c.color}"></span>
+      <span style="font:500 11px/1 var(--mono);color:${c.labelColor}">${esc(c.label)}</span></span>`).join('');
+
+  return `
+  <div id="root" style="width:100%;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
+    <div style="display:flex;align-items:center;gap:14px;padding:18px 24px;border-bottom:1px solid rgba(255,255,255,.06)">
+      <span style="width:28px;height:28px;border-radius:8px;background:#42d17f1a;border:1px solid #42d17f40;display:flex;align-items:center;justify-content:center;font:700 14px var(--disp);color:#42d17f">K</span>
+      <div style="font:600 15px/1 var(--disp);letter-spacing:-.01em">MCP Launcher</div>
+      <select id="proj" class="sel" style="max-width:300px;background:#161b26;border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:8px 12px;color:#e6e9ef;font:500 12.5px/1 var(--sans);cursor:pointer">${options}</select>
+      <div style="flex:1"></div>
+      <button data-act="restart" ${v.restartDisabled?'disabled':''} style="${v.restartDisabled?b.secDis:b.sec}">Restart</button>
+      <button data-act="stop" ${v.stopDisabled?'disabled':''} style="${v.stopDisabled?b.secDis:b.sec}">Stop</button>
+      <button data-act="start" ${v.startDisabled?'disabled':''} style="${b.start};flex:none">${'<span style="'+b.spin+'"></span>'}${esc(v.startLabel)}</button>
+    </div>
+
+    ${fragToolbar(v, '12px 24px 0')}
+    ${fragDiags(v, '12px 24px 0')}
+
+    <div style="padding:16px 24px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div style="grid-column:1 / -1;background:linear-gradient(135deg,#161b26,#141926);border:1px solid rgba(255,255,255,.07);border-radius:15px;padding:20px 22px;display:flex;align-items:center;gap:24px">
+        <div style="flex:none">
+          <div style="display:flex;align-items:baseline;gap:4px">
+            <span style="font:700 40px/1 var(--disp);color:${v.readyColor};letter-spacing:-.02em">${v.readyCount}</span>
+            <span style="font:600 20px/1 var(--disp);color:#5f6b7c">/${v.readyTotal}</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px;margin-top:8px">
+            <span style="width:8px;height:8px;border-radius:50%;background:${v.readyColor};box-shadow:0 0 9px ${v.readyColor}"></span>
+            <span style="font:600 12px/1 var(--mono);letter-spacing:.05em;color:${v.readyColor}">${esc(v.readyText)}</span>
+          </div>
+        </div>
+        <div style="flex:1;min-width:0">
+          <div style="font:600 12.5px/1 var(--disp);letter-spacing:.02em;color:#c8cfda;margin-bottom:10px">Ready for PCB</div>
+          <div style="height:8px;border-radius:6px;background:#0d1117;overflow:hidden;margin-bottom:14px">
+            <div style="height:100%;border-radius:6px;background:linear-gradient(90deg,${v.readyColor}bb,${v.readyColor});width:${v.readyPct}%;transition:width .5s ease"></div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">${pills}</div>
+        </div>
+      </div>
+
+      ${fragGuidance(v, '', true)}
+
+      ${fragCard('pcbnew bridge', v.bridgeColor, v.bridgeLabel, v.bridgeDetail1, v.bridgeDetail2, 15)}
+      ${fragCard('MCP server process', v.serverColor, v.serverLabel, v.serverDetail1, v.serverDetail2, 15)}
+
+      <div style="grid-column:1 / -1;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:15px;padding:18px 20px">
+        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:6px">backends</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 28px">${fragBackendRows(v, true)}</div>
+      </div>
+
+      <div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:15px;padding:16px 18px">
+        <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
+          <span style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">tool activity</span>
+          <span style="font:500 11px/1 var(--mono);color:#5b9dff">${esc(v.activityRate)}</span>
+        </div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:4px">${fragActivity(v)}</div>
+      </div>
+      <div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:15px;padding:16px 18px">
+        <div style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c;margin-bottom:12px">server.log</div>
+        <div class="feed" style="display:flex;flex-direction:column;gap:7px">${fragLogs(v)}</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ---------- glue ---------- */
 
 let _toastTimer=null;
 function toast(msg){
@@ -263,13 +400,11 @@ function fitWindow(){
 function render(st){
   const app=document.getElementById('app');
   const sel=document.getElementById('proj');
-  // Don't clobber an open dropdown mid-interaction.
-  if(sel && document.activeElement===sel) return;
+  if(sel && document.activeElement===sel) return;   // don't clobber an open dropdown
   const v=renderVals(st);
-  app.innerHTML=tpl(st, v);
+  app.innerHTML = v.variant==='bento' ? tplBento(v) : tplConsole(v);
   document.getElementById('proj').addEventListener('change', onProjectChange);
   app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
-  // Resize the native window to fit the freshly-rendered content.
   requestAnimationFrame(fitWindow);
 }
 
@@ -286,16 +421,29 @@ async function onProjectChange(e){
   refresh();
 }
 
+const ACTIONS = {
+  start: a=>a.start_everything(),
+  restart: a=>a.restart_mcp(),
+  stop: a=>a.stop_mcp(),
+  stopAll: a=>a.stop_everything(),
+  openPcb: a=>a.open_pcb_editor(),
+  browse: a=>a.browse_project(),
+  rescan: a=>a.rescan_projects(),
+  reveal: a=>a.reveal_project(),
+  copyCfg: a=>a.copy_connect_info(),
+  reinstallBridge: a=>a.reinstall_bridge(),
+  stopForeign: a=>a.stop_foreign_server(),
+  variantBento: a=>a.set_variant('bento'),
+  variantConsole: a=>a.set_variant('console'),
+  tray: a=>a.hide_to_tray(),
+};
+
 async function onAction(e){
   const act=e.currentTarget.getAttribute('data-act');
-  const a=await api(); if(!a) return;
+  const a=await api(); if(!a || !ACTIONS[act]) return;
   let res=null;
-  try{
-    if(act==='start') res=await a.start_everything();
-    else if(act==='restart') res=await a.restart_mcp();
-    else if(act==='stop') res=await a.stop_mcp();
-    else if(act==='openPcb') res=await a.open_pcb_editor();
-  }catch(err){ toast('action failed: '+err); }
+  try{ res=await ACTIONS[act](a); }
+  catch(err){ toast('action failed: '+err); }
   if(res && res.messages && res.messages.length) toast(res.messages.join('\n'));
   refresh();
 }
@@ -303,7 +451,6 @@ async function onAction(e){
 function boot(){
   refresh();
   setInterval(refresh, 1500);
-  // Fonts load async and can reflow height — re-fit once they're ready.
   if(document.fonts && document.fonts.ready){ document.fonts.ready.then(()=>setTimeout(fitWindow, 30)); }
 }
 if(window.pywebview){ boot(); }

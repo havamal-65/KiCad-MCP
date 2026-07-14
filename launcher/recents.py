@@ -93,6 +93,19 @@ def _norm(p: str) -> str:
         return str(Path(p))
 
 
+def resolve_board_path(picked: Path | str) -> Path | None:
+    """Resolve a user-browsed file to a board: a `.kicad_pcb` is itself; a
+    `.kicad_pro` resolves to its sibling `.kicad_pcb`. None if unresolvable."""
+    p = Path(picked)
+    suffix = p.suffix.lower()
+    if suffix == ".kicad_pcb":
+        return p if p.exists() else None
+    if suffix == ".kicad_pro":
+        sibling = p.with_suffix(".kicad_pcb")
+        return sibling if sibling.exists() else None
+    return None
+
+
 def discover_projects(roots: list[Path]) -> list[Path]:
     """Recursively find *.kicad_pcb under each root. De-duplicated, sorted."""
     found: dict[str, Path] = {}

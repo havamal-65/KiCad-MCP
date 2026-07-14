@@ -41,10 +41,11 @@
 
 <script>
 const GREEN='#42d17f', AMBER='#f2b13c', RED='#f2647a', BLUE='#5b9dff', DIM='#5f6b7c';
+// Display labels (humanized) keyed by the true check name.
 const CHECK_LABEL = {
-  kicad_running:'kicad_running', bridge_reachable:'bridge_reachable',
-  bridge_version_ok:'bridge_version_ok', pcb_editor_open:'pcb_editor_open',
-  kicad_cli_available:'kicad_cli_available', project_loaded:'project_loaded'
+  kicad_running:'KiCad running', bridge_reachable:'Bridge reachable',
+  bridge_version_ok:'Bridge version OK', pcb_editor_open:'PCB editor open',
+  kicad_cli_available:'kicad-cli available', project_loaded:'Project loaded'
 };
 const CHECK_ORDER = ['kicad_running','bridge_reachable','bridge_version_ok','pcb_editor_open','kicad_cli_available','project_loaded'];
 const BACKENDS = [
@@ -163,7 +164,7 @@ function tpl(st, v){
     </div>` : '';
 
   return `
-  <div style="width:100%;min-height:100vh;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
+  <div id="root" style="width:100%;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
     <div style="padding:20px 22px 18px;border-bottom:1px solid rgba(255,255,255,.06)">
       <div style="display:flex;align-items:center;gap:10px">
         <span style="width:26px;height:26px;border-radius:7px;background:#42d17f1a;border:1px solid #42d17f40;display:flex;align-items:center;justify-content:center;font:700 13px var(--disp);color:#42d17f">K</span>
@@ -212,7 +213,7 @@ function tpl(st, v){
 
     <div style="margin:0 22px 18px;background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:16px 18px">
       <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px">
-        <span style="font:500 10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:#5f6b7c">ready_for_pcb gate</span>
+        <span style="font:600 13px/1 var(--disp);letter-spacing:.02em;color:#c8cfda">Ready for PCB</span>
         <span style="font:600 12px/1 var(--mono);color:${v.readyColor}">${v.readyCount}/${v.readyTotal} checks</span>
       </div>
       <div style="height:6px;border-radius:6px;background:#0d1117;overflow:hidden;margin-bottom:15px">
@@ -251,7 +252,14 @@ function toast(msg){
   _toastTimer=setTimeout(()=>el.classList.remove('show'), 4200);
 }
 
-let _lastProjOpen=false;
+function fitWindow(){
+  const a = (window.pywebview && window.pywebview.api) ? window.pywebview.api : null;
+  if(!a || !a.fit_height) return;
+  const root = document.getElementById('root');
+  if(!root) return;
+  a.fit_height(Math.ceil(root.getBoundingClientRect().height), window.innerHeight);
+}
+
 function render(st){
   const app=document.getElementById('app');
   const sel=document.getElementById('proj');
@@ -261,6 +269,8 @@ function render(st){
   app.innerHTML=tpl(st, v);
   document.getElementById('proj').addEventListener('change', onProjectChange);
   app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
+  // Resize the native window to fit the freshly-rendered content.
+  requestAnimationFrame(fitWindow);
 }
 
 async function api(){ return (window.pywebview && window.pywebview.api) ? window.pywebview.api : null; }
@@ -293,6 +303,8 @@ async function onAction(e){
 function boot(){
   refresh();
   setInterval(refresh, 1500);
+  // Fonts load async and can reflow height — re-fit once they're ready.
+  if(document.fonts && document.fonts.ready){ document.fonts.ready.then(()=>setTimeout(fitWindow, 30)); }
 }
 if(window.pywebview){ boot(); }
 else { window.addEventListener('pywebviewready', boot); }

@@ -71,6 +71,15 @@ For development:
 pip install kicad-mcp[dev]
 ```
 
+For the desktop launcher (a status dashboard that brings up the whole stack — see
+[Desktop Launcher](#desktop-launcher-ui) below):
+```bash
+pip install kicad-mcp[launcher]   # pywebview + psutil
+```
+On Windows the launcher uses the system **WebView2** runtime (preinstalled on
+Windows 11). It is a standalone dev tool run from source and is **not** part of the
+MCP server install.
+
 ## Claude Code Skill: `/build-pcb`
 
 When using this server with Claude Code, invoke `/build-pcb [project description]` to
@@ -122,6 +131,40 @@ python -m kicad_mcp_plugin
 ```bash
 python -m kicad_mcp_plugin --transport sse --sse-host 127.0.0.1 --sse-port 8765
 ```
+
+## Desktop Launcher (UI)
+
+A standalone desktop app that brings up and monitors the whole KiCad ↔ MCP stack
+from one window — so you don't have to start pcbnew, the MCP server, and Claude Code
+by hand. It's a **status-first dashboard** that shows, live, whether an AI agent can
+currently reach and edit a board.
+
+**What it shows** (all real, polled from the same health collectors the MCP uses —
+no mock data):
+
+- **pcbnew bridge** and **MCP server** status tiles (connected / running / pid / uptime)
+- the **`ready_for_pcb` gate** — a live `n/6` progress bar over the six startup checks
+- the four **backends** (`plugin`, `file`, `cli`, `subprocess`) and their availability
+- **tool-activity** and **server.log** feeds (only real events — quiet when idle)
+- an **actionable guidance** callout that turns a passive status into the next step
+  (server stopped → *Start everything*; bridge down → *Open PCB editor*; checks
+  incomplete → *Reload board*)
+
+**Actions**: a project picker plus **Start everything** (opens pcbnew on the selected
+board, starts the MCP HTTP server, and launches a Claude Code session), **Restart MCP**
+(reloads server code without the manual kill + `/mcp`), and **Stop MCP**.
+
+**Run it** (after `pip install kicad-mcp[launcher]`):
+
+```bash
+python -m launcher
+```
+
+On Windows you can also double-click / run `launcher/launcher.ps1` for a windowless
+(`pythonw`) launch. The launcher never modifies the MCP server or the bridge; it
+reuses `scripts/mcp_health_monitor.py`'s collectors for status and drives the same
+tools you'd call by hand. Configure it with the same environment variables as the
+server (e.g. `KICAD_MCP_HTTP_HOST`/`KICAD_MCP_HTTP_PORT`, `KICAD_MCP_PROJECTS_ROOT`).
 
 ## Configuration
 
@@ -493,6 +536,14 @@ KiCad-MCP/
 ├── kicad_plugin/
 │   ├── kicad_mcp_bridge.py  # KiCad ActionPlugin — TCP bridge (installed into KiCad)
 │   └── install_bridge.ps1   # PowerShell installer (Windows, PowerShell 7+)
+├── launcher/               # Desktop launcher (pywebview dashboard — see Desktop Launcher)
+│   ├── app.py              #   webview host + LauncherApi (start/stop/restart, status)
+│   ├── dashboard.py        #   pure collect()-snapshot → UI state mapping
+│   ├── processes.py        #   pcbnew / MCP-server / Claude process control
+│   ├── recents.py, config.py, orchestrator.py  # picker, config, bring-up logic
+│   └── ui/index.html       #   the dark status-first dashboard (HTML/CSS/JS)
+├── scripts/
+│   └── mcp_health_monitor.py  # health collectors (reused by the launcher for status)
 ├── tests/                 # pytest suite (mocked _tcp_call — no live KiCad needed)
 ├── examples/              # Local-only worked builds (gitignored — see Examples section)
 ├── run_plugin.ps1         # Windows launcher for kicad_mcp_plugin (auto-creates venv)

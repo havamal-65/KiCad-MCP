@@ -158,6 +158,7 @@ function fragToolbar(v, pad){
     <button class="tool" data-act="reveal">Reveal in Explorer</button>
     <button class="tool" data-act="copyCfg">Copy MCP config</button>
     <button class="tool" data-act="reinstallBridge">Reinstall bridge</button>
+    <button class="tool" data-act="openSetup">Setup</button>
     ${layout}${tray}
   </div>`;
 }
@@ -232,6 +233,69 @@ function fragLogs(v){
       : `<div style="font:400 11.5px/1.5 var(--mono);color:#5f6b7c">no recent warnings</div>`;
 }
 
+/* ---------- setup view (U3) ---------- */
+
+let VIEW='dashboard';   // 'dashboard' | 'setup'
+let SETUP=null;         // {items:[…], ok:bool} — fetched on demand, never on the poll
+
+const FIX_LABEL={install_bridge:'Install / update bridge', register_claude:'Register with Claude Code', open_kicad_download:'Get KiCad'};
+const SETUP_STATUS={pass:['OK',GREEN], fail:['NEEDS ATTENTION',RED], stale:['UPDATE AVAILABLE',AMBER], optional_missing:['NOT FOUND',DIM], unknown:['UNKNOWN',DIM]};
+
+function setupBroken(items){ return items.filter(i=>i.required && (i.status==='fail'||i.status==='stale')); }
+
+function fragSetupBanner(margin){
+  if(!SETUP || SETUP.ok || VIEW==='setup') return '';
+  const n = setupBroken(SETUP.items).length;
+  return `<div style="margin:${margin};background:${RED}12;border:1px solid ${RED}38;border-radius:11px;padding:11px 14px;display:flex;align-items:center;gap:11px">
+    <span style="width:14px;height:14px;border-radius:50%;background:${RED};display:flex;align-items:center;justify-content:center;font:700 10px var(--sans);color:#0d1117;flex:none">!</span>
+    <span style="flex:1;min-width:0;font:400 12px/1.5 var(--sans);color:#c8cfda">Setup incomplete — ${n} item${n===1?'':'s'} need${n===1?'s':''} attention</span>
+    <button data-act="openSetup" style="flex:none;background:${RED};color:#0d1117;border:none;border-radius:8px;padding:7px 12px;font:600 12px/1 var(--sans);cursor:pointer">Open setup</button>
+  </div>`;
+}
+
+function tplSetup(){
+  const items=(SETUP&&SETUP.items)||[];
+  const ok=SETUP?SETUP.ok:true;
+  const rows=items.length ? items.map(i=>{
+    const [text,color]=SETUP_STATUS[i.status]||['?',DIM];
+    const fixBtn=(i.fix && i.status!=='pass')
+      ? `<button data-fix="${esc(i.fix)}" style="flex:none;background:${color===DIM?'#1c2230':color};color:${color===DIM?'#c8cfda':'#0d1117'};border:none;border-radius:8px;padding:8px 13px;font:600 12px/1 var(--sans);cursor:pointer">${esc(FIX_LABEL[i.fix]||i.fix)}</button>`
+      : '';
+    return `<div style="background:#161b26;border:1px solid rgba(255,255,255,.06);border-radius:13px;padding:14px 17px;display:flex;align-items:center;gap:13px">
+      <span style="width:9px;height:9px;border-radius:50%;background:${color};box-shadow:0 0 9px ${color};flex:none"></span>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap">
+          <span style="font:600 13.5px/1 var(--disp);color:#e6e9ef">${esc(i.label)}</span>
+          <span style="font:500 10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:#5f6b7c">${i.required?'required':'optional'}</span>
+          <span style="font:600 10.5px/1 var(--mono);letter-spacing:.06em;color:${color}">${text}</span>
+        </div>
+        <div style="font:400 11.5px/1.5 var(--mono);color:#9aa4b2;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(i.detail)}">${esc(i.detail)}</div>
+      </div>
+      ${fixBtn}
+    </div>`;
+  }).join('') : `<div style="font:400 12px/1.6 var(--mono);color:#5f6b7c;padding:6px 2px">checking…</div>`;
+  const vColor = items.length ? (ok?GREEN:RED) : DIM;
+  const vText = items.length ? (ok?'READY TO USE':'SETUP INCOMPLETE') : 'CHECKING…';
+  return `
+  <div id="root" style="width:100%;background:#0d1117;font-family:var(--sans);color:#e6e9ef">
+    <div style="display:flex;align-items:center;gap:12px;padding:20px 22px 14px;border-bottom:1px solid rgba(255,255,255,.06)">
+      <button class="tool" data-act="backDash">← Dashboard</button>
+      <div style="font:600 15px/1 var(--disp);letter-spacing:-.01em">Setup</div>
+      <div style="display:flex;align-items:center;gap:7px;padding:4px 10px;border-radius:20px;white-space:nowrap;background:${vColor}14;border:1px solid ${vColor}40">
+        <span style="width:7px;height:7px;border-radius:50%;background:${vColor};box-shadow:0 0 8px ${vColor}"></span>
+        <span style="font:600 11px/1 var(--mono);letter-spacing:.06em;color:${vColor}">${vText}</span>
+      </div>
+      <div style="flex:1"></div>
+      <button class="tool" data-act="recheckSetup">Re-check</button>
+    </div>
+    <div style="padding:16px 22px 8px;display:flex;flex-direction:column;gap:10px">${rows}</div>
+    <div style="padding:6px 24px 20px;font:400 11px/1.6 var(--mono);color:#5f6b7c">
+      Fixes re-verify before reporting. Claude Code registration is added at user scope
+      (available from any folder); this repo's own project-scope config always takes precedence here.
+    </div>
+  </div>`;
+}
+
 /* ---------- console (narrow) variant ---------- */
 
 function tplConsole(v){
@@ -267,6 +331,7 @@ function tplConsole(v){
     </div>
 
     ${fragToolbar(v, '4px 22px 12px')}
+    ${fragSetupBanner('0 22px 12px')}
     ${fragDiags(v, '0 22px 12px')}
 
     <div style="display:flex;gap:12px;padding:0 22px 18px">
@@ -330,6 +395,7 @@ function tplBento(v){
     </div>
 
     ${fragToolbar(v, '12px 24px 0')}
+    ${fragSetupBanner('12px 24px 0')}
     ${fragDiags(v, '12px 24px 0')}
 
     <div style="padding:16px 24px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14px">
@@ -397,11 +463,20 @@ function fitWindow(){
   a.fit_height(Math.ceil(root.getBoundingClientRect().height), window.innerHeight);
 }
 
+let LAST_ST={};
 function render(st){
+  if(st) LAST_ST=st;
   const app=document.getElementById('app');
+  if(VIEW==='setup'){
+    app.innerHTML = tplSetup();
+    app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
+    app.querySelectorAll('button[data-fix]').forEach(b=>b.addEventListener('click', onFix));
+    requestAnimationFrame(fitWindow);
+    return;
+  }
   const sel=document.getElementById('proj');
   if(sel && document.activeElement===sel) return;   // don't clobber an open dropdown
-  const v=renderVals(st);
+  const v=renderVals(LAST_ST);
   app.innerHTML = v.variant==='bento' ? tplBento(v) : tplConsole(v);
   document.getElementById('proj').addEventListener('change', onProjectChange);
   app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
@@ -412,7 +487,11 @@ async function api(){ return (window.pywebview && window.pywebview.api) ? window
 
 async function refresh(){
   const a=await api(); if(!a) return;
-  try{ const st=await a.get_state(); render(st); }catch(e){ /* transient */ }
+  try{
+    const st=await a.get_state();
+    if(VIEW==='setup'){ LAST_ST=st; }   // setup state is NOT re-fetched on the poll
+    else render(st);
+  }catch(e){ /* transient */ }
 }
 
 async function onProjectChange(e){
@@ -436,7 +515,27 @@ const ACTIONS = {
   variantBento: a=>a.set_variant('bento'),
   variantConsole: a=>a.set_variant('console'),
   tray: a=>a.hide_to_tray(),
+  openSetup: async a=>{ VIEW='setup'; render(); SETUP=await a.get_setup_state(true); render(); return null; },
+  backDash: async a=>{ VIEW='dashboard'; render(); return null; },
+  recheckSetup: async a=>{ SETUP=await a.get_setup_state(true); render(); return null; },
 };
+
+async function onFix(e){
+  const btn=e.currentTarget, key=btn.getAttribute('data-fix');
+  const a=await api(); if(!a) return;
+  btn.disabled=true; btn.textContent='Working…';
+  let res=null;
+  try{ res=await a.run_fix(key); }
+  catch(err){ toast('fix failed: '+err); }
+  if(res){
+    if(res.item && SETUP){
+      SETUP.items=SETUP.items.map(i=>i.key===res.item.key?res.item:i);
+      SETUP.ok=setupBroken(SETUP.items).length===0;
+    }
+    if(res.messages && res.messages.length) toast(res.messages.join('\n'));
+  }
+  render();
+}
 
 async function onAction(e){
   const act=e.currentTarget.getAttribute('data-act');
@@ -451,6 +550,11 @@ async function onAction(e){
 function boot(){
   refresh();
   setInterval(refresh, 1500);
+  // One boot-time setup check — a broken install is never silent (REQ-WIZ-002).
+  (async()=>{
+    const a=await api(); if(!a || !a.get_setup_state) return;
+    try{ SETUP=await a.get_setup_state(); if(!SETUP.ok) render(); }catch(e){}
+  })();
   if(document.fonts && document.fonts.ready){ document.fonts.ready.then(()=>setTimeout(fitWindow, 30)); }
 }
 if(window.pywebview){ boot(); }

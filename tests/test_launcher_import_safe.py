@@ -31,6 +31,7 @@ import launcher.orchestrator
 import launcher.processes
 import launcher.dashboard
 import launcher.settings
+import launcher.setup_core
 
 assert "tkinter" not in sys.modules, "a core module imported tkinter at load"
 assert "webview" not in sys.modules, "a core module imported webview at load"
@@ -63,6 +64,7 @@ def test_gui_modules_are_the_only_tkinter_importers():
         "launcher.processes",
         "launcher.dashboard",
         "launcher.settings",
+        "launcher.setup_core",
     ):
         mod = importlib.import_module(name)
         assert mod is not None

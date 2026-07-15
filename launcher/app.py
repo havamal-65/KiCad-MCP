@@ -16,6 +16,7 @@ Only this module imports pywebview/pystray; the core stays import-safe.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import subprocess
@@ -26,7 +27,7 @@ from typing import Any
 
 import webview
 
-from launcher import dashboard, processes, recents, settings
+from launcher import dashboard, processes, recents, settings, setup_core
 from launcher.config import LauncherConfig, connect_info, load_config
 from launcher.orchestrator import classify_failures, plan_bringup
 
@@ -137,6 +138,9 @@ class LauncherApi:
         self._claude_ok = shutil.which("claude") is not None
         # Bridge-transition tracking for notifications.
         self._last_bridge: str | None = None
+        # Setup checklist cache — recomputed on demand + after fixes, never on
+        # the 1.5 s poll (REQ-CHK-005).
+        self._setup_cache: list[setup_core.SetupItem] | None = None
         # Window management.
         self._window: Any = None
         self._outer_h = 0
@@ -405,6 +409,38 @@ class LauncherApi:
         r = processes.launch_pcbnew(board)
         self._poller.refresh_now()
         return {"ok": r.action != "failed", "messages": [_fmt(r)]}
+
+    # ------------------------------------------------------------------ setup
+    def get_setup_state(self, refresh: Any = False) -> dict[str, Any]:
+        """Setup checklist (U3). pywebview dispatches api calls on worker
+        threads, so the (slow) CLI/FS checks never block the UI or the poll."""
+        if self._setup_cache is None or refresh:
+            self._setup_cache = setup_core.collect_setup(self.cfg)
+        items = self._setup_cache
+        return {
+            "items": [dataclasses.asdict(i) for i in items],
+            "ok": setup_core.setup_ok(items),
+        }
+
+    def run_fix(self, key: Any) -> dict[str, Any]:
+        fixes = {
+            "install_bridge": setup_core.fix_install_bridge,
+            "register_claude": lambda: setup_core.fix_register_claude(self.cfg),
+            "open_kicad_download": setup_core.fix_open_kicad_download,
+        }
+        fn = fixes.get(str(key))
+        if fn is None:
+            return {"ok": False, "messages": [f"unknown fix: {key}"]}
+        outcome = fn()
+        if self._setup_cache is not None:
+            self._setup_cache = [
+                outcome.item if i.key == outcome.item.key else i for i in self._setup_cache
+            ]
+        return {
+            "ok": outcome.item.status == "pass",
+            "item": dataclasses.asdict(outcome.item),
+            "messages": [outcome.message],
+        }
 
     def hide_to_tray(self) -> dict[str, Any]:
         if not self._tray.available:

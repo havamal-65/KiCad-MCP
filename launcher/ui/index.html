@@ -457,10 +457,21 @@ function toast(msg){
 
 function fitWindow(){
   const a = (window.pywebview && window.pywebview.api) ? window.pywebview.api : null;
-  if(!a || !a.fit_height) return;
+  if(!a || !a.fit_size) return;
   const root = document.getElementById('root');
   if(!root) return;
-  a.fit_height(Math.ceil(root.getBoundingClientRect().height), window.innerHeight);
+  // Width must never cause truncation: find the widest hidden overflow among
+  // ellipsized elements (and the root itself) and ask for that much more.
+  let overflow = Math.max(0, root.scrollWidth - root.clientWidth);
+  root.querySelectorAll('[style*="ellipsis"]').forEach(el=>{
+    overflow = Math.max(overflow, el.scrollWidth - el.clientWidth);
+  });
+  const contentW = overflow > 0 ? Math.ceil(window.innerWidth + overflow + 6) : 0;
+  const p = a.fit_size(Math.ceil(root.getBoundingClientRect().height), window.innerHeight,
+                       contentW, window.innerWidth);
+  // After a width grow, re-measure once so height settles to the new layout
+  // (terminates: the follow-up finds no overflow and requests no growth).
+  if(contentW && p && p.then) p.then(()=>setTimeout(fitWindow, 90));
 }
 
 let LAST_ST={};

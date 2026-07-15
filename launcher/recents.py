@@ -113,8 +113,12 @@ def discover_projects(roots: list[Path]) -> list[Path]:
         if not root.exists():
             continue
         for pcb in root.rglob("*.kicad_pcb"):
-            # Skip auto-backups and fp-info caches.
-            if any(part.endswith("-backups") for part in pcb.parts):
+            # Skip auto-backups: KiCad's <project>-backups dirs and the MCP's
+            # own .kicad_mcp_backups snapshots.
+            if any(
+                part.endswith("-backups") or part == ".kicad_mcp_backups"
+                for part in pcb.parts
+            ):
                 continue
             found[_norm(str(pcb))] = pcb
     return [found[k] for k in sorted(found)]

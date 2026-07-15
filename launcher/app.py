@@ -145,6 +145,7 @@ class LauncherApi:
         self._window: Any = None
         self._outer_h = 0
         self._chrome: int | None = None
+        self._chrome_w: int | None = None
         self._max_h: int | None = None
         self._tray = _Tray(self._tray_show, self._tray_quit)
 
@@ -203,27 +204,49 @@ class LauncherApi:
             pass
         return 1300
 
-    def fit_height(self, content: Any, viewport: Any) -> dict[str, Any]:
-        """Resize the window so the content area exactly fits `content` px."""
+    def _screen_width(self) -> int:
+        try:
+            screens = webview.screens
+            if screens:
+                return int(screens[0].width) - 72
+        except Exception:
+            pass
+        return 2400
+
+    def fit_size(
+        self, content_h: Any, viewport_h: Any, content_w: Any = 0, viewport_w: Any = 0
+    ) -> dict[str, Any]:
+        """Auto-fit the window to the rendered content: height exactly, width
+        grown whenever content would otherwise truncate (never shrunk — the
+        user's manual width is the floor). Both clamped to the screen."""
         if self._window is None:
             return {"ok": False}
         try:
-            content_px = int(content)
-            viewport_px = int(viewport)
+            content_h_px = int(content_h)
+            viewport_h_px = int(viewport_h)
+            content_w_px = int(content_w or 0)
+            viewport_w_px = int(viewport_w or 0)
         except (TypeError, ValueError):
             return {"ok": False}
-        if self._chrome is None and viewport_px > 0 and self._outer_h > 0:
-            self._chrome = max(0, self._outer_h - viewport_px)
+        if self._chrome is None and viewport_h_px > 0 and self._outer_h > 0:
+            self._chrome = max(0, self._outer_h - viewport_h_px)
+        if self._chrome_w is None and viewport_w_px > 0 and self._width > 0:
+            self._chrome_w = max(0, self._width - viewport_w_px)
         if self._max_h is None:
             self._max_h = self._screen_height()
-        target = max(400, min(content_px + (self._chrome or 0), self._max_h))
-        if abs(target - self._outer_h) > 2:
-            self._outer_h = target
+        target_h = max(400, min(content_h_px + (self._chrome or 0), self._max_h))
+        target_w = self._width
+        if content_w_px > viewport_w_px > 0:
+            needed = content_w_px + (self._chrome_w or 0)
+            target_w = min(max(self._width, needed), self._screen_width())
+        if abs(target_h - self._outer_h) > 2 or abs(target_w - self._width) > 2:
+            self._outer_h = target_h
+            self._width = target_w
             try:
-                self._window.resize(self._width, target)
+                self._window.resize(target_w, target_h)
             except Exception:
                 pass
-        return {"ok": True, "height": target}
+        return {"ok": True, "height": target_h, "width": target_w}
 
     # ------------------------------------------------------------------ state
     def _busy(self) -> str | None:

@@ -105,6 +105,17 @@ def test_discover_projects_finds_boards_skips_backups(tmp_path):
     assert found[0].name == "a.kicad_pcb"
 
 
+def test_discover_projects_skips_mcp_backup_snapshots(tmp_path):
+    root = tmp_path / "projects"
+    (root / "proj_a").mkdir(parents=True)
+    (root / "proj_a" / "a.kicad_pcb").write_text("x", encoding="utf-8")
+    mcp_backups = root / "proj_a" / ".kicad_mcp_backups"
+    mcp_backups.mkdir()
+    (mcp_backups / "a_20260703_221749.kicad_pcb").write_text("x", encoding="utf-8")
+    found = recents.discover_projects([root])
+    assert [p.name for p in found] == ["a.kicad_pcb"]
+
+
 def test_list_for_picker_unions_discovered(tmp_path):
     root = tmp_path / "projects"
     root.mkdir()

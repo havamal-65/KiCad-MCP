@@ -139,6 +139,10 @@ from one window — so you don't have to start pcbnew, the MCP server, and Claud
 by hand. It's a **status-first dashboard** that shows, live, whether an AI agent can
 currently reach and edit a board.
 
+<p align="center">
+  <img src="docs/images/launcher-dashboard.png" alt="KiCad-MCP Launcher — live status dashboard (bridge and MCP server running, 6/6 ready-for-PCB checks green)" width="560">
+</p>
+
 **What it shows** (all real, polled from the same health collectors the MCP uses —
 no mock data):
 

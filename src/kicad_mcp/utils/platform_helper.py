@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from kicad_mcp.logging_config import get_logger
+from kicad_mcp.utils.kicad_version import probe_order
 
 logger = get_logger("platform")
 
@@ -48,7 +49,7 @@ def find_kicad_cli() -> Path | None:
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         for base in [program_files, program_files_x86]:
-            for version in ["9.0", "8.0", "7.0"]:
+            for version in probe_order():
                 candidates.append(Path(base) / "KiCad" / version / "bin" / "kicad-cli.exe")
 
     elif platform == "macos":
@@ -83,7 +84,7 @@ def find_kicad_template_dir() -> Path | None:
 
     if platform == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        for version in ["9.0", "8.0", "7.0"]:
+        for version in probe_order():
             candidate = Path(program_files) / "KiCad" / version / "share" / "kicad" / "template"
             if candidate.exists():
                 return candidate
@@ -115,7 +116,7 @@ def find_kicad_python_paths() -> list[Path]:
 
     if platform == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        for version in ["9.0", "8.0", "7.0"]:
+        for version in probe_order():
             p = Path(program_files) / "KiCad" / version / "bin" / "Lib" / "site-packages"
             if p.exists():
                 paths.append(p)
@@ -181,7 +182,7 @@ def find_kicad_executable() -> Path | None:
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         for base in [program_files, program_files_x86]:
-            for version in ["9.0", "8.0", "7.0"]:
+            for version in probe_order():
                 candidate = Path(base) / "KiCad" / version / "bin" / "kicad.exe"
                 if candidate.exists():
                     return candidate
@@ -352,7 +353,7 @@ def find_pcbnew_executable() -> Path | None:
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
         program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         for base in [program_files, program_files_x86]:
-            for version in ["9.0", "8.0", "7.0"]:
+            for version in probe_order():
                 candidate = Path(base) / "KiCad" / version / "bin" / "pcbnew.exe"
                 if candidate.exists():
                     return candidate
@@ -612,13 +613,13 @@ def find_freerouting_jar(java_version: int | None = None) -> Path | None:
     if platform == "windows":
         appdata = os.environ.get("APPDATA")
         if appdata:
-            for version in ["9.0", "8.0", "7.0"]:
+            for version in probe_order():
                 search_dirs.append(
                     Path(appdata) / "kicad" / version / "3rdparty" / "plugins"
                     / "com_github_freerouting_freerouting" / "plugins" / "jar"
                 )
         documents = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
-        for version in ["9.0", "8.0", "7.0"]:
+        for version in probe_order():
             search_dirs.append(
                 documents / "KiCad" / version / "3rdparty" / "plugins"
                 / "com_github_freerouting_freerouting" / "plugins" / "jar"

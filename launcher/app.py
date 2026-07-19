@@ -446,15 +446,21 @@ class LauncherApi:
         }
 
     def run_fix(self, key: Any) -> dict[str, Any]:
+        key_str = str(key)
         fixes = {
             "install_bridge": setup_core.fix_install_bridge,
             "register_claude": lambda: setup_core.fix_register_claude(self.cfg),
             "open_kicad_download": setup_core.fix_open_kicad_download,
         }
-        fn = fixes.get(str(key))
-        if fn is None:
-            return {"ok": False, "messages": [f"unknown fix: {key}"]}
-        outcome = fn()
+        # Per-version dynamic fix: enable_api_server_<version> (e.g. 10.0).
+        if key_str.startswith("enable_api_server_"):
+            version = key_str.removeprefix("enable_api_server_")
+            outcome = setup_core.fix_enable_api_server(version)
+        else:
+            fn = fixes.get(key_str)
+            if fn is None:
+                return {"ok": False, "messages": [f"unknown fix: {key}"]}
+            outcome = fn()
         if self._setup_cache is not None:
             self._setup_cache = [
                 outcome.item if i.key == outcome.item.key else i for i in self._setup_cache

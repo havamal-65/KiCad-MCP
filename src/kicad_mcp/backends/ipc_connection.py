@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kicad_mcp.logging_config import get_logger
@@ -80,26 +79,17 @@ def _get_timeout_ms() -> int:
         return _DEFAULT_TIMEOUT_MS
 
 
-def _kicad_config_root() -> Path | None:
-    """Directory holding per-version KiCad config dirs (…/kicad/9.0/…)."""
-    if os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        return Path(appdata) / "kicad" if appdata else None
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
-    return base / "kicad"
-
-
 def read_api_server_pref() -> bool | None:
-    """Read ``api.enable_server`` from the newest kicad_common.json.
+    """Read ``api.enable_server`` from the preferred version's kicad_common.json.
 
-    Returns True/False for the pref value, or None when no readable config was
-    found (KiCad not installed, or a layout we don't recognize).
+    Walks the resolver's probe order (preferred version first), returning the
+    first readable pref. Returns True/False for the pref value, or None when no
+    readable config was found (KiCad not installed, or an unrecognized layout).
     """
-    root = _kicad_config_root()
-    if root is None or not root.is_dir():
-        return None
-    for candidate in sorted(root.glob("*/kicad_common.json"), reverse=True):
+    from kicad_mcp.utils.kicad_version import config_dir, probe_order
+
+    for version in probe_order():
+        candidate = config_dir(version) / "kicad_common.json"
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, ValueError):

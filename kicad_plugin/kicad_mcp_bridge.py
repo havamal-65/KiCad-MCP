@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.3.3-noboard"
+_BRIDGE_VERSION = "2.4.0-k10s1"
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +279,44 @@ def _layer_id(board, layer_name: str) -> int:
     return lid
 
 
-_STOCK_FOOTPRINT_DIRS = [
+# Static fallback footprint dirs, used when the running version can't be
+# resolved. See _stock_footprint_dirs().
+_STOCK_FOOTPRINT_FALLBACK = [
     r"C:\Program Files\KiCad\9.0\share\kicad\footprints",
     r"C:\Program Files\KiCad\8.0\share\kicad\footprints",
     "/usr/share/kicad/footprints",
     "/usr/local/share/kicad/footprints",
 ]
+
+
+def _stock_footprint_dirs() -> list:
+    """Stock footprint search dirs, the running KiCad's share dir first.
+
+    Derives major.minor from ``pcbnew.GetBuildVersion()`` (e.g. ``"10.0.4"`` →
+    ``"10.0"``) and prepends that version's Program Files share dir, so a bridge
+    running inside KiCad 10 finds 10's stock footprints instead of a hardcoded
+    9.0 path. The static fallback list follows, and if version detection fails
+    the behavior degrades to exactly that list (REQ-VER-005). Self-contained:
+    the bridge runs in KiCad's embedded Python and cannot import the MCP package.
+    """
+    dirs: list = []
+    try:
+        import re as _re
+
+        import pcbnew
+
+        m = _re.search(r"(\d+)\.(\d+)", pcbnew.GetBuildVersion())
+        if m:
+            major_minor = f"{m.group(1)}.{m.group(2)}"
+            dirs.append(
+                rf"C:\Program Files\KiCad\{major_minor}\share\kicad\footprints"
+            )
+    except Exception:
+        pass  # detection failed → fall back to the static list alone
+    for entry in _STOCK_FOOTPRINT_FALLBACK:
+        if entry not in dirs:
+            dirs.append(entry)
+    return dirs
 
 
 def _parse_fp_lib_table_file(table_path: str) -> dict:
@@ -347,7 +379,7 @@ def _expand_lib_uri(uri: str, project_dir):
         # KiCad path vars are not always exported to os.environ — fall back
         # to the conventional stock locations for the footprint dir.
         if re.fullmatch(r"KICAD\d*_FOOTPRINT_DIR", var):
-            for base in _STOCK_FOOTPRINT_DIRS:
+            for base in _stock_footprint_dirs():
                 if os.path.isdir(base):
                     return base
         raise KeyError(var)
@@ -454,7 +486,7 @@ def _load_footprint(lib_id: str):
         _search_dirs = [
             os.environ.get("KICAD9_FOOTPRINT_DIR", ""),
             os.environ.get("KICAD8_FOOTPRINT_DIR", ""),
-        ] + _STOCK_FOOTPRINT_DIRS
+        ] + _stock_footprint_dirs()
         for base in _search_dirs:
             if not base:
                 continue

@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# Install the KiCad MCP bridge plugin into KiCad 9 on Linux or macOS.
+# Install the KiCad MCP bridge plugin into KiCad on Linux or macOS.
 #
 # SYNOPSIS
-#   ./install_bridge.sh [--version 9.0]
+#   ./install_bridge.sh [--version 10.0]
 #
 # DESCRIPTION
 #   Copies kicad_mcp_bridge.py as __init__.py into the KiCad PCM plugins
 #   directory and patches pcbnew.json so KiCad auto-loads the bridge on
 #   every pcbnew startup without needing a manual "Refresh Plugins" step.
+#
+#   When --version is omitted, the newest installed KiCad is chosen: the
+#   highest \d+.\d+ version directory present under the platform's KiCad data
+#   root (macOS: ~/Library/Preferences/kicad; Linux: $XDG_DATA_HOME/kicad),
+#   falling back to the legacy 9.0 if none is found. This mirrors the
+#   enumerate-newest rule the resolver and install_bridge.ps1 use.
 #
 #   Also removes any stale copies from scripting/plugins/ — those trigger a
 #   sys.modules conflict that silently prevents the bridge from starting
@@ -30,7 +36,7 @@
 
 set -euo pipefail
 
-KICAD_VERSION="9.0"
+KICAD_VERSION=""   # empty → auto-detect newest installed below
 
 # ---------------------------------------------------------------------------
 # Parse args
@@ -65,16 +71,38 @@ fi
 OS="$(uname -s)"
 
 if [[ "$OS" == "Darwin" ]]; then
-    # macOS: KiCad 9 stores user data and config together
-    KICAD_DATA="$HOME/Library/Preferences/kicad/$KICAD_VERSION"
-    KICAD_CONFIG="$HOME/Library/Preferences/kicad/$KICAD_VERSION"
+    # macOS: KiCad stores user data and config together
+    KICAD_DATA_ROOT="$HOME/Library/Preferences/kicad"
+    KICAD_CONFIG_ROOT="$HOME/Library/Preferences/kicad"
 else
     # Linux: XDG Base Directory spec
     XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
     XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-    KICAD_DATA="$XDG_DATA_HOME/kicad/$KICAD_VERSION"
-    KICAD_CONFIG="$XDG_CONFIG_HOME/kicad/$KICAD_VERSION"
+    KICAD_DATA_ROOT="$XDG_DATA_HOME/kicad"
+    KICAD_CONFIG_ROOT="$XDG_CONFIG_HOME/kicad"
 fi
+
+# Auto-detect newest installed version when --version was not given: the highest
+# \d+.\d+ dir under the data root, else the legacy 9.0 default. Portable across
+# GNU (Linux) and BSD (macOS) — a glob loop, no find -printf.
+if [[ -z "$KICAD_VERSION" ]]; then
+    newest=""
+    if [[ -d "$KICAD_DATA_ROOT" ]]; then
+        for d in "$KICAD_DATA_ROOT"/*/; do
+            name="$(basename "$d")"
+            if [[ "$name" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                if [[ -z "$newest" ]] || \
+                   [[ "$(printf '%s\n%s\n' "$newest" "$name" | sort -V | tail -1)" == "$name" ]]; then
+                    newest="$name"
+                fi
+            fi
+        done
+    fi
+    KICAD_VERSION="${newest:-9.0}"
+fi
+
+KICAD_DATA="$KICAD_DATA_ROOT/$KICAD_VERSION"
+KICAD_CONFIG="$KICAD_CONFIG_ROOT/$KICAD_VERSION"
 
 PLUGINS_ROOT="$KICAD_DATA/3rdparty/plugins"
 BRIDGE_DIR="$PLUGINS_ROOT/kicad_mcp_bridge"

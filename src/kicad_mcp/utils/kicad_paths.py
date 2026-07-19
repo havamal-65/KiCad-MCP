@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from kicad_mcp.logging_config import get_logger
+from kicad_mcp.utils.kicad_version import config_dir, probe_order, share_dir
 from kicad_mcp.utils.platform_helper import get_platform
 
 logger = get_logger("paths")
@@ -15,41 +16,18 @@ def get_kicad_user_dir() -> Path | None:
     """Get the KiCad user configuration/data directory.
 
     Returns:
-        Path to KiCad user directory, or None if not found.
+        Path to KiCad user directory (newest resolvable version), or None.
     """
-    platform = get_platform()
+    for version in probe_order():
+        versioned = config_dir(version)
+        if versioned.exists():
+            return versioned
 
-    if platform == "windows":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            user_dir = Path(appdata) / "kicad"
-            # KiCad 7+ uses versioned dirs
-            for version in ["9.0", "8.0", "7.0"]:
-                versioned = user_dir / version
-                if versioned.exists():
-                    return versioned
-            if user_dir.exists():
-                return user_dir
-
-    elif platform == "macos":
-        user_dir = Path.home() / "Library" / "Preferences" / "kicad"
-        for version in ["9.0", "8.0", "7.0"]:
-            versioned = user_dir / version
-            if versioned.exists():
-                return versioned
-        if user_dir.exists():
-            return user_dir
-
-    else:  # linux
-        config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        user_dir = config_home / "kicad"
-        for version in ["9.0", "8.0", "7.0"]:
-            versioned = user_dir / version
-            if versioned.exists():
-                return versioned
-        if user_dir.exists():
-            return user_dir
-
+    # No versioned dir present — fall back to the unversioned base if it exists
+    # (config_dir("") drops the empty version part, yielding …/kicad).
+    base = config_dir("")
+    if base.exists():
+        return base
     return None
 
 
@@ -72,9 +50,8 @@ def get_system_library_paths() -> list[Path]:
                 paths.append(p)
 
     if platform == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        for version in ["9.0", "8.0", "7.0"]:
-            share = Path(program_files) / "KiCad" / version / "share" / "kicad"
+        for version in probe_order():
+            share = share_dir(version)
             if share.exists():
                 for subdir in ["symbols", "footprints", "3dmodels"]:
                     lib_dir = share / subdir

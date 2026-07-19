@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -62,3 +63,34 @@ def test_handle_ping_returns_identity_fields(bridge):
     # pcbnew is not importable in CI → version unknown, no board loaded.
     assert result["kicad_version"] == "unknown"
     assert result["board_path"] is None
+
+
+# ---------------------------------------------------------------------------
+# _stock_footprint_dirs — runtime version derivation (REQ-VER-005)
+# ---------------------------------------------------------------------------
+
+def test_stock_footprint_dirs_fallback_when_pcbnew_absent(bridge):
+    # pcbnew is not importable in CI → degrades to exactly the static fallback.
+    assert bridge._stock_footprint_dirs() == bridge._STOCK_FOOTPRINT_FALLBACK
+
+
+def test_stock_footprint_dirs_prepends_running_version(bridge, monkeypatch):
+    # Inject a fake pcbnew reporting 10.0.4 → its share dir leads the list.
+    fake = types.SimpleNamespace(GetBuildVersion=lambda: "10.0.4")
+    monkeypatch.setitem(sys.modules, "pcbnew", fake)
+    dirs = bridge._stock_footprint_dirs()
+    assert dirs[0] == r"C:\Program Files\KiCad\10.0\share\kicad\footprints"
+    # Fallback entries still present, and the 10.0 dir is not duplicated.
+    assert dirs.count(dirs[0]) == 1
+    for entry in bridge._STOCK_FOOTPRINT_FALLBACK:
+        assert entry in dirs
+
+
+def test_stock_footprint_dirs_no_dup_when_running_version_is_9(bridge, monkeypatch):
+    # Running 9.0 already appears in the fallback → prepended, listed once.
+    fake = types.SimpleNamespace(GetBuildVersion=lambda: "9.0.7")
+    monkeypatch.setitem(sys.modules, "pcbnew", fake)
+    dirs = bridge._stock_footprint_dirs()
+    nine = r"C:\Program Files\KiCad\9.0\share\kicad\footprints"
+    assert dirs[0] == nine
+    assert dirs.count(nine) == 1

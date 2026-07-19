@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -143,13 +144,35 @@ def test_resolve_footprint_dir_default_from_stock(monkeypatch, tmp_path: Path):
 
 
 def test_resolve_3rd_party_default(monkeypatch, tmp_path: Path):
+    # No env var, no relocated config var → resolver's known-folder Documents
+    # default. AR7: resolution never touches an OneDrive literal.
+    from kicad_mcp.utils import kicad_version as kv
+
     monkeypatch.delenv("KICAD9_3RD_PARTY", raising=False)
-    monkeypatch.delenv("OneDrive", raising=False)
     third_party = tmp_path / "Documents" / "KiCad" / "9.0" / "3rdparty"
     third_party.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(kv, "documents_dir", lambda: tmp_path / "Documents")
+    monkeypatch.setattr(kv, "config_dir", lambda v: tmp_path / "no_config" / v)
     resolved = resolve_lib_uri("${KICAD9_3RD_PARTY}/footprints/X.pretty")
     assert resolved == third_party / "footprints" / "X.pretty"
+
+
+def test_resolve_3rd_party_config_first(monkeypatch, tmp_path: Path):
+    # A user-relocated KICAD9_3RD_PARTY in kicad_common.json wins (REQ-VER-003).
+    from kicad_mcp.utils import kicad_version as kv
+
+    monkeypatch.delenv("KICAD9_3RD_PARTY", raising=False)
+    cfg = tmp_path / "cfg" / "9.0"
+    cfg.mkdir(parents=True)
+    relocated = tmp_path / "relocated" / "3rdparty"
+    (relocated / "footprints" / "X.pretty").mkdir(parents=True)
+    (cfg / "kicad_common.json").write_text(
+        json.dumps({"environment": {"vars": {"KICAD9_3RD_PARTY": str(relocated)}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kv, "config_dir", lambda v: tmp_path / "cfg" / v)
+    resolved = resolve_lib_uri("${KICAD9_3RD_PARTY}/footprints/X.pretty")
+    assert resolved == relocated / "footprints" / "X.pretty"
 
 
 # ---------------------------------------------------------------------------

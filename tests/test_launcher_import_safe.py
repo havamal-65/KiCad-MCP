@@ -33,6 +33,10 @@ import launcher.dashboard
 import launcher.settings
 import launcher.setup_core
 
+# The shared version resolver (imported by setup_core's checks) must also be
+# import-safe: stdlib + logging only, no GUI toolkit (REQ-CORE-101).
+import kicad_mcp.utils.kicad_version
+
 assert "tkinter" not in sys.modules, "a core module imported tkinter at load"
 assert "webview" not in sys.modules, "a core module imported webview at load"
 print("IMPORT_SAFE_OK")

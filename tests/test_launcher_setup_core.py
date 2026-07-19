@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from launcher import setup_core
 from launcher.config import LauncherConfig
 from launcher.processes import Result
@@ -164,17 +162,20 @@ def test_setup_ok_all_pass():
 
 def _wire_bridge_paths(monkeypatch, source: Path, installed: Path, poison: list[Path]):
     monkeypatch.setattr(setup_core, "bridge_source_path", lambda: source)
-    monkeypatch.setattr(setup_core, "installed_bridge_path", lambda: installed)
-    monkeypatch.setattr(setup_core, "poison_copies", lambda: poison)
+    monkeypatch.setattr(setup_core, "installed_bridge_path", lambda v: installed)
+    monkeypatch.setattr(setup_core, "poison_copies", lambda v: poison)
+    monkeypatch.setattr(setup_core, "_preferred_version", lambda: "10.0")
 
 
 def test_check_bridge_absent(tmp_path, monkeypatch):
     src = tmp_path / "bridge.py"
     src.write_text(SOURCE, encoding="utf-8")
     _wire_bridge_paths(monkeypatch, src, tmp_path / "missing" / "__init__.py", [])
-    item = setup_core.check_bridge()
+    item = setup_core.check_bridge("10.0")
     assert item.status == "fail"
     assert item.fix == "install_bridge"
+    assert item.key == "bridge_10.0"
+    assert item.required is True  # preferred version
 
 
 def test_check_bridge_current(tmp_path, monkeypatch):
@@ -184,9 +185,18 @@ def test_check_bridge_current(tmp_path, monkeypatch):
     inst.parent.mkdir()
     inst.write_text(SOURCE, encoding="utf-8")
     _wire_bridge_paths(monkeypatch, src, inst, [])
-    item = setup_core.check_bridge()
+    item = setup_core.check_bridge("10.0")
     assert item.status == "pass"
     assert item.fix is None
+
+
+def test_check_bridge_non_preferred_is_optional(tmp_path, monkeypatch):
+    src = tmp_path / "bridge.py"
+    src.write_text(SOURCE, encoding="utf-8")
+    _wire_bridge_paths(monkeypatch, src, tmp_path / "missing" / "__init__.py", [])
+    item = setup_core.check_bridge("9.0")  # preferred is 10.0
+    assert item.key == "bridge_9.0"
+    assert item.required is False
 
 
 def test_check_bridge_stale_flags_fix(tmp_path, monkeypatch):
@@ -196,7 +206,7 @@ def test_check_bridge_stale_flags_fix(tmp_path, monkeypatch):
     inst.parent.mkdir()
     inst.write_text(SOURCE.replace("2.3.3-noboard", "2.3.2"), encoding="utf-8")
     _wire_bridge_paths(monkeypatch, src, inst, [])
-    item = setup_core.check_bridge()
+    item = setup_core.check_bridge("10.0")
     assert item.status == "stale"
     assert item.fix == "install_bridge"
 
@@ -205,7 +215,7 @@ def test_check_bridge_source_missing_is_unknown(tmp_path, monkeypatch):
     _wire_bridge_paths(
         monkeypatch, tmp_path / "nope.py", tmp_path / "installed" / "__init__.py", []
     )
-    item = setup_core.check_bridge()
+    item = setup_core.check_bridge("10.0")
     assert item.status == "unknown"
 
 
@@ -237,8 +247,9 @@ def test_fix_install_bridge_rechecks(monkeypatch):
         setup_core.processes, "reinstall_bridge",
         lambda: Result("bridge", "started", "bridge reinstalled — restart the PCB editor"),
     )
-    fresh = SetupItem("bridge", "pcbnew bridge", True, "pass", "2.3.3-noboard — current", None)
-    monkeypatch.setattr(setup_core, "check_bridge", lambda: fresh)
+    monkeypatch.setattr(setup_core, "_preferred_version", lambda: "10.0")
+    fresh = SetupItem("bridge_10.0", "pcbnew bridge (10.0)", True, "pass", "current", None)
+    monkeypatch.setattr(setup_core, "check_bridge", lambda v: fresh)
     outcome = setup_core.fix_install_bridge()
     assert outcome.item is fresh
     assert "restart the PCB editor" in outcome.message
@@ -249,19 +260,113 @@ def test_fix_install_bridge_failure_still_returns_recheck(monkeypatch):
         setup_core.processes, "reinstall_bridge",
         lambda: Result("bridge", "failed", "pwsh not found on PATH"),
     )
-    still_stale = SetupItem("bridge", "pcbnew bridge", True, "stale", "…", "install_bridge")
-    monkeypatch.setattr(setup_core, "check_bridge", lambda: still_stale)
+    monkeypatch.setattr(setup_core, "_preferred_version", lambda: "10.0")
+    still_stale = SetupItem(
+        "bridge_10.0", "pcbnew bridge (10.0)", True, "stale", "…", "install_bridge"
+    )
+    monkeypatch.setattr(setup_core, "check_bridge", lambda v: still_stale)
     outcome = setup_core.fix_install_bridge()
     assert outcome.item is still_stale
     assert "pwsh not found" in outcome.message
 
 
+# --- check_api_server + fix_enable_api_server ---------------------------------
+
+def _wire_common_json(monkeypatch, tmp_path, version, payload):
+    cfg = tmp_path / "kicad" / version
+    cfg.mkdir(parents=True, exist_ok=True)
+    if payload is not None:
+        (cfg / "kicad_common.json").write_text(__import__("json").dumps(payload), encoding="utf-8")
+    from kicad_mcp.utils import kicad_version as kv
+    monkeypatch.setattr(kv, "config_dir", lambda v: tmp_path / "kicad" / v)
+    monkeypatch.setattr(setup_core, "_preferred_version", lambda: "10.0")
+
+
+def test_check_api_server_enabled_is_pass(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {"enable_server": True}})
+    item = setup_core.check_api_server("10.0")
+    assert item.status == "pass"
+    assert item.key == "api_server_10.0"
+    assert item.required is True
+    assert item.fix is None
+
+
+def test_check_api_server_disabled_flags_fix(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {"enable_server": False}})
+    item = setup_core.check_api_server("10.0")
+    assert item.status == "fail"
+    assert item.fix == "enable_api_server_10.0"
+
+
+def test_check_api_server_missing_key_is_unknown(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {}})
+    item = setup_core.check_api_server("10.0")
+    assert item.status == "unknown"
+    assert item.fix is None
+
+
+def test_check_api_server_missing_file_is_unknown(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", None)
+    item = setup_core.check_api_server("10.0")
+    assert item.status == "unknown"
+
+
+def test_fix_enable_api_server_refuses_while_running(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {"enable_server": False}})
+    monkeypatch.setattr(setup_core, "_kicad_version_running", lambda v: True)
+    outcome = setup_core.fix_enable_api_server("10.0")
+    assert outcome.item.status == "fail"  # unchanged — not flipped
+    assert "close KiCad 10.0" in outcome.message
+
+
+def test_fix_enable_api_server_refuses_when_uncertain(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {"enable_server": False}})
+    monkeypatch.setattr(setup_core, "_kicad_version_running", lambda v: None)
+    outcome = setup_core.fix_enable_api_server("10.0")
+    assert outcome.item.status == "fail"
+    assert "cannot confirm" in outcome.message
+
+
+def test_fix_enable_api_server_flips_when_closed(tmp_path, monkeypatch):
+    _wire_common_json(monkeypatch, tmp_path, "10.0", {"api": {"enable_server": False}})
+    monkeypatch.setattr(setup_core, "_kicad_version_running", lambda v: False)
+    outcome = setup_core.fix_enable_api_server("10.0")
+    assert outcome.item.status == "pass"
+    assert "enabled api.enable_server" in outcome.message
+    # File actually rewritten with the flag true.
+    import json as _json
+    data = _json.loads((tmp_path / "kicad" / "10.0" / "kicad_common.json").read_text())
+    assert data["api"]["enable_server"] is True
+
+
+def test_fix_enable_api_server_preserves_other_keys(tmp_path, monkeypatch):
+    _wire_common_json(
+        monkeypatch, tmp_path, "10.0",
+        {"api": {"enable_server": False, "interpreter_path": "X"}, "other": 1},
+    )
+    monkeypatch.setattr(setup_core, "_kicad_version_running", lambda v: False)
+    setup_core.fix_enable_api_server("10.0")
+    import json as _json
+    data = _json.loads((tmp_path / "kicad" / "10.0" / "kicad_common.json").read_text())
+    assert data["api"]["interpreter_path"] == "X"
+    assert data["other"] == 1
+
+
 # --- collect_setup ordering ---------------------------------------------------------
 
 def test_collect_setup_order_and_keys(tmp_path, monkeypatch):
-    for name in ("check_kicad", "check_bridge", "check_claude_cli", "check_java"):
+    for name in ("check_kicad", "check_claude_cli", "check_java"):
         key = name.removeprefix("check_")
         monkeypatch.setattr(setup_core, name, lambda k=key: _item(key=k))
     monkeypatch.setattr(setup_core, "check_claude_mcp", lambda cfg: _item(key="claude_mcp"))
+    monkeypatch.setattr(setup_core, "_installed_versions", lambda: ["10.0", "9.0"])
+    monkeypatch.setattr(setup_core, "check_bridge", lambda v: _item(key=f"bridge_{v}"))
+    monkeypatch.setattr(setup_core, "check_api_server", lambda v: _item(key=f"api_server_{v}"))
     items = setup_core.collect_setup(_cfg(tmp_path))
-    assert [i.key for i in items] == ["kicad", "bridge", "claude_cli", "claude_mcp", "java"]
+    # kicad, then per-version (bridge + api_server) newest-first, then the rest.
+    assert [i.key for i in items] == [
+        "kicad",
+        "bridge_10.0", "api_server_10.0",
+        "bridge_9.0", "api_server_9.0",
+        "claude_cli", "claude_mcp", "java",
+    ]

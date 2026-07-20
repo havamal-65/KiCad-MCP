@@ -2399,8 +2399,11 @@ class FileSchematicOps(SchematicOps):
         # Find the lib_symbols section
         lib_sym_start = content.find("(lib_symbols")
         if lib_sym_start == -1:
-            # No lib_symbols section — create one before the first (symbol instance
-            first_sym = content.find("(symbol ")
+            # No lib_symbols section — create one before the first (symbol
+            # instance. Delimiter-tolerant: the 10 pretty-printer writes a
+            # newline after "(symbol".
+            first_sym_m = re.search(r"\(symbol[\s(]", content)
+            first_sym = first_sym_m.start() if first_sym_m else -1
             if first_sym == -1:
                 # No symbols at all yet, insert before closing paren
                 last_paren = content.rfind(")")

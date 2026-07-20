@@ -8,6 +8,11 @@ padstack/footprint tokens (``tenting``/``covering``/``plugging``/``capping``/
 board must (a) follow the file's own name-only convention — a coded clause in
 a 10-format file is silently ignored on load — and (b) pass the v10 tokens
 through untouched.
+
+``k10_saved.kicad_sch`` (format 20260306, ``kicad-cli 10 sch upgrade``) covers
+the schematic side: the 10 pretty-printer puts a newline after ``(symbol``
+(≤9 wrote ``(symbol (lib_id`` on one line), which broke every writer that
+located instance blocks with a literal ``"(symbol "`` scan.
 """
 
 from __future__ import annotations
@@ -19,11 +24,21 @@ from pathlib import Path
 
 import pytest
 
-from kicad_mcp.backends.file_backend import FileBoardOps, _file_uses_net_codes
-from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
+from kicad_mcp.backends.file_backend import (
+    FileBoardOps,
+    FileSchematicOps,
+    _file_uses_net_codes,
+)
+from kicad_mcp.utils.sexp_parser import (
+    find_footprint_block_by_reference,
+    find_symbol_block_by_reference,
+)
 
 _K10_FIXTURE = (
     Path(__file__).parent / "fixtures" / "boards" / "k10" / "k10_saved.kicad_pcb"
+)
+_K10_SCH_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "boards" / "k10" / "k10_saved.kicad_sch"
 )
 
 _V10_TOKENS = (
@@ -42,6 +57,13 @@ def k10_board(tmp_path: Path) -> Path:
     board = tmp_path / "k10_saved.kicad_pcb"
     shutil.copy(_K10_FIXTURE, board)
     return board
+
+
+@pytest.fixture
+def k10_sch(tmp_path: Path) -> Path:
+    sch = tmp_path / "k10_saved.kicad_sch"
+    shutil.copy(_K10_SCH_FIXTURE, sch)
+    return sch
 
 
 def _token_counts(content: str) -> dict[str, int]:
@@ -231,3 +253,59 @@ def test_mutation_chain_round_trip(k10_board: Path):
     assert "T14_R2" in refs
     assert "RT_NET" in {n["name"] for n in ops.get_nets(k10_board)}
     assert len(ops.get_tracks(k10_board)) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Schematic — format 20260306 (newline after "(symbol")
+# ---------------------------------------------------------------------------
+
+def test_sch_fixture_is_kicad10_format():
+    content = _K10_SCH_FIXTURE.read_text(encoding="utf-8")
+    assert "(version 20260306)" in content
+    assert 'generator_version "10.0"' in content
+    assert re.search(r"\(symbol\r?\n", content), (
+        "the 10 pretty-printer newline after (symbol is the very thing "
+        "under test — a fixture without it was regenerated with a ≤9 writer"
+    )
+
+
+def test_sch_get_symbols_parses_k10(k10_sch: Path):
+    ops = FileSchematicOps()
+    refs = {s["reference"] for s in ops.get_symbols(k10_sch)}
+    assert len(refs) >= 30
+    assert "C1" in refs
+
+
+def test_sch_find_symbol_block_newline_form(k10_sch: Path):
+    """Regression: the locator scanned for a literal ``"(symbol "`` and
+    missed every instance in a 10-saved schematic — reads worked (sexp
+    tree), all writes raised 'not found'."""
+    content = k10_sch.read_text(encoding="utf-8")
+    located = find_symbol_block_by_reference(content, "C1")
+    assert located is not None
+    block = content[located[0]:located[1] + 1]
+    assert '(property "Reference" "C1"' in block
+    assert '(lib_id "Device:C")' in block
+
+
+def test_sch_update_property_round_trip(k10_sch: Path):
+    ops = FileSchematicOps()
+    ops.update_component_property(k10_sch, "C1", "K10_PROBE", "on")
+    content = k10_sch.read_text(encoding="utf-8")
+    located = find_symbol_block_by_reference(content, "C1")
+    assert located is not None
+    assert '(property "K10_PROBE" "on"' in content[located[0]:located[1] + 1]
+    # Still parseable, symbol count unchanged.
+    assert len(ops.get_symbols(k10_sch)) >= 30
+
+
+def test_sch_move_component_round_trip(k10_sch: Path):
+    ops = FileSchematicOps()
+    result = ops.move_component(k10_sch, "C1", x=123.0, y=45.5)
+    assert result["position"]["x"] == pytest.approx(123.0)
+    moved = next(
+        s for s in FileSchematicOps().get_symbols(k10_sch)
+        if s["reference"] == "C1"
+    )
+    assert moved["position"]["x"] == pytest.approx(123.0)
+    assert moved["position"]["y"] == pytest.approx(45.5)

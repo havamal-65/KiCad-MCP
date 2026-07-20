@@ -74,7 +74,8 @@ def _count_pad_with_net(board_path: str, reference: str, pad_number: str,
             else:
                 continue
             total += 1
-            if re.search(rf'\(net\s+\d+\s+"{re.escape(net_name)}"\s*\)', pad_block):
+            # ≤9 writes (net N "NAME") in pads; 10-saved boards drop the code.
+            if re.search(rf'\(net\s+(?:\d+\s+)?"{re.escape(net_name)}"\s*\)', pad_block):
                 with_net += 1
         return total, with_net
     return 0, 0

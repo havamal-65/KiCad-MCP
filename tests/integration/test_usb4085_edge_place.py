@@ -185,11 +185,17 @@ def test_usb4085_places_gates_and_autoroutes(bridge_session):
         assert "run_freerouter" in step_names, step_names
 
         # The net actually landed as copper: a routed track carries T15_NET.
+        # KiCad ≤9 saves coded nets — (net N "NAME") decl, (net N) in
+        # segments; 10-saved boards are name-only ((net "NAME") everywhere).
         routed = p.read_text(encoding="utf-8")
-        net_m = re.search(rf'\(net\s+(\d+)\s+"{_NET}"\)', routed)
+        net_m = re.search(rf'\(net\s+(?:(\d+)\s+)?"{_NET}"\)', routed)
         assert net_m, "net vanished after autoroute"
+        if net_m.group(1) is not None:
+            seg_pat = rf'\(segment\s.*?\(net\s+{net_m.group(1)}\)'
+        else:
+            seg_pat = rf'\(segment\s.*?\(net\s+"{_NET}"\)'
         assert re.search(
-            rf'\(segment\s.*?\(net\s+{net_m.group(1)}\)', routed, re.DOTALL,
+            seg_pat, routed, re.DOTALL,
         ), "no routed segment on the USB4085 net — autoroute did not route it"
     finally:
         try:

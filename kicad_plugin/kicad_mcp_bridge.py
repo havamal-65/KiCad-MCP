@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.4.0-k10s1"
+_BRIDGE_VERSION = "2.4.1-k10s2"
 
 
 # ---------------------------------------------------------------------------
@@ -1059,13 +1059,25 @@ def _handle_add_via(path: str, x: float, y: float,
         via.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
         via.SetWidth(_mm(size))
         via.SetDrill(_mm(drill))
+
+        # KiCad 10 split VIATYPE_BLIND_BURIED into VIATYPE_BLIND and
+        # VIATYPE_BURIED; 9 has only the combined enum. Resolve lazily per
+        # attribute name — an eager dict raised AttributeError on 10 for
+        # EVERY via type, including plain through-holes.
+        def _via_enum(*names):
+            for name in names:
+                value = getattr(pcbnew, name, None)
+                if value is not None:
+                    return value
+            return pcbnew.VIATYPE_THROUGH
+
         _VIA_TYPES = {
-            "through": pcbnew.VIATYPE_THROUGH,
-            "blind": pcbnew.VIATYPE_BLIND_BURIED,
-            "buried": pcbnew.VIATYPE_BLIND_BURIED,
-            "microvia": pcbnew.VIATYPE_MICROVIA,
+            "through": ("VIATYPE_THROUGH",),
+            "blind": ("VIATYPE_BLIND", "VIATYPE_BLIND_BURIED"),
+            "buried": ("VIATYPE_BURIED", "VIATYPE_BLIND_BURIED"),
+            "microvia": ("VIATYPE_MICROVIA",),
         }
-        via.SetViaType(_VIA_TYPES.get(via_type, pcbnew.VIATYPE_THROUGH))
+        via.SetViaType(_via_enum(*_VIA_TYPES.get(via_type, ("VIATYPE_THROUGH",))))
         if net:
             netinfo = board.FindNet(net)
             if netinfo:

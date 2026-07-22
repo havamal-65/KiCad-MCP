@@ -17,6 +17,70 @@ from kicad_mcp.utils.validation import validate_kicad_path
 logger = get_logger("tools.export")
 
 
+# ── K10-S3 variant gate (REQ-S3F-002, REQ-S3A-001/003/005) ───────────────────
+
+def _serving_cli_path(ops: Any) -> Path | None:
+    """The kicad-cli binary this export will actually run with.
+
+    REQ-S3F-002: key the capability gate on the ops' own resolved path, never
+    a recomputed preference. ``find_kicad_cli()`` is only the fallback for an
+    ops object that doesn't carry one (same resolver, same env → same answer).
+    """
+    cli = getattr(ops, "_cli", None)
+    if isinstance(cli, Path):
+        return cli
+    from kicad_mcp.utils.platform_helper import find_kicad_cli
+    return find_kicad_cli()
+
+
+def _variant_gate(ops: Any, variant: str | list[str] | None, output: str) -> str | None:
+    """Validate + capability-gate a variant-bearing export call.
+
+    Returns a JSON error string the tool returns verbatim, or None to
+    proceed. ``variant=None`` bypasses everything — those calls must keep
+    working on KiCad 9 exactly as before (REQ-S3A-005). Parameter validation
+    (the ``${VARIANT}`` placeholder rule) runs before any subprocess.
+    """
+    from kicad_mcp.models.errors import KicadCapabilityError
+    from kicad_mcp.utils.kicad_capabilities import requires_kicad
+
+    if variant is None:
+        return None
+    if isinstance(variant, list):
+        if not variant:
+            return json.dumps({
+                "status": "error",
+                "error": "parameter_error",
+                "message": "variant list must not be empty; pass None for the default variant",
+            }, indent=2)
+        if "${VARIANT}" not in output:
+            return json.dumps({
+                "status": "error",
+                "error": "parameter_error",
+                "message": (
+                    "Multi-variant export needs the literal ${VARIANT} placeholder in "
+                    "the output path (kicad-cli expands it per variant), e.g. "
+                    "'out/bom_${VARIANT}.csv'."
+                ),
+            }, indent=2)
+
+    cli = _serving_cli_path(ops)
+    if cli is None:
+        return json.dumps({
+            "status": "error",
+            "error": "capability_unavailable",
+            "capability": "variant-exports",
+            "required": "kicad-cli 10.0+ (--variant)",
+            "detected": "kicad-cli not found",
+            "hint": "Install KiCad 10 and ensure kicad-cli is discoverable.",
+        }, indent=2)
+    try:
+        requires_kicad("variant-exports", cli)
+    except KicadCapabilityError as exc:
+        return json.dumps({"status": "error", **exc.payload}, indent=2)
+    return None
+
+
 # ── §6.6 verify_3d_models — 3D model file resolution ─────────────────────────
 # Pure file-read: walks every footprint's (model "…") clause, expands KiCad path
 # variables, and checks the file exists on disk. Records the verdict to the
@@ -142,6 +206,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         path: str,
         output_dir: str,
         layers: list[str] | None = None,
+        variant: str | list[str] | None = None,
     ) -> str:
         """Export Gerber manufacturing files from a PCB board.
 
@@ -150,8 +215,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Args:
             path: Path to .kicad_pcb file.
-            output_dir: Directory to write Gerber files to.
+            output_dir: Directory to write Gerber files to. For a list variant,
+                must contain the literal ${VARIANT} placeholder.
             layers: Optional list of specific layers to export. Exports all enabled layers if not specified.
+            variant: Design variant(s) to export (KiCad 10+). None = the default
+                variant, identical to pre-variant behavior on any KiCad version.
 
         Returns:
             JSON with list of generated files and output directory.
@@ -170,13 +238,20 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             return refusal
 
         out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # A ${VARIANT}-templated dir is expanded by the backend; creating the
+        # literal template dir here would leave junk on disk.
+        if "${VARIANT}" not in output_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
             backend.save_board(p)
             ops = backend.get_export_ops()
-            result = ops.export_gerbers(p, out_dir, layers)
-            change_log.record("export_gerbers", {"path": path, "output_dir": output_dir})
+            gate_error = _variant_gate(ops, variant, output_dir)
+            if gate_error is not None:
+                return gate_error
+            result = ops.export_gerbers(p, out_dir, layers, variant=variant)
+            change_log.record("export_gerbers", {"path": path, "output_dir": output_dir,
+                                                 "variant": variant})
             return json.dumps({"status": "success", **result}, indent=2)
         except Exception as e:
             return json.dumps({
@@ -216,16 +291,22 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         path: str,
         output: str,
         format: str = "csv",
+        variant: str | list[str] | None = None,
+        exclude_dnp: bool = False,
     ) -> str:
         """Export Bill of Materials from a board or schematic.
 
         Args:
             path: Path to .kicad_pcb or .kicad_sch file.
-            output: Output file path.
+            output: Output file path. For a list variant, must contain the
+                literal ${VARIANT} placeholder (expanded per variant).
             format: Output format - 'csv', 'json', 'xml', or 'html'.
+            variant: Design variant(s) to export (KiCad 10+). None = the default
+                variant, identical to pre-variant behavior on any KiCad version.
+            exclude_dnp: Exclude do-not-populate components from the BOM.
 
         Returns:
-            JSON with export result and output file path.
+            JSON with export result and output file path(s).
         """
         p = validate_kicad_path(path)
         out = Path(output)
@@ -241,8 +322,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             if p.suffix == ".kicad_pcb":
                 backend.save_board(p)
             ops = backend.get_export_ops()
-            result = ops.export_bom(p, out, format)
-            change_log.record("export_bom", {"path": path, "output": output, "format": format})
+            gate_error = _variant_gate(ops, variant, output)
+            if gate_error is not None:
+                return gate_error
+            result = ops.export_bom(p, out, format, variant=variant, exclude_dnp=exclude_dnp)
+            change_log.record("export_bom", {"path": path, "output": output, "format": format,
+                                             "variant": variant, "exclude_dnp": exclude_dnp})
             return json.dumps({"status": "success", **result}, indent=2)
         except Exception as e:
             return json.dumps({
@@ -251,12 +336,21 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             })
 
     @mcp.tool()
-    def export_pick_and_place(path: str, output: str) -> str:
+    def export_pick_and_place(
+        path: str,
+        output: str,
+        variant: str | list[str] | None = None,
+        exclude_dnp: bool = False,
+    ) -> str:
         """Export pick-and-place (component placement) file for assembly.
 
         Args:
             path: Path to .kicad_pcb file.
-            output: Output CSV file path.
+            output: Output CSV file path. For a list variant, must contain the
+                literal ${VARIANT} placeholder (expanded per variant).
+            variant: Design variant(s) to export (KiCad 10+). None = the default
+                variant, identical to pre-variant behavior on any KiCad version.
+            exclude_dnp: Exclude do-not-populate components from the placement file.
 
         Returns:
             JSON with export result.
@@ -267,8 +361,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         try:
             backend.save_board(p)
             ops = backend.get_export_ops()
-            result = ops.export_pick_and_place(p, out)
-            change_log.record("export_pick_and_place", {"path": path, "output": output})
+            gate_error = _variant_gate(ops, variant, output)
+            if gate_error is not None:
+                return gate_error
+            result = ops.export_pick_and_place(p, out, variant=variant, exclude_dnp=exclude_dnp)
+            change_log.record("export_pick_and_place", {"path": path, "output": output,
+                                                        "variant": variant,
+                                                        "exclude_dnp": exclude_dnp})
             return json.dumps({"status": "success", **result}, indent=2)
         except Exception as e:
             return json.dumps({
@@ -281,6 +380,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         path: str,
         output: str,
         layers: list[str] | None = None,
+        variant: str | list[str] | None = None,
     ) -> str:
         """Export a board or schematic to PDF.
 
@@ -291,8 +391,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Args:
             path: Path to .kicad_pcb or .kicad_sch file.
-            output: Output PDF file path.
+            output: Output PDF file path. For a list variant, must contain the
+                literal ${VARIANT} placeholder (expanded per variant).
             layers: For board files, optional list of layers to include.
+            variant: Design variant(s) to export — schematic inputs only
+                (KiCad 10+; kicad-cli pcb export pdf has no variant flag).
+                None = the default variant, identical to pre-variant behavior.
 
         Returns:
             JSON with export result and output file path.
@@ -302,6 +406,17 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         p = validate_kicad_path(path)
         out = Path(output)
+
+        if variant is not None and p.suffix == ".kicad_pcb":
+            return json.dumps({
+                "status": "error",
+                "error": "parameter_error",
+                "message": (
+                    "variant is only supported for schematic PDF export "
+                    "(kicad-cli pcb export pdf has no --variant flag). "
+                    "Pass the .kicad_sch path, or drop the variant parameter."
+                ),
+            }, indent=2)
 
         # Verify kicad-cli is available before attempting export
         cli_path = _shutil.which("kicad-cli")
@@ -323,7 +438,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             if p.suffix == ".kicad_pcb":
                 backend.save_board(p)
             ops = backend.get_export_ops()
-            result = ops.export_pdf(p, out, layers)
+            gate_error = _variant_gate(ops, variant, output)
+            if gate_error is not None:
+                return gate_error
+            result = ops.export_pdf(p, out, layers, variant=variant)
 
             # Surface failures: check exit code result and file existence
             if not result.get("success", True):
@@ -338,18 +456,24 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     "kicad_cli_path": cli_path,
                 }, indent=2)
 
-            # Even a zero-exit kicad-cli sometimes produces no file (wrong path, permission issue)
-            if not out.exists():
+            # Even a zero-exit kicad-cli sometimes produces no file (wrong path,
+            # permission issue). Multi-variant calls check every expanded path.
+            expected_files = result.get("output_files") or [str(out)]
+            missing_files = [f for f in expected_files if not Path(f).exists()]
+            if missing_files:
                 return json.dumps({
                     "status": "error",
                     "message": (
-                        f"kicad-cli reported success but output file was not created: {out}. "
+                        "kicad-cli reported success but output file(s) were not created: "
+                        f"{', '.join(missing_files)}. "
                         "Check that the output directory is writable and the path is correct."
                     ),
                     "output_path": str(out),
+                    "missing_files": missing_files,
                 }, indent=2)
 
-            change_log.record("export_pdf", {"path": path, "output": output})
+            change_log.record("export_pdf", {"path": path, "output": output,
+                                             "variant": variant})
             return json.dumps({"status": "success", **result}, indent=2)
         except NotImplementedError:
             return json.dumps({

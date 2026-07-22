@@ -48,13 +48,22 @@ def run_manufacturing_readiness_audit(
     mounting_hole_keepout_mm: float = 3.0,
     fiducial_keepout_mm: float = 1.0,
     routing_channel_pct: float = 20.0,
+    variant: str | None = None,
 ) -> dict[str, Any]:
     """Run the four pre-fab checks and (unless gated) produce the five fab
     artifacts, returning a single ``ready_to_ship`` verdict.
 
-    Returns ``{ready_to_ship, checks, artifacts, blocking_issues, advisories}``.
-    Each check/artifact/export is isolated: a raise is caught and recorded as a
-    failure + blocking issue without aborting the rest (REQ-CHECK-005/REQ-ART-006).
+    ``variant`` (K10-S3, REQ-S3A-002): audit one named design variant — the
+    variant-capable artifact legs (gerbers, BOM, pos) export it and artifacts
+    land under ``<output_dir>/<variant>/`` so variant sets stay separate. None
+    audits the default variant exactly as before. One variant = one verdict;
+    audit multiple variants with multiple calls. The tool layer capability-gates
+    variant-bearing calls before invoking this (REQ-S3A-005).
+
+    Returns ``{ready_to_ship, variant, checks, artifacts, blocking_issues,
+    advisories}``. Each check/artifact/export is isolated: a raise is caught and
+    recorded as a failure + blocking issue without aborting the rest
+    (REQ-CHECK-005/REQ-ART-006).
     """
     from kicad_mcp.tools.board import run_verify_board_size
     from kicad_mcp.tools.drc import run_check_courtyard_overlaps
@@ -160,7 +169,8 @@ def run_manufacturing_readiness_audit(
             artifacts.append({"name": name, "generated": False,
                               "detail": {"skipped": "drc_failed"}})
     else:
-        output_dir.mkdir(parents=True, exist_ok=True)
+        artifact_dir = output_dir / variant if variant is not None else output_dir
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         export = backend.get_export_ops()
 
         def _artifact(name: str, fn: Callable[[], Any],
@@ -190,19 +200,24 @@ def run_manufacturing_readiness_audit(
                                  "detail": {"message": res.get("message")}})
             artifacts.append(entry)
 
-        _artifact("gerbers", lambda: export.export_gerbers(board_path, output_dir / "gerbers", None),
+        _artifact("gerbers", lambda: export.export_gerbers(
+                      board_path, artifact_dir / "gerbers", None, variant=variant),
                   "files", "output_files")
-        _artifact("drill", lambda: export.export_drill(board_path, output_dir / "drill"),
+        # drill/step have no variant surface (holes and 3D body are physical);
+        # they still land in the variant dir so each variant's package is complete.
+        _artifact("drill", lambda: export.export_drill(board_path, artifact_dir / "drill"),
                   "output_path", "output_dir")
         # BOM is generated from the schematic (kicad-cli `sch export bom`); the
         # sibling .kicad_sch is the canonical source — the board path is not.
         sch_path = board_path.with_suffix(".kicad_sch")
         bom_source = sch_path if sch_path.exists() else board_path
-        _artifact("bom", lambda: export.export_bom(bom_source, output_dir / "bom.csv", "csv"),
+        _artifact("bom", lambda: export.export_bom(
+                      bom_source, artifact_dir / "bom.csv", "csv", variant=variant),
                   "output_path", "_first_file")
-        _artifact("pos", lambda: export.export_pick_and_place(board_path, output_dir / "pos.csv"),
+        _artifact("pos", lambda: export.export_pick_and_place(
+                      board_path, artifact_dir / "pos.csv", variant=variant),
                   "output_path", "_first_file")
-        _artifact("step", lambda: export.export_step(board_path, output_dir / "model.step"),
+        _artifact("step", lambda: export.export_step(board_path, artifact_dir / "model.step"),
                   "output_path", "output_file")
 
     # ── verdict (REQ-VERDICT-001/004) ────────────────────────────────────────
@@ -216,6 +231,7 @@ def run_manufacturing_readiness_audit(
 
     return {
         "ready_to_ship": ready,
+        "variant": variant,
         "checks": checks,
         "artifacts": artifacts,
         "blocking_issues": blocking,
@@ -235,6 +251,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         mounting_hole_keepout_mm: float = 3.0,
         fiducial_keepout_mm: float = 1.0,
         routing_channel_pct: float = 20.0,
+        variant: str | None = None,
     ) -> str:
         """Run a one-call manufacturing-readiness audit: all pre-fab checks plus
         the five fab artifacts, returning a structured ship/no-ship verdict.
@@ -255,11 +272,28 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mounting_hole_keepout_mm: Board-size tolerance — mounting-hole keepout.
             fiducial_keepout_mm: Board-size tolerance — fiducial keepout.
             routing_channel_pct: Board-size tolerance — routing-channel headroom %.
+            variant: Audit one named design variant (KiCad 10+): variant-capable
+                artifacts (gerbers, BOM, pos) export it and everything lands under
+                output_dir/<variant>/. None audits the default variant as before.
+                Variant projects: run once per shipping variant.
 
         Returns:
-            JSON: {ready_to_ship, checks, artifacts, blocking_issues, advisories}.
+            JSON: {ready_to_ship, variant, checks, artifacts, blocking_issues, advisories}.
         """
         p = validate_kicad_path(board_path, ".kicad_pcb")
+
+        # K10-S3 gate (REQ-S3A-005): a variant-bearing audit on a CLI without
+        # variant support refuses up front — never a silent default-variant run.
+        if variant is not None:
+            from kicad_mcp.tools.export import _variant_gate
+            try:
+                ops = backend.get_export_ops()
+            except Exception:
+                ops = None
+            gate_error = _variant_gate(ops, variant, output_dir)
+            if gate_error is not None:
+                return gate_error
+
         result = run_manufacturing_readiness_audit(
             backend, p, Path(output_dir),
             skip_artifacts=skip_artifacts,
@@ -267,8 +301,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mounting_hole_keepout_mm=mounting_hole_keepout_mm,
             fiducial_keepout_mm=fiducial_keepout_mm,
             routing_channel_pct=routing_channel_pct,
+            variant=variant,
         )
         change_log.record("manufacturing_readiness_audit",
                           {"board_path": board_path, "output_dir": output_dir,
-                           "ready_to_ship": result["ready_to_ship"]})
+                           "ready_to_ship": result["ready_to_ship"],
+                           "variant": variant})
         return json.dumps(result, indent=2)

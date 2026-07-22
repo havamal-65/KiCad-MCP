@@ -24,6 +24,47 @@ CLI_TIMEOUT = 120  # seconds
 EXPORT_3D_TIMEOUT = 300  # 5 minutes for 3D exports
 
 
+def _variant_flags(variant: str | list[str] | None) -> list[str]:
+    """``--variant`` argv fragment (K10-S3). ``None`` → empty: the argv is
+    byte-identical to pre-variant behavior (REQ-S3A-001, unit-guarded)."""
+    if variant is None:
+        return []
+    names = [variant] if isinstance(variant, str) else list(variant)
+    flags: list[str] = []
+    for name in names:
+        flags += ["--variant", name]
+    return flags
+
+
+def _expected_outputs(output: Path, variant: str | list[str] | None) -> list[Path]:
+    """The artifact paths a call will produce: the literal *output* normally;
+    when the path carries the ``${VARIANT}`` template, the per-variant
+    expansion (for existence checks/reporting)."""
+    if variant is None or "${VARIANT}" not in str(output):
+        return [output]
+    names = [variant] if isinstance(variant, str) else list(variant)
+    return [Path(str(output).replace("${VARIANT}", v)) for v in names]
+
+
+def _variant_calls(
+    output: Path, variant: str | list[str] | None,
+) -> list[tuple[list[str], Path]]:
+    """(variant flags, concrete output path) — one CLI invocation per entry.
+
+    A variant list is expanded CLIENT-side into one single-``--variant`` call
+    per name: kicad-cli 10.0.4's own multi-``--variant``/``${VARIANT}`` loop
+    writes default-variant content into every templated file (verified live
+    2026-07-21 — upstream defect), while single-variant calls are correct.
+    Per-variant calls stay byte-identical if/when upstream fixes the loop.
+    """
+    if isinstance(variant, list):
+        return [
+            (["--variant", name], Path(str(output).replace("${VARIANT}", name)))
+            for name in variant
+        ]
+    return [(_variant_flags(variant), _expected_outputs(output, variant)[0])]
+
+
 class CLIExportOps(ExportOps):
     """Export operations via kicad-cli subprocess."""
 
@@ -50,38 +91,53 @@ class CLIExportOps(ExportOps):
 
     def export_gerbers(
         self, board_path: Path, output_dir: Path, layers: list[str] | None = None,
+        *, variant: str | list[str] | None = None,
     ) -> dict[str, Any]:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        args = [
-            "pcb", "export", "gerbers",
-            "--output", str(output_dir) + "/",
-            str(board_path),
+        # Multi-variant: output_dir carries ${VARIANT}; one gerber call per
+        # expanded dir (client-side loop — see _variant_calls), never the
+        # literal template dir.
+        results: list[subprocess.CompletedProcess[str]] = []
+        out_dirs: list[Path] = []
+        for flags, d in _variant_calls(output_dir, variant):
+            d.mkdir(parents=True, exist_ok=True)
+            out_dirs.append(d)
+            args = [
+                "pcb", "export", "gerbers",
+                "--output", str(d) + "/",
+                *flags,
+                str(board_path),
+            ]
+            if layers:
+                for layer in layers:
+                    args.insert(-1, "--layers")
+                    args.insert(-1, layer)
+            results.append(self._run(args))
+
+        # Also export drill files — drill has no variant surface (holes are
+        # physical, identical across variants); one copy per output dir so
+        # every variant's fab package is complete.
+        for d in out_dirs:
+            drill_args = [
+                "pcb", "export", "drill",
+                "--output", str(d) + "/",
+                "--format", "excellon",
+                "--drill-origin", "absolute",
+                "--excellon-separate-th",
+                str(board_path),
+            ]
+            self._run(drill_args)
+
+        output_files = [
+            str(f) for d in out_dirs if d.is_dir() for f in d.iterdir() if f.is_file()
         ]
-        if layers:
-            for layer in layers:
-                args.insert(-1, "--layers")
-                args.insert(-1, layer)
 
-        result = self._run(args)
-
-        # Also export drill files
-        drill_args = [
-            "pcb", "export", "drill",
-            "--output", str(output_dir) + "/",
-            "--format", "excellon",
-            "--drill-origin", "absolute",
-            "--excellon-separate-th",
-            str(board_path),
-        ]
-        self._run(drill_args)
-
-        output_files = [str(f) for f in output_dir.iterdir() if f.is_file()]
-
+        ok = all(r.returncode == 0 for r in results)
+        first_err = next((r.stderr for r in results if r.returncode != 0), "")
         return {
-            "success": result.returncode == 0,
+            "success": ok,
             "output_dir": str(output_dir),
             "output_files": output_files,
-            "message": result.stderr if result.returncode != 0 else "Gerbers exported",
+            "message": first_err if not ok else "Gerbers exported",
         }
 
     def export_drill(self, board_path: Path, output_dir: Path) -> dict[str, Any]:
@@ -106,75 +162,99 @@ class CLIExportOps(ExportOps):
 
     def export_bom(
         self, path: Path, output: Path, fmt: str = "csv",
+        *, variant: str | list[str] | None = None, exclude_dnp: bool = False,
     ) -> dict[str, Any]:
-        output.parent.mkdir(parents=True, exist_ok=True)
+        # sch vs pcb subcommand — for PCB, use python-bom or extract from schematic
+        sub = "sch" if path.suffix == ".kicad_sch" else "pcb"
 
-        # Determine if this is a schematic or board
-        if path.suffix == ".kicad_sch":
+        results: list[subprocess.CompletedProcess[str]] = []
+        for flags, out in _variant_calls(output, variant):
+            out.parent.mkdir(parents=True, exist_ok=True)
             args = [
-                "sch", "export", "bom",
-                "--output", str(output),
+                sub, "export", "bom",
+                "--output", str(out),
+                *flags,
+                *(["--exclude-dnp"] if exclude_dnp else []),
                 str(path),
             ]
-        else:
-            # For PCB, use python-bom or extract from schematic
-            args = [
-                "pcb", "export", "bom",
-                "--output", str(output),
-                str(path),
-            ]
+            results.append(self._run(args))
 
-        result = self._run(args)
+        ok = all(r.returncode == 0 for r in results)
+        first_err = next((r.stderr for r in results if r.returncode != 0), "")
+        expected = _expected_outputs(output, variant)
         return {
-            "success": result.returncode == 0,
-            "output_files": [str(output)] if result.returncode == 0 else [],
-            "message": result.stderr if result.returncode != 0 else "BOM exported",
+            "success": ok,
+            "output_files": [str(p) for p in expected] if ok else [],
+            "message": first_err if not ok else "BOM exported",
         }
 
     def export_pick_and_place(
         self, board_path: Path, output: Path,
+        *, variant: str | list[str] | None = None, exclude_dnp: bool = False,
     ) -> dict[str, Any]:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        args = [
-            "pcb", "export", "pos",
-            "--output", str(output),
-            "--format", "csv",
-            "--units", "mm",
-            str(board_path),
-        ]
-        result = self._run(args)
+        results: list[subprocess.CompletedProcess[str]] = []
+        for flags, out in _variant_calls(output, variant):
+            out.parent.mkdir(parents=True, exist_ok=True)
+            args = [
+                "pcb", "export", "pos",
+                "--output", str(out),
+                "--format", "csv",
+                "--units", "mm",
+                *flags,
+                *(["--exclude-dnp"] if exclude_dnp else []),
+                str(board_path),
+            ]
+            results.append(self._run(args))
+
+        ok = all(r.returncode == 0 for r in results)
+        first_err = next((r.stderr for r in results if r.returncode != 0), "")
+        expected = _expected_outputs(output, variant)
         return {
-            "success": result.returncode == 0,
-            "output_files": [str(output)] if result.returncode == 0 else [],
-            "message": result.stderr if result.returncode != 0 else "Pick-and-place exported",
+            "success": ok,
+            "output_files": [str(p) for p in expected] if ok else [],
+            "message": first_err if not ok else "Pick-and-place exported",
         }
 
     def export_pdf(
         self, path: Path, output: Path, layers: list[str] | None = None,
+        *, variant: str | list[str] | None = None,
     ) -> dict[str, Any]:
-        output.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix != ".kicad_sch" and variant is not None:
+            # kicad-cli pcb export pdf has no --variant surface; the tool layer
+            # refuses board+variant before reaching here (REQ-S3A-001).
+            raise ExportError(
+                "PDF variant export is schematic-only: "
+                "kicad-cli pcb export pdf has no --variant flag"
+            )
 
-        if path.suffix == ".kicad_sch":
-            args = [
-                "sch", "export", "pdf",
-                "--output", str(output),
-                str(path),
-            ]
-        else:
-            args = [
-                "pcb", "export", "pdf",
-                "--output", str(output),
-                str(path),
-            ]
-            if layers:
-                args.insert(-1, "--layers")
-                args.insert(-1, ",".join(layers))
+        results: list[subprocess.CompletedProcess[str]] = []
+        for flags, out in _variant_calls(output, variant):
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if path.suffix == ".kicad_sch":
+                args = [
+                    "sch", "export", "pdf",
+                    "--output", str(out),
+                    *flags,
+                    str(path),
+                ]
+            else:
+                args = [
+                    "pcb", "export", "pdf",
+                    "--output", str(out),
+                    str(path),
+                ]
+                if layers:
+                    args.insert(-1, "--layers")
+                    args.insert(-1, ",".join(layers))
+            results.append(self._run(args))
 
-        result = self._run(args)
+        ok = all(r.returncode == 0 for r in results)
+        first_err = next((r.stderr for r in results if r.returncode != 0), "")
+        expected = _expected_outputs(output, variant)
         return {
-            "success": result.returncode == 0,
-            "output_files": [str(output)] if result.returncode == 0 else [],
-            "message": result.stderr if result.returncode != 0 else "PDF exported",
+            "success": ok,
+            "output_files": [str(p) for p in expected] if ok else [],
+            "message": first_err if not ok else "PDF exported",
         }
 
 

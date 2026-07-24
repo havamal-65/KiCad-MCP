@@ -27,6 +27,7 @@ from kicad_mcp.tools import (
     project,
     routing,
     schematic,
+    variants,
 )
 from kicad_mcp.utils.change_log import ChangeLog
 from kicad_mcp.utils.startup_state import note_launch
@@ -44,15 +45,13 @@ from kicad_mcp_plugin.config import KiCadPluginConfig
 logger = get_logger("plugin.server")
 
 
-def _wait_for_board(pcb_path: "Path", timeout: float = 10.0, interval: float = 0.5) -> bool:
+def _wait_for_board(pcb_path: Path, timeout: float = 10.0, interval: float = 0.5) -> bool:
     """Poll get_active_project until board_path matches pcb_path or timeout expires.
 
     The bridge answers ping as soon as the TCP port is bound, but pcbnew loads
     the board file asynchronously.  This helper waits until the bridge reports
     the correct board_path before callers assume the board is ready.
     """
-    from pathlib import Path  # noqa: PLC0415 — avoid circular at module level
-
     requested = os.path.normcase(os.path.normpath(str(pcb_path)))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -374,6 +373,8 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     # §6.7 manufacturing-readiness audit — pure orchestration over the file-side
     # checks + the same CLI export/DRC ops as export.py; no bridge required.
     manufacturing.register_tools(mcp, backend, change_log)
+    # K10-S4 variant authoring — pure file writes + kicad-cli oracles; no bridge.
+    variants.register_tools(mcp, backend, change_log)
 
     # Install bridge guard for board and routing tools — most require
     # BOARD_READ / BOARD_MODIFY / ZONE_REFILL / BOARD_STACKUP, all of which route

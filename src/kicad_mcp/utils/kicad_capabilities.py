@@ -45,6 +45,14 @@ _CAPABILITIES: dict[str, _CapabilitySpec] = {
         "required": "kicad-cli 10.0+ (--variant)",
         "min_major": 10,
     },
+    # K10-S4: authoring shares the export probe — a --variant-capable CLI
+    # implies a variant-capable KiCad 10 install (file format + oracle).
+    "variant-authoring": {
+        "help_args": ["sch", "export", "bom", "--help"],
+        "flag": "--variant",
+        "required": "kicad-cli 10.0+ (variant-capable)",
+        "min_major": 10,
+    },
 }
 
 # (capability, resolved cli path) -> probe verdict; per-process, cleared on demand.

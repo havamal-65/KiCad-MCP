@@ -48,6 +48,11 @@ launcher = [
     "pystray>=0.19",     # status tray icon + bridge drop/recover notifications
     "pillow>=10.0",      # tray icon rendering (pystray dependency in practice)
 ]
+# Build tooling for the packaged desktop app (installer/build.ps1, U4).
+# Dev-machine only — never a runtime dependency of the server or launcher.
+packaging = [
+    "pyinstaller>=6",
+]
 
 [project.scripts]
 kicad-mcp-plugin = "kicad_mcp_plugin.__main__:main"

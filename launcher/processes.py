@@ -24,7 +24,10 @@ from launcher.config import LauncherConfig
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # cmdline markers that identify a launcher-owned MCP HTTP server.
+# Dev path: `<venv python> -m kicad_mcp_plugin --transport streamable-http …`;
+# packaged app (U4): `kicad-mcp-server.exe --transport streamable-http …`.
 _SERVER_MODULE_MARKER = "kicad_mcp_plugin"
+_SERVER_FROZEN_MARKER = "kicad-mcp-server"
 _SERVER_HTTP_MARKER = "streamable-http"
 
 McpState = Literal["ours", "foreign", "down"]
@@ -78,7 +81,8 @@ def _matches_server(cmdline: list[str], port: int) -> bool:
     Port-aware: a server on a different port is NOT ours for this config
     (an unspecified --port means the 8765 default)."""
     joined = " ".join(str(p) for p in cmdline)
-    if _SERVER_MODULE_MARKER not in joined or _SERVER_HTTP_MARKER not in joined:
+    is_ours = _SERVER_MODULE_MARKER in joined or _SERVER_FROZEN_MARKER in joined
+    if not is_ours or _SERVER_HTTP_MARKER not in joined:
         return False
     return (_cmdline_port([str(p) for p in cmdline]) or 8765) == port
 
@@ -157,22 +161,23 @@ def start_mcp_http(cfg: LauncherConfig) -> Result:
         return Result("mcp", "already_up", "MCP server already running")
     if state == "foreign":
         return Result("mcp", "failed", "port in use by a foreign process")
+    from launcher.config import frozen_server_exe, is_frozen
+
+    # Same server args either way; only the executable prefix differs
+    # (REQ-U4-003: frozen -> the sibling exe, dev -> venv python -m, unchanged).
+    server_args = [
+        "--transport", "streamable-http",
+        "--host", cfg.mcp_host,
+        "--port", str(cfg.mcp_port),
+    ]
+    if is_frozen():
+        cmd = [str(frozen_server_exe()), *server_args]
+        cwd = str(Path(sys.executable).parent)
+    else:
+        cmd = [str(cfg.venv_python), "-m", "kicad_mcp_plugin", *server_args]
+        cwd = str(REPO_ROOT)
     try:
-        subprocess.Popen(
-            [
-                str(cfg.venv_python),
-                "-m",
-                "kicad_mcp_plugin",
-                "--transport",
-                "streamable-http",
-                "--host",
-                cfg.mcp_host,
-                "--port",
-                str(cfg.mcp_port),
-            ],
-            cwd=str(REPO_ROOT),
-            creationflags=_detached_flags(),
-        )
+        subprocess.Popen(cmd, cwd=cwd, creationflags=_detached_flags())
         return Result("mcp", "started", f"http://{cfg.mcp_host}:{cfg.mcp_port}/mcp")
     except Exception as exc:
         return Result("mcp", "failed", f"{type(exc).__name__}: {exc}")
@@ -303,7 +308,31 @@ def reveal_in_explorer(board: Path) -> Result:
 
 def reinstall_bridge() -> Result:
     """Run the vetted bridge installer (never reimplemented). Blocking — call
-    off the UI thread. User must restart the PCB editor afterwards."""
+    off the UI thread. User must restart the PCB editor afterwards.
+
+    Packaged app (U4): the ps1 (and pwsh) may not exist — the Python installer
+    (`kicad_mcp_plugin.install_bridge`, --all-capable since K10-S1) runs
+    in-process with the bundled bridge payload instead. Same vetted logic,
+    different entry.
+    """
+    from launcher.config import is_frozen
+
+    if is_frozen():
+        try:
+            from kicad_mcp_plugin.install_bridge import _all_versions, install_bridge
+
+            versions = _all_versions()
+            if not versions:
+                return Result("bridge", "failed", "no KiCad installation detected")
+            failures = [v for v in versions if install_bridge(version=v) != 0]
+            if failures:
+                return Result("bridge", "failed",
+                              f"install failed for KiCad {', '.join(failures)}")
+            return Result("bridge", "started",
+                          "bridge installed — restart the PCB editor")
+        except Exception as exc:
+            return Result("bridge", "failed", f"{type(exc).__name__}: {exc}")
+
     script = REPO_ROOT / "kicad_plugin" / "install_bridge.ps1"
     if not script.exists():
         return Result("bridge", "failed", f"{script.name} not found")

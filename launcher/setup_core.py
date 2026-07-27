@@ -53,6 +53,18 @@ class FixOutcome:
 # (AR7). The launcher imports those helpers rather than duplicating them.
 
 def bridge_source_path() -> Path:
+    """The authoritative bridge source to compare installs against.
+
+    Dev tree: `kicad_plugin/kicad_mcp_bridge.py`. Packaged app (U4): the
+    bundled package-data copy (same file the wheel ships).
+    """
+    from launcher.config import is_frozen
+
+    if is_frozen():
+        import kicad_mcp_plugin
+
+        pkg_file: str = kicad_mcp_plugin.__file__ or ""
+        return Path(pkg_file).resolve().parent / "data" / "kicad_mcp_bridge.py"
     return REPO_ROOT / "kicad_plugin" / "kicad_mcp_bridge.py"
 
 
@@ -60,7 +72,8 @@ def installed_bridge_path(version: str) -> Path:
     """PCM-plugins bridge entry point for a KiCad version (config-first path)."""
     from kicad_mcp.utils.kicad_version import plugins_3rdparty_dir
 
-    return plugins_3rdparty_dir(version) / "kicad_mcp_bridge" / "__init__.py"
+    path: Path = plugins_3rdparty_dir(version) / "kicad_mcp_bridge" / "__init__.py"
+    return path
 
 
 def poison_copies(version: str) -> list[Path]:

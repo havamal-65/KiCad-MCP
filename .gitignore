@@ -63,3 +63,12 @@ tests/_scratch/
 # Runtime diagnostic log the bridge writes next to its module file —
 # created in-repo when tests import kicad_plugin/kicad_mcp_bridge.py.
 kicad_plugin/bridge_startup.log
+
+# U4 packaged-app build outputs (installer/build.ps1)
+installer/build/
+installer/dist/
+installer/out/
+
+# U4 smoke runtime artifacts (installer/sandbox_smoke.ps1 + local_smoke.ps1)
+installer/sandbox_results/
+installer/*.log

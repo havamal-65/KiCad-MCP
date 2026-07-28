@@ -72,3 +72,6 @@ installer/out/
 # U4 smoke runtime artifacts (installer/sandbox_smoke.ps1 + local_smoke.ps1)
 installer/sandbox_results/
 installer/*.log
+
+# U4 bundled WebView2 bootstrapper — fetched by build.ps1, Microsoft redist
+installer/webview2/

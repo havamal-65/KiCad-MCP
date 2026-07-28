@@ -59,6 +59,19 @@ if ($SkipInstaller) {
     exit 0
 }
 
+# 4b. WebView2 Evergreen bootstrapper — bundled so a bare machine provisions the
+# runtime during install with zero manual steps (QU4-4). ~2 MB Microsoft redist;
+# idempotent + a no-op when the runtime is already present. Cached across builds.
+$WebView2Dir = Join-Path $PSScriptRoot "webview2"
+New-Item -ItemType Directory -Force $WebView2Dir | Out-Null
+$WebView2Setup = Join-Path $WebView2Dir "MicrosoftEdgeWebview2Setup.exe"
+if (-not (Test-Path $WebView2Setup)) {
+    Write-Host "downloading WebView2 evergreen bootstrapper..."
+    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" `
+        -OutFile $WebView2Setup -UseBasicParsing
+}
+if (-not (Test-Path $WebView2Setup)) { throw "WebView2 bootstrapper download failed" }
+
 # 5. Inno Setup compiler (winget-install headlessly if absent).
 $Iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
 if (-not $Iscc) {
@@ -80,7 +93,7 @@ if (-not $Iscc) {
 if (-not $Iscc) { throw "Inno Setup (ISCC.exe) not found and winget install failed" }
 
 # 6. Compile the installer.
-& $Iscc (Join-Path $PSScriptRoot "installer.iss") "/DAppVersion=$Version" "/DDistDir=$DistDir"
+& $Iscc (Join-Path $PSScriptRoot "installer.iss") "/DAppVersion=$Version" "/DDistDir=$DistDir" "/DWebView2Setup=$WebView2Setup"
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
 $Artifact = Join-Path $PSScriptRoot "out\KiCad-MCP-Launcher-Setup-$Version.exe"

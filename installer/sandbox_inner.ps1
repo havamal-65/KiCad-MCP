@@ -56,26 +56,23 @@ Step "install dir + start-menu shortcut exist" {
     "all present"
 }
 
-Step "app degrades gracefully with no WebView2 runtime (QU4-4)" {
-    # A pristine sandbox has no Edge WebView2 runtime. The app must detect that and
-    # show its native "install WebView2" MessageBox (staying alive), NOT crash.
-    $p = Start-Process -FilePath "$App\KiCad-MCP Launcher.exe" -PassThru
-    Start-Sleep -Seconds 15
-    if ($p.HasExited -and $p.ExitCode -ne 0) { throw "launcher crashed (code $($p.ExitCode))" }
-    $alive = -not $p.HasExited
-    Stop-Process -Name "KiCad-MCP Launcher" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    "no crash; handled missing runtime (alive=$alive)"
-}
-
-Step "install WebView2 evergreen runtime" {
-    # A real clean Windows ships WebView2 inbox; the sandbox is barer, so install
-    # the official evergreen bootstrapper to exercise the real dashboard path.
-    $bs = Join-Path $env:TEMP "MicrosoftEdgeWebview2Setup.exe"
-    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $bs -UseBasicParsing
-    $p = Start-Process -FilePath $bs -ArgumentList "/silent","/install" -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "webview2 bootstrapper exit code $($p.ExitCode)" }
-    "installed"
+Step "installer provisioned WebView2 runtime (QU4-4, zero manual steps)" {
+    # A pristine sandbox has no Edge WebView2 runtime; the bundled bootstrapper in
+    # the installer must have provisioned it during silent install. Probe the same
+    # client GUID / pv value the app + installer.iss check.
+    $guid = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    $keys = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid",
+        "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid"
+    )
+    $pv = $null
+    foreach ($k in $keys) {
+        $v = (Get-ItemProperty -Path $k -Name pv -ErrorAction SilentlyContinue).pv
+        if ($v -and $v -ne "0.0.0.0") { $pv = $v; break }
+    }
+    if (-not $pv) { throw "WebView2 runtime absent after install (installer did not provision it)" }
+    "runtime pv=$pv"
 }
 
 Step "dashboard renders: WebView2 tree alive after 25s" {

@@ -61,6 +61,36 @@ class SafeRefuseError(BackendError):
         self.paths_tried = paths_tried
 
 
+class KicadCapabilityError(BackendError):
+    """A tool parameter needs a capability the serving KiCad cannot provide.
+
+    Raised by ``utils.kicad_capabilities.requires_kicad`` (REQ-S3F-001..003).
+    ``payload`` is the structured refusal the tool layer returns verbatim:
+    ``{"error": "capability_unavailable", "capability", "required",
+    "detected", "hint"}``. The check is capability-probed (the serving CLI's
+    own ``--help``), never a version compare, so a backported flag gates
+    correctly (REQ-FEAT-001).
+    """
+
+    def __init__(
+        self, message: str, *,
+        capability: str, required: str, detected: str, hint: str,
+    ) -> None:
+        payload = {
+            "error": "capability_unavailable",
+            "capability": capability,
+            "required": required,
+            "detected": detected,
+            "hint": hint,
+        }
+        super().__init__(message, payload)
+        self.payload = payload
+        self.capability = capability
+        self.required = required
+        self.detected = detected
+        self.hint = hint
+
+
 class ProjectError(KiCadMCPError):
     """Error related to project operations."""
 

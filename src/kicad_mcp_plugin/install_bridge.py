@@ -46,17 +46,24 @@ def _detect_kicad_dirs(version: str) -> tuple[Path, Path, Path]:
     """Return (plugins_root, scripting_root, pcbnew_json) for the given KiCad version.
 
     Args:
-        version: KiCad version string, e.g. ``"9.0"``.
+        version: KiCad version string, e.g. ``"9.0"`` or ``"10.0"``.
 
     Returns:
         Tuple of (3rdparty/plugins root, scripting/plugins root, pcbnew.json path).
+
+    The Windows 3rdparty root is resolved config-first through the shared
+    resolver: a user-relocated ``KICAD<n>_3RD_PARTY`` wins, else the OS
+    known-folder Documents dir (REQ-INST-002/005). The old
+    ``USERPROFILE\\Documents`` literal installed to a dir KiCad never scans on
+    machines where Windows redirects Documents.
     """
     platform = sys.platform
 
     if platform == "win32":
-        docs = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Documents"
+        from kicad_mcp.utils.kicad_version import plugins_3rdparty_dir
+
         appdata = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
-        plugins_root = docs / "KiCad" / version / "3rdparty" / "plugins"
+        plugins_root = plugins_3rdparty_dir(version)
         scripting_root = appdata / "kicad" / version / "scripting" / "plugins"
         pcbnew_json = appdata / "kicad" / version / "pcbnew.json"
     elif platform == "darwin":
@@ -126,11 +133,37 @@ def _patch_pcbnew_json(pcbnew_json: Path, bridge_dir: Path, dry_run: bool) -> No
     print(f"  Patched pcbnew.json: {pcbnew_json}")
 
 
+def _default_version() -> str:
+    """Newest installed KiCad, falling back to the newest known string.
+
+    Keeps the CLI usable when the resolver can't import or finds nothing
+    installed (parity with the historical hardcoded default, but current).
+    """
+    try:
+        from kicad_mcp.utils.kicad_version import KNOWN_VERSIONS, preferred
+
+        pref = preferred()
+        return pref.version if pref is not None else KNOWN_VERSIONS[0]
+    except Exception:
+        return "9.0"
+
+
+def _all_versions() -> list[str]:
+    """Every installed KiCad version, newest-first (for ``--all``)."""
+    try:
+        from kicad_mcp.utils.kicad_version import installed
+
+        versions = [i.version for i in installed()]
+        return versions or [_default_version()]
+    except Exception:
+        return [_default_version()]
+
+
 def install_bridge(version: str = "9.0", dry_run: bool = False) -> int:
-    """Install the KiCad MCP bridge plugin.
+    """Install the KiCad MCP bridge plugin into one KiCad version.
 
     Args:
-        version: KiCad version string (default ``"9.0"``).
+        version: KiCad version string (e.g. ``"9.0"`` or ``"10.0"``).
         dry_run: If True, print what would be done without making changes.
 
     Returns:
@@ -230,9 +263,14 @@ def main() -> None:
     )
     install_parser.add_argument(
         "--kicad-version",
-        default="9.0",
+        default=None,
         metavar="VERSION",
-        help="KiCad version to target (default: 9.0)",
+        help="KiCad version to target (default: newest installed, e.g. 10.0)",
+    )
+    install_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Install into every detected KiCad version (parity with install_bridge.ps1)",
     )
     install_parser.add_argument(
         "--dry-run",
@@ -243,7 +281,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.cmd == "install-bridge":
-        sys.exit(install_bridge(version=args.kicad_version, dry_run=args.dry_run))
+        if args.all:
+            versions = _all_versions()
+        else:
+            versions = [args.kicad_version or _default_version()]
+        rc = 0
+        for version in versions:
+            rc |= install_bridge(version=version, dry_run=args.dry_run)
+        sys.exit(rc)
     parser.error(f"Unknown command: {args.cmd!r}")  # unreachable; required=True guards it
 
 

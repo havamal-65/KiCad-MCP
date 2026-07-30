@@ -349,10 +349,18 @@ class SchematicOps(ABC):
 
 
 class ExportOps(ABC):
-    """Abstract interface for export operations."""
+    """Abstract interface for export operations.
+
+    ``variant``/``exclude_dnp`` (K10-S3, REQ-S3A-001): design-variant selection
+    for backends that support it (kicad-cli 10+). ``variant=None`` must be
+    byte-identical to pre-variant behavior — no flag emitted, works on any
+    KiCad. Callers gate variant-bearing calls via
+    ``utils.kicad_capabilities.requires_kicad`` before invoking these.
+    """
 
     def export_gerbers(
         self, board_path: Path, output_dir: Path, layers: list[str] | None = None,
+        *, variant: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Export Gerber files."""
         raise NotImplementedError("This backend does not support Gerber export")
@@ -365,18 +373,21 @@ class ExportOps(ABC):
 
     def export_bom(
         self, path: Path, output: Path, fmt: str = "csv",
+        *, variant: str | list[str] | None = None, exclude_dnp: bool = False,
     ) -> dict[str, Any]:
         """Export bill of materials."""
         raise NotImplementedError("This backend does not support BOM export")
 
     def export_pick_and_place(
         self, board_path: Path, output: Path,
+        *, variant: str | list[str] | None = None, exclude_dnp: bool = False,
     ) -> dict[str, Any]:
         """Export pick-and-place file."""
         raise NotImplementedError("This backend does not support pick-and-place export")
 
     def export_pdf(
         self, path: Path, output: Path, layers: list[str] | None = None,
+        *, variant: str | list[str] | None = None,
     ) -> dict[str, Any]:
         """Export PDF."""
         raise NotImplementedError("This backend does not support PDF export")

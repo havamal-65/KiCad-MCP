@@ -9,7 +9,6 @@ pcbnew scripts in a subprocess.
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -82,9 +81,10 @@ def _get_kicad_python() -> Path | None:
     platform = get_platform()
 
     if platform == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        for version in ["9.0", "8.0", "7.0"]:
-            candidate = Path(program_files) / "KiCad" / version / "bin" / "python.exe"
+        from kicad_mcp.utils.kicad_version import bin_dir, probe_order
+
+        for version in probe_order():
+            candidate = bin_dir(version) / "python.exe"
             if candidate.exists():
                 return candidate
     elif platform == "macos":

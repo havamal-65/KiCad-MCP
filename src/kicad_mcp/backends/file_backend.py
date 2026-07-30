@@ -629,7 +629,9 @@ def _footprint_state_from_block(block: str) -> dict[str, Any]:
             continue
         pad_block = block[idx:end + 1]
         name_match = re.match(r'\(pad\s+(?:"([^"]*)"|([^\s()]+))', pad_block)
-        net_match = re.search(r'\(net\s+\d+\s+"([^"]*)"\)', pad_block)
+        # KiCad ≤9 writes (net N "NAME") in pads; 10-saved boards drop the
+        # numeric code and write (net "NAME"). Accept both.
+        net_match = re.search(r'\(net\s+(?:\d+\s+)?"([^"]*)"\)', pad_block)
         if name_match:
             pad_name = (
                 name_match.group(1) if name_match.group(1) is not None
@@ -640,6 +642,21 @@ def _footprint_state_from_block(block: str) -> dict[str, Any]:
         search_start = end + 1
 
     return state
+
+
+def _file_uses_net_codes(content: str) -> bool:
+    """Whether the board file carries numeric net codes (KiCad ≤9 format).
+
+    KiCad ≤9 boards declare a numbered top-level net table — at minimum
+    ``(net 0 "")`` — and reference nets by code in pads/segments/vias.
+    Boards saved by KiCad 10 (format 20260206) drop the codes entirely:
+    no top-level table, and every reference is name-only ``(net "NAME")``.
+    Writers must match the file's own convention — a numbered entry in a
+    10-format file (or vice versa) is silently ignored on load.
+    """
+    first_fp = content.find("(footprint ")
+    preamble = content[:first_fp] if first_fp != -1 else content
+    return re.search(r'(?m)^[ \t]*\(net\s+\d+\s+"', preamble) is not None
 
 
 class FileBoardOps(BoardOps):
@@ -701,7 +718,17 @@ class FileBoardOps(BoardOps):
         for node in tree:
             if isinstance(node, list) and len(node) >= 3 and node[0] == "net":
                 nets.append({"number": node[1], "name": node[2]})
-        return nets
+        if nets:
+            return nets
+        # 10-saved boards have no top-level net table — net existence is
+        # implied by name-only (net "NAME") references in pads/segments/vias.
+        # Collect the distinct names; "number" is None (codes don't exist).
+        content = path.read_text(encoding="utf-8")
+        names = sorted({
+            m.group(1)
+            for m in re.finditer(r'\(net\s+"([^"]+)"\)', content)
+        })
+        return [{"number": None, "name": name} for name in names]
 
     def get_tracks(self, path: Path) -> list[dict[str, Any]]:
         tree = parse_sexp_file(path)
@@ -721,15 +748,21 @@ class FileBoardOps(BoardOps):
         return {}
 
     @staticmethod
-    def _resolve_net_id(content: str, net_name: str) -> tuple[str, int]:
+    def _resolve_net_id(content: str, net_name: str) -> tuple[str, int | None]:
         """Resolve a net name to its numeric ID in the PCB file.
 
-        Scans for ``(net N "name")`` patterns. If the net is not found,
-        adds a new net entry and returns its ID.
+        KiCad ≤9 format: scans the top-level ``(net N "name")`` table and
+        appends a new entry when absent. 10-format (name-only) files have no
+        table and no codes — returns ``None`` for the ID and leaves the
+        content untouched; writers must then emit name-only ``(net "name")``
+        clauses (``_net_clause`` does this).
 
         Returns:
-            Tuple of (possibly modified content, net ID).
+            Tuple of (possibly modified content, net ID or None for
+            name-only files).
         """
+        if not _file_uses_net_codes(content):
+            return content, None
         if not net_name:
             return content, 0
 
@@ -763,6 +796,19 @@ class FileBoardOps(BoardOps):
             if last_paren >= 0:
                 content = content[:last_paren] + net_entry + content[last_paren:]
         return content, new_id
+
+    @staticmethod
+    def _net_clause(net_id: int | None, net_name: str, *, named: bool) -> str:
+        """The ``(net …)`` clause in the file's own convention.
+
+        Coded files (≤9): ``(net N "name")`` in pads, ``(net N)`` in
+        segments/vias. Name-only files (10): ``(net "name")`` everywhere.
+        """
+        if net_id is None:
+            return f'(net "{net_name}")'
+        if named:
+            return f'(net {net_id} "{net_name}")'
+        return f"(net {net_id})"
 
     def place_component(
         self, path: Path, reference: str, footprint: str,
@@ -911,9 +957,10 @@ class FileBoardOps(BoardOps):
         content = path.read_text(encoding="utf-8")
         content, net_id = self._resolve_net_id(content, net)
 
+        net_clause = self._net_clause(net_id, net, named=False)
         track_sexp = (
             f'  (segment (start {start_x} {start_y}) (end {end_x} {end_y})'
-            f' (width {width}) (layer "{layer}") (net {net_id})'
+            f' (width {width}) (layer "{layer}") {net_clause}'
             f' (uuid "{track_uuid}"))\n'
         )
 
@@ -942,9 +989,10 @@ class FileBoardOps(BoardOps):
         content = path.read_text(encoding="utf-8")
         content, net_id = self._resolve_net_id(content, net)
 
+        net_clause = self._net_clause(net_id, net, named=False)
         via_sexp = (
             f'  (via (at {x} {y}) (size {size}) (drill {drill})'
-            f' (layers "F.Cu" "B.Cu") (net {net_id})'
+            f' (layers "F.Cu" "B.Cu") {net_clause}'
             f' (uuid "{via_uuid}"))\n'
         )
 
@@ -992,7 +1040,7 @@ class FileBoardOps(BoardOps):
         if not pad_matches:
             raise ValueError(f"Pad '{pad}' not found in footprint '{reference}'")
 
-        net_clause = f'(net {net_id} "{net}")'
+        net_clause = self._net_clause(net_id, net, named=True)
 
         # Process in reverse order so that earlier positions are unaffected by
         # insertions/replacements in later parts of the block.
@@ -1005,8 +1053,13 @@ class FileBoardOps(BoardOps):
 
             pad_block = new_block[pad_start:pad_end_abs + 1]
 
-            # Replace or insert (net ...) in the pad block
-            net_in_pad = re.search(r'\(net\s+\d+(?:\s+"[^"]*")?\)', pad_block)
+            # Replace or insert (net ...) in the pad block. Match both the
+            # coded ≤9 forms — (net N) / (net N "NAME") — and the name-only
+            # 10 form (net "NAME"); missing the existing node would append a
+            # duplicate.
+            net_in_pad = re.search(
+                r'\(net\s+(?:\d+(?:\s+"[^"]*")?|"[^"]*")\)', pad_block
+            )
 
             if net_in_pad:
                 new_pad_block = (
@@ -2346,8 +2399,11 @@ class FileSchematicOps(SchematicOps):
         # Find the lib_symbols section
         lib_sym_start = content.find("(lib_symbols")
         if lib_sym_start == -1:
-            # No lib_symbols section — create one before the first (symbol instance
-            first_sym = content.find("(symbol ")
+            # No lib_symbols section — create one before the first (symbol
+            # instance. Delimiter-tolerant: the 10 pretty-printer writes a
+            # newline after "(symbol".
+            first_sym_m = re.search(r"\(symbol[\s(]", content)
+            first_sym = first_sym_m.start() if first_sym_m else -1
             if first_sym == -1:
                 # No symbols at all yet, insert before closing paren
                 last_paren = content.rfind(")")

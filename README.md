@@ -170,6 +170,30 @@ reuses `scripts/mcp_health_monitor.py`'s collectors for status and drives the sa
 tools you'd call by hand. Configure it with the same environment variables as the
 server (e.g. `KICAD_MCP_HTTP_HOST`/`KICAD_MCP_HTTP_PORT`, `KICAD_MCP_PROJECTS_ROOT`).
 
+### Packaged app (no Python required)
+
+A double-click Windows installer bundles the launcher, the MCP server, and a
+Python runtime — nothing to `pip install`, no terminal:
+
+1. Build (or download) `KiCad-MCP-Launcher-Setup-<version>.exe` — built from a
+   checkout with one command: `pwsh -File installer\build.ps1`.
+2. Run it. **The installer is unsigned**, so Windows SmartScreen will warn:
+   click **More info → Run anyway**. (Unsigned-with-docs is the deliberate
+   ship decision; the build script signs everything automatically if you
+   supply a code-signing certificate: `installer\build.ps1 -CertPath ...`.)
+3. It installs per-user (no admin prompt) to
+   `%LOCALAPPDATA%\Programs\KiCad-MCP Launcher`, adds a Start-Menu shortcut,
+   and opens the launcher. On first run the **Setup view** walks the
+   remaining pieces: detect KiCad, install the bridge, register the MCP with
+   Claude Code — all from the window.
+4. KiCad itself stays a prerequisite (the wizard links to its download);
+   uninstalling removes the app but deliberately leaves the bridge and your
+   MCP client config in place (they belong to your KiCad/client setup).
+
+The `pip install` dev path above keeps working unchanged; the packaged app is
+additive. Requires the Microsoft WebView2 runtime (preinstalled on Windows 11;
+the app shows the official download link if it's missing).
+
 ## Configuration
 
 ### Environment Variables

@@ -75,3 +75,8 @@ installer/*.log
 
 # U4 bundled WebView2 bootstrapper — fetched by build.ps1, Microsoft redist
 installer/webview2/
+
+# KiCad per-user project-local settings + validator sidecar caches — runtime
+# byproducts written next to fixtures/boards; never part of the committed project.
+*.kicad_prl
+*.validation_cache.json

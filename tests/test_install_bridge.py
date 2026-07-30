@@ -41,13 +41,11 @@ def test_detect_dirs_uses_known_folder_not_userprofile(monkeypatch, tmp_path):
 
     assert plugins_root == redirected / "KiCad" / "10.0" / "3rdparty" / "plugins"
     assert (tmp_path / "profile") not in plugins_root.parents
-    # config/pcbnew.json stay under APPDATA, versioned.
-    assert scripting_root == Path(
-        r"C:\Users\redir\AppData\Roaming\kicad\10.0\scripting\plugins"
-    )
-    assert pcbnew_json == Path(
-        r"C:\Users\redir\AppData\Roaming\kicad\10.0\pcbnew.json"
-    )
+    # config/pcbnew.json stay under APPDATA, versioned. Expected built by joining
+    # (not a backslash literal) so it equals the code's output on Linux CI too.
+    appdata = Path(r"C:\Users\redir\AppData\Roaming")
+    assert scripting_root == appdata / "kicad" / "10.0" / "scripting" / "plugins"
+    assert pcbnew_json == appdata / "kicad" / "10.0" / "pcbnew.json"
 
 
 def test_detect_dirs_config_first(monkeypatch, tmp_path):

@@ -236,9 +236,18 @@ def find_symbol_block_by_reference(content: str, reference: str) -> tuple[int, i
     # Scan for all (symbol occurrences
     search_start = 0
     while True:
-        idx = content.find("(symbol ", search_start)
+        idx = content.find("(symbol", search_start)
         if idx == -1:
             break
+
+        # Require a delimiter after the keyword: eeschema ≤9 writes
+        # ``(symbol (lib_id`` on one line, the 10 pretty-printer (format
+        # 20260306) puts a newline after ``(symbol``. The delimiter check
+        # also keeps e.g. ``(symbol_instances`` from matching.
+        after = idx + len("(symbol")
+        if after >= len(content) or content[after] not in " \t\r\n(":
+            search_start = idx + 1
+            continue
 
         # Skip if inside lib_symbols section
         if lib_symbols_start != -1 and lib_symbols_start <= idx <= lib_symbols_end:

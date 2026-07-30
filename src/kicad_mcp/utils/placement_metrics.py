@@ -33,7 +33,9 @@ _REF_PAT = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
 _FP_REF_PAT = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
 _FP_LIBID_PAT = re.compile(r'\(footprint\s+"([^"]+)"')
 _PAD_NAME_PAT = re.compile(r'\(pad\s+(?:"([^"]*)"|([^\s()]+))')
-_NET_PAT = re.compile(r'\(net\s+(\d+)\s+"([^"]*)"\)')
+# Pad net node: (net N "NAME") in KiCad ≤9 files, name-only (net "NAME") in
+# 10-saved files (code group absent → sentinel -1; 0 stays "unconnected").
+_NET_PAT = re.compile(r'\(net\s+(?:(\d+)\s+)?"([^"]*)"\)')
 
 
 class PadRecord(TypedDict):
@@ -124,8 +126,11 @@ def _parse_footprints(content: str) -> list[_Footprint]:
             net_m = _NET_PAT.search(pad_block)
             if not net_m:
                 continue
-            net_id = int(net_m.group(1))
             net_name = net_m.group(2)
+            if net_m.group(1) is not None:
+                net_id = int(net_m.group(1))
+            else:
+                net_id = -1 if net_name else 0  # name-only (10-format) file
             # Net 0 / empty name => mechanical / unconnected (REQ-GRAPH-002).
             if net_id == 0 or not net_name:
                 continue

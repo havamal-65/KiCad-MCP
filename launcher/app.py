@@ -20,6 +20,7 @@ import dataclasses
 import importlib.util
 import json
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -446,15 +447,21 @@ class LauncherApi:
         }
 
     def run_fix(self, key: Any) -> dict[str, Any]:
+        key_str = str(key)
         fixes = {
             "install_bridge": setup_core.fix_install_bridge,
             "register_claude": lambda: setup_core.fix_register_claude(self.cfg),
             "open_kicad_download": setup_core.fix_open_kicad_download,
         }
-        fn = fixes.get(str(key))
-        if fn is None:
-            return {"ok": False, "messages": [f"unknown fix: {key}"]}
-        outcome = fn()
+        # Per-version dynamic fix: enable_api_server_<version> (e.g. 10.0).
+        if key_str.startswith("enable_api_server_"):
+            version = key_str.removeprefix("enable_api_server_")
+            outcome = setup_core.fix_enable_api_server(version)
+        else:
+            fn = fixes.get(key_str)
+            if fn is None:
+                return {"ok": False, "messages": [f"unknown fix: {key}"]}
+            outcome = fn()
         if self._setup_cache is not None:
             self._setup_cache = [
                 outcome.item if i.key == outcome.item.key else i for i in self._setup_cache
@@ -477,7 +484,61 @@ class LauncherApi:
         return {"ok": False}
 
 
+# WebView2 evergreen-runtime client GUID (Microsoft-documented detection key).
+_WEBVIEW2_CLIENT_KEY = (
+    r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+)
+_WEBVIEW2_DOWNLOAD_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+
+
+def _webview2_present() -> bool:
+    """Whether the WebView2 evergreen runtime is installed (Windows only).
+
+    Registry probe per Microsoft's deployment docs; any readable `pv` value
+    in the machine (incl. WOW6432Node) or user hive counts. Non-Windows: True
+    (pywebview uses a different backend there).
+    """
+    if sys.platform != "win32":
+        return True
+    import winreg
+
+    probes = [
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\" + _WEBVIEW2_CLIENT_KEY),
+        (winreg.HKEY_LOCAL_MACHINE, "SOFTWARE\\" + _WEBVIEW2_CLIENT_KEY),
+        (winreg.HKEY_CURRENT_USER, "Software\\" + _WEBVIEW2_CLIENT_KEY),
+    ]
+    for hive, key in probes:
+        try:
+            with winreg.OpenKey(hive, key) as handle:
+                version, _ = winreg.QueryValueEx(handle, "pv")
+                if str(version).strip("0. "):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def _webview2_missing_dialog() -> None:
+    """Native message box (no webview available to render anything better)."""
+    import ctypes
+
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        "The Microsoft WebView2 runtime is required to show the launcher "
+        f"window and was not found.\n\nInstall it from:\n{_WEBVIEW2_DOWNLOAD_URL}\n\n"
+        "OK opens that page in your browser.",
+        "KiCad-MCP Launcher — WebView2 missing",
+        0x40,  # MB_ICONINFORMATION
+    )
+    import webbrowser
+
+    webbrowser.open(_WEBVIEW2_DOWNLOAD_URL)
+
+
 def main() -> None:
+    if not _webview2_present():
+        _webview2_missing_dialog()
+        raise SystemExit(1)
     cfg = load_config()
     api = LauncherApi(cfg)
     st = api.settings

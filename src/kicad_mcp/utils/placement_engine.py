@@ -133,7 +133,10 @@ _REF_PAT = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
 _FP_REF_PAT = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
 _FP_LIBID_PAT = re.compile(r'\(footprint\s+"([^"]+)"')
 _PAD_NAME_PAT = re.compile(r'\(pad\s+(?:"([^"]*)"|([^\s()]+))')
-_NET_PAT = re.compile(r'\(net\s+(\d+)\s+"([^"]*)"\)')
+# Pad net node: (net N "NAME") in KiCad ≤9 files, name-only (net "NAME") in
+# 10-saved files. Group 1 (the code) is then absent — consumers treat a named
+# net with no code as connected (sentinel -1); net_id == 0 stays "unconnected".
+_NET_PAT = re.compile(r'\(net\s+(?:(\d+)\s+)?"([^"]*)"\)')
 _CLUSTERID_PAT = re.compile(r'\(property\s+"ClusterId"\s+"([^"]*)"')
 _PATH_PAT = re.compile(r'\(path\s+"([^"]*)"')
 _START_PAT = re.compile(r"\(start\s+([-\d.]+)\s+([-\d.]+)\)")
@@ -254,8 +257,11 @@ def read_part_records(content: str) -> list[PartRecord]:
             py = float(at_pm.group(2)) if at_pm else 0.0
 
             net_m = _NET_PAT.search(pad_block)
-            net_id = int(net_m.group(1)) if net_m else 0
             net_name = net_m.group(2) if net_m else ""
+            if net_m and net_m.group(1) is not None:
+                net_id = int(net_m.group(1))
+            else:
+                net_id = -1 if net_name else 0  # name-only (10-format) file
 
             pads.append(PadLocal(
                 pad=pad_name, net_id=net_id, net_name=net_name, dx=px, dy=py,

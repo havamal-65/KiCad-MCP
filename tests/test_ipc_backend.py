@@ -285,37 +285,51 @@ class TestConnectionRemedy:
 # ---------------------------------------------------------------------------
 
 class TestReadApiServerPref:
+    """``read_api_server_pref`` walks the resolver's probe order (preferred
+    version first), reading each version's kicad_common.json. Tests fake the
+    resolver's ``config_dir`` + ``probe_order`` against a tmp tree."""
+
+    def _setup_resolver(self, monkeypatch, root, order):
+        from kicad_mcp.utils import kicad_version as kv
+
+        monkeypatch.setattr(kv, "config_dir", lambda v: root / v)
+        monkeypatch.setattr(kv, "probe_order", lambda: order)
+
     def _write_common(self, root, version: str, payload: dict) -> None:
         d = root / version
         d.mkdir(parents=True)
         (d / "kicad_common.json").write_text(json.dumps(payload), encoding="utf-8")
 
     def test_reads_enable_server_true(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: tmp_path)
+        self._setup_resolver(monkeypatch, tmp_path, ["9.0"])
         self._write_common(tmp_path, "9.0", {"api": {"enable_server": True}})
         assert read_api_server_pref() is True
 
     def test_reads_enable_server_false(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: tmp_path)
+        self._setup_resolver(monkeypatch, tmp_path, ["9.0"])
         self._write_common(tmp_path, "9.0", {"api": {"enable_server": False}})
         assert read_api_server_pref() is False
 
-    def test_newest_version_wins(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: tmp_path)
-        self._write_common(tmp_path, "8.0", {"api": {"enable_server": False}})
+    def test_preferred_version_wins(self, tmp_path, monkeypatch):
+        # probe_order lists 10.0 first (preferred/newest); its pref is returned
+        # even though an older version's config disagrees.
+        self._setup_resolver(monkeypatch, tmp_path, ["10.0", "9.0"])
+        self._write_common(tmp_path, "9.0", {"api": {"enable_server": False}})
+        self._write_common(tmp_path, "10.0", {"api": {"enable_server": True}})
+        assert read_api_server_pref() is True
+
+    def test_falls_through_to_next_version(self, tmp_path, monkeypatch):
+        # Preferred version has no readable pref → the next one supplies it.
+        self._setup_resolver(monkeypatch, tmp_path, ["10.0", "9.0"])
         self._write_common(tmp_path, "9.0", {"api": {"enable_server": True}})
         assert read_api_server_pref() is True
 
     def test_missing_config_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: tmp_path)
-        assert read_api_server_pref() is None
-
-    def test_no_config_root_returns_none(self, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: None)
+        self._setup_resolver(monkeypatch, tmp_path, ["10.0", "9.0"])
         assert read_api_server_pref() is None
 
     def test_malformed_json_skipped(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ipc_connection, "_kicad_config_root", lambda: tmp_path)
+        self._setup_resolver(monkeypatch, tmp_path, ["9.0"])
         d = tmp_path / "9.0"
         d.mkdir()
         (d / "kicad_common.json").write_text("{not json", encoding="utf-8")

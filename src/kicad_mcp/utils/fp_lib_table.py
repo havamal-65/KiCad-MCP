@@ -109,39 +109,28 @@ def _default_var_value(var: str) -> str | None:
                 return str(base)
         return None
 
-    # ${KICAD_USER_3DMODEL_DIR} → user 3rdparty 3dmodels dir, mirroring the
-    # KICAD\d+_3RD_PARTY candidate search below but ending in /3dmodels.
+    # ${KICAD_USER_3DMODEL_DIR} → user 3rdparty 3dmodels dir. The 3rd-party root
+    # comes from the resolver (config-first, then the OS known-folder Documents
+    # default) — never an OneDrive literal (AR7).
     if var == "KICAD_USER_3DMODEL_DIR":
-        for version in ("9.0", "8.0", "7.0"):
-            candidates: list[Path] = []
-            onedrive = os.environ.get("OneDrive")
-            if onedrive:
-                candidates.append(
-                    Path(onedrive) / "Documents" / "KiCad" / version / "3rdparty" / "3dmodels"
-                )
-            candidates.append(
-                Path.home() / "Documents" / "KiCad" / version / "3rdparty" / "3dmodels"
-            )
-            candidates.append(
-                Path.home() / ".local" / "share" / "kicad" / version / "3rdparty" / "3dmodels"
-            )
-            for c in candidates:
-                if c.is_dir():
-                    return str(c)
+        from kicad_mcp.utils.kicad_version import probe_order, third_party_dir
+
+        for version in probe_order():
+            candidate = third_party_dir(version) / "3dmodels"
+            if candidate.is_dir():
+                return str(candidate)
         return None
 
+    # ${KICAD<n>_3RD_PARTY} → that version's 3rd-party root, straight from the
+    # resolver (honors a user-relocated KICAD<n>_3RD_PARTY, else the known-folder
+    # Documents default).
     m = re.fullmatch(r"KICAD(\d+)_3RD_PARTY", var)
     if m:
-        version = f"{m.group(1)}.0"
-        candidates = []
-        onedrive = os.environ.get("OneDrive")
-        if onedrive:
-            candidates.append(Path(onedrive) / "Documents" / "KiCad" / version / "3rdparty")
-        candidates.append(Path.home() / "Documents" / "KiCad" / version / "3rdparty")
-        candidates.append(Path.home() / ".local" / "share" / "kicad" / version / "3rdparty")
-        for c in candidates:
-            if c.is_dir():
-                return str(c)
+        from kicad_mcp.utils.kicad_version import third_party_dir
+
+        candidate = third_party_dir(f"{m.group(1)}.0")
+        if candidate.is_dir():
+            return str(candidate)
     return None
 
 

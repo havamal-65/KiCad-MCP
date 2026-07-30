@@ -14,10 +14,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # launcher/config.py -> parents[1] == repo root
+# (Frozen app: launcher/ lives in the bundle's _internal, so this resolves to
+# _internal — which is exactly where the bundled data files land. U4.)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765  # matches the committed .mcp.dev.json URL
+
+
+def is_frozen() -> bool:
+    """True when running from the packaged app (PyInstaller bundle, U4).
+
+    PyInstaller sets ``sys.frozen`` — the explicit marker REQ-U4-003 requires
+    (never a path heuristic).
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
+def frozen_server_exe() -> Path:
+    """The sibling frozen MCP server executable (packaged app only)."""
+    name = "kicad-mcp-server.exe" if sys.platform == "win32" else "kicad-mcp-server"
+    return Path(sys.executable).with_name(name)
 
 
 @dataclass(frozen=True)

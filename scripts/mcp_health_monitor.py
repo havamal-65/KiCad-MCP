@@ -35,7 +35,13 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 
-import tkinter as tk
+# tkinter powers only the standalone monitor window (main()). The launcher
+# imports this module for its Poller/collectors, where tk must not be a hard
+# dependency — the packaged app (U4) ships without tcl/tk.
+try:
+    import tkinter as tk
+except ImportError:  # packaged app / minimal python
+    tk = None  # type: ignore[assignment]
 
 try:
     import psutil
@@ -912,6 +918,11 @@ def main():
         print(json.dumps(build_report(), indent=2, default=str))
         return
 
+    if tk is None:
+        raise SystemExit(
+            "the standalone monitor window needs tkinter, which this Python "
+            "lacks; the launcher's inline monitor does not (it uses Poller only)"
+        )
     poller = Poller()
     poller.start()
     root = tk.Tk()

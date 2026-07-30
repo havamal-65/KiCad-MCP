@@ -162,7 +162,9 @@ def test_probe_order_no_installs_is_known_versions(program_files):
 
 def test_config_dir_windows(program_files, monkeypatch):
     monkeypatch.setenv("APPDATA", r"C:\Users\x\AppData\Roaming")
-    assert kv.config_dir("10.0") == Path(r"C:\Users\x\AppData\Roaming\kicad\10.0")
+    # Expected built by joining (not a backslash literal) so it equals the code's
+    # output under any pathlib flavor — the assertion runs on Linux CI too.
+    assert kv.config_dir("10.0") == Path(r"C:\Users\x\AppData\Roaming") / "kicad" / "10.0"
 
 
 def test_documents_dir_known_folder(monkeypatch):
@@ -179,8 +181,9 @@ def test_third_party_dir_default(monkeypatch):
     monkeypatch.setattr(kv, "_platform", lambda: "windows")
     monkeypatch.setattr(kv, "documents_dir", lambda: Path(r"C:\Users\x\Documents"))
     monkeypatch.setattr(kv, "config_dir", lambda v: Path(r"C:\nope") / v)
-    assert kv.third_party_dir("10.0") == Path(
-        r"C:\Users\x\Documents\KiCad\10.0\3rdparty"
+    assert (
+        kv.third_party_dir("10.0")
+        == Path(r"C:\Users\x\Documents") / "KiCad" / "10.0" / "3rdparty"
     )
 
 
@@ -195,7 +198,7 @@ def test_third_party_dir_config_first(tmp_path, monkeypatch):
     monkeypatch.setattr(kv, "config_dir", lambda v: tmp_path / "kicad" / v)
     monkeypatch.setattr(kv, "documents_dir", lambda: tmp_path / "Documents")
     assert kv.third_party_dir("10.0") == Path(r"E:\my3rd")
-    assert kv.plugins_3rdparty_dir("10.0") == Path(r"E:\my3rd\plugins")
+    assert kv.plugins_3rdparty_dir("10.0") == Path(r"E:\my3rd") / "plugins"
 
 
 def test_third_party_dir_config_missing_key_uses_default(tmp_path, monkeypatch):

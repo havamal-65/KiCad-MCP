@@ -20,6 +20,7 @@ from kicad_mcp.tools import (
     board,
     drc,
     export,
+    format_upgrade,
     library,
     library_manage,
     manufacturing,
@@ -375,6 +376,7 @@ def create_plugin_server(config: KiCadPluginConfig | None = None) -> FastMCP:
     manufacturing.register_tools(mcp, backend, change_log)
     # K10-S4 variant authoring — pure file writes + kicad-cli oracles; no bridge.
     variants.register_tools(mcp, backend, change_log)
+    format_upgrade.register_tools(mcp, backend, change_log)
 
     # Install bridge guard for board and routing tools — most require
     # BOARD_READ / BOARD_MODIFY / ZONE_REFILL / BOARD_STACKUP, all of which route

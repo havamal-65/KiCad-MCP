@@ -753,6 +753,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         title: str = "",
         revision: str = "",
         design_rules_preset: str = "fab_jlcpcb",
+        target_format: str = "kicad9",
     ) -> str:
         """Create a new KiCad project with blank schematic and PCB files.
 
@@ -777,6 +778,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             revision: Optional revision string (e.g. "1.0").
             design_rules_preset: Fab preset applied at creation — "fab_jlcpcb"
                 (default), "class2", or "" to skip.
+            target_format: "kicad9" (default) or "kicad10". KiCad 9 is the safe
+                cross-version default (v9 files open in both 9 and 10). Choose
+                "kicad10" when the project needs the KiCad-10 variant tools — the
+                files are generated in v9 form and then upgraded in place via
+                kicad-cli, so the result is real KiCad-10 format. Requires a
+                KiCad-10 kicad-cli; the call refuses (writing nothing) if one is
+                not available.
 
         Returns:
             JSON with status, paths to all created files, and the design rules
@@ -784,6 +792,22 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
         from kicad_mcp.utils.platform_helper import find_kicad_template_dir
+
+        if target_format not in ("kicad9", "kicad10"):
+            return json.dumps({
+                "status": "error",
+                "message": f"target_format must be 'kicad9' or 'kicad10', got {target_format!r}",
+            })
+
+        # Resolve the v10 upgrade capability BEFORE writing anything, so a v10
+        # request without a v10 CLI refuses cleanly instead of silently leaving
+        # v9 files behind.
+        upgrade_cli = None
+        if target_format == "kicad10":
+            from kicad_mcp.tools.format_upgrade import v10_cli_gate
+            upgrade_cli, refusal = v10_cli_gate()
+            if refusal is not None:
+                return refusal
 
         proj_dir = Path(project_dir).resolve()
         proj_dir.mkdir(parents=True, exist_ok=True)
@@ -826,6 +850,17 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # --- .kicad_pcb ---
         FileBoardOps().create_board(pcb_path, title=title, revision=revision)
 
+        # Upgrade the v9-format files to KiCad 10 if requested, before design
+        # rules so those edit the upgraded files.
+        upgrade_report = None
+        if target_format == "kicad10":
+            from kicad_mcp.tools.format_upgrade import upgrade_project_files
+            from kicad_mcp.utils.variant_files import resolve_project
+            assert upgrade_cli is not None  # v10_cli_gate resolved it above
+            upgrade_report = upgrade_project_files(resolve_project(pro_path), upgrade_cli)
+            if upgrade_report.get("status") == "error":
+                return json.dumps(upgrade_report, indent=2)
+
         # Apply design rules immediately so constraints are set before any
         # schematic or footprint work begins.
         applied_preset = None
@@ -846,17 +881,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     },
                 })
 
-        result = {
-            "status": "success",
-            "project": {
-                "name": stem,
-                "directory": str(proj_dir),
-                "pro_file": str(pro_path),
-                "schematic_file": str(sch_path),
-                "board_file": str(pcb_path),
-                "design_rules_preset": applied_preset or "none (defaults)",
-            },
+        project_info: dict[str, Any] = {
+            "name": stem,
+            "directory": str(proj_dir),
+            "pro_file": str(pro_path),
+            "schematic_file": str(sch_path),
+            "board_file": str(pcb_path),
+            "design_rules_preset": applied_preset or "none (defaults)",
+            "target_format": target_format,
         }
+        if upgrade_report is not None:
+            project_info["format_upgrade"] = upgrade_report
+        result = {"status": "success", "project": project_info}
         change_log.record("create_project", {"name": stem, "dir": project_dir, "preset": applied_preset})
         return json.dumps(result, indent=2)
 

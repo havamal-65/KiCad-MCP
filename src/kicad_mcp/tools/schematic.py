@@ -543,10 +543,27 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             change_log.record("generate_netlist", {"path": path, "output": output})
             return json.dumps({"status": "success", **result}, indent=2)
         except NotImplementedError:
-            return json.dumps({
-                "status": "info",
-                "message": "Netlist generation requires kicad-cli or KiCad IPC.",
-            })
+            # The schematic-ops backend can't generate a netlist (KiCad 9 has no
+            # eeschema Python API). Fall back to on-PATH kicad-cli, mirroring how
+            # run_erc already does (F6).
+            from kicad_mcp.utils.platform_helper import find_kicad_cli
+            cli = find_kicad_cli()
+            if cli is None:
+                return json.dumps({
+                    "status": "info",
+                    "message": "Netlist generation requires kicad-cli or KiCad IPC; "
+                               "kicad-cli was not found on PATH.",
+                })
+            from kicad_mcp.backends.cli_backend import CLIDRCOps
+            res = CLIDRCOps(cli).generate_netlist(p, out)
+            if not res.get("generated"):
+                return json.dumps({
+                    "status": "error",
+                    "message": "kicad-cli ran but produced no netlist file.",
+                    **res,
+                }, indent=2)
+            change_log.record("generate_netlist", {"path": path, "output": output})
+            return json.dumps({"status": "success", **res}, indent=2)
 
     @mcp.tool()
     def get_symbol_pin_positions(

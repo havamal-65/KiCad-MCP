@@ -126,6 +126,8 @@ def test_check_format_versions_refuses_pre_v10(tmp_path: Path):
     assert payload["found"] == 20250114
     assert payload["required"] == vf.SCH_MIN_FORMAT
     assert "upgrade" in payload["hint"].lower()
+    # FB: the hint names the in-MCP upgrade tool, not a manual kicad-cli recipe.
+    assert "upgrade_project_format" in payload["hint"]
 
 
 # ── .kicad_pro registry ──────────────────────────────────────────────────────

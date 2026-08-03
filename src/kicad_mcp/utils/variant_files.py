@@ -755,9 +755,11 @@ def check_format_versions(files: ProjectFiles) -> dict[str, Any] | None:
                 "found": stamp,
                 "required": minimum,
                 "hint": (
-                    "This file predates KiCad 10's variant format. Upgrade it "
-                    "headlessly (schematics: `kicad-cli sch upgrade --force`; "
-                    "boards: open + save once in KiCad 10), then retry."
+                    "This file predates KiCad 10's variant format. Run the "
+                    "upgrade_project_format tool on this project (it backs up every "
+                    "file, then upgrades the schematic and board in place), then "
+                    "retry. Note: KiCad 9 cannot open upgraded files — the v9 "
+                    "backups in .kicad_mcp_backups/ are your only rollback."
                 ),
             }
     return None

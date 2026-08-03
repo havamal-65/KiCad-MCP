@@ -81,6 +81,41 @@ def _run(tmp_path: Path, stdout: str, *, jar_name: str = "freerouting-2.2.4.jar"
     return result
 
 
+# --- F13: routing preflight version surfacing --------------------------------
+
+def test_resolve_routing_runtime_reports_versions(tmp_path: Path):
+    """F13: the preflight reports the resolved FreeRouting + Java runtime and how
+    each was chosen, without launching anything."""
+    from kicad_mcp.tools.routing import _resolve_routing_runtime
+
+    java = tmp_path / "java.exe"
+    java.touch()
+    with patch("kicad_mcp.tools.routing.find_java", return_value=java), \
+         patch("kicad_mcp.utils.platform_helper.detect_java_major_version", return_value=25), \
+         patch("kicad_mcp.tools.routing.find_freerouting_jar",
+               return_value=tmp_path / "freerouting-2.2.4.jar"):
+        info = _resolve_routing_runtime(_cfg(), "", "")
+
+    assert info["java_source"] == "auto-detected (PATH)"
+    assert info["java_major"] == 25
+    assert info["freerouting_jar"] == "freerouting-2.2.4.jar"
+    assert "2.2.4" in (info["freerouting_version"] or "")
+
+
+def test_resolve_routing_runtime_honors_argument_paths(tmp_path: Path):
+    from kicad_mcp.tools.routing import _resolve_routing_runtime
+
+    java = tmp_path / "myjava.exe"
+    java.touch()
+    with patch("kicad_mcp.utils.platform_helper.detect_java_major_version", return_value=21):
+        info = _resolve_routing_runtime(
+            _cfg(), str(tmp_path / "freerouting-1.9.0.jar"), str(java),
+        )
+    assert info["java_source"] == "argument"
+    assert info["jar_source"] == "argument"
+    assert info["freerouting_jar"] == "freerouting-1.9.0.jar"
+
+
 def test_incomplete_not_success(tmp_path: Path):
     r = _run(tmp_path, _V2_STDOUT_7_UNROUTED)
     assert r["status"] == "incomplete"

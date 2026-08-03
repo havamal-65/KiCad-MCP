@@ -90,14 +90,22 @@ def get_system_library_paths() -> list[Path]:
 def find_symbol_libraries() -> list[Path]:
     """Find all .kicad_sym symbol library files.
 
+    On a multi-version install, ``get_system_library_paths`` yields each
+    installed version's ``symbols`` directory (newest first, via
+    ``probe_order``), plus any ``KICAD*_SYMBOL_DIR`` override ahead of them.
+    De-duplicate by file stem so each stock library is returned once — the
+    first occurrence (an env override, else the newest version) wins.
+
     Returns:
-        List of paths to symbol library files.
+        Sorted list of symbol library files, one per library name.
     """
-    libraries: list[Path] = []
+    seen: dict[str, Path] = {}
     for base_path in get_system_library_paths():
-        if base_path.name == "symbols":
-            libraries.extend(base_path.glob("*.kicad_sym"))
-    return sorted(libraries)
+        if base_path.name != "symbols":
+            continue
+        for lib in base_path.glob("*.kicad_sym"):
+            seen.setdefault(lib.stem, lib)
+    return sorted(seen.values())
 
 
 def find_footprint_libraries(project_dir: str | Path | None = None) -> list[Path]:

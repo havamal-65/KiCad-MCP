@@ -507,67 +507,99 @@ def detect_kicad_version() -> str | None:
     return None
 
 
-def find_java() -> Path | None:
-    """Find a Java executable on this system.
+def _java_candidates() -> list[Path]:
+    """Every plausible ``java`` executable on this system, in discovery order.
 
-    Checks PATH first, then JAVA_HOME, then platform-specific default locations.
-
-    Returns:
-        Path to java executable if found, None otherwise.
+    Covers PATH, JAVA_HOME, the OS package locations, and JetBrains-managed
+    JDKs under ``~/.jdks`` (where IntelliJ / PyCharm install runtimes) — so a
+    newer JDK that is not on PATH is still discoverable. De-duplicated on the
+    resolved path; only existing files are returned.
     """
-    # Check PATH first
-    java_in_path = shutil.which("java")
-    if java_in_path:
-        logger.debug("Found java in PATH: %s", java_in_path)
-        return Path(java_in_path)
+    exe = "java.exe" if get_platform() == "windows" else "java"
+    cands: list[Path] = []
 
-    # Check JAVA_HOME
+    in_path = shutil.which("java")
+    if in_path:
+        cands.append(Path(in_path))
+
     java_home = os.environ.get("JAVA_HOME")
     if java_home:
-        java_bin = Path(java_home) / "bin" / ("java.exe" if get_platform() == "windows" else "java")
-        if java_bin.exists():
-            logger.debug("Found java via JAVA_HOME: %s", java_bin)
-            return java_bin
+        cands.append(Path(java_home) / "bin" / exe)
+
+    home = (
+        Path(os.environ.get("USERPROFILE", str(Path.home())))
+        if os.name == "nt" else Path.home()
+    )
+    roots: list[Path] = [home / ".jdks"]  # JetBrains-managed JDKs (all platforms)
 
     platform = get_platform()
-    candidates: list[Path] = []
-
     if platform == "windows":
         program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        # Eclipse Adoptium / Temurin
-        adoptium_base = Path(program_files) / "Eclipse Adoptium"
-        if adoptium_base.exists():
-            for jre_dir in sorted(adoptium_base.iterdir(), reverse=True):
-                candidates.append(jre_dir / "bin" / "java.exe")
-        # Oracle / OpenJDK
-        java_base = Path(program_files) / "Java"
-        if java_base.exists():
-            for jdk_dir in sorted(java_base.iterdir(), reverse=True):
-                candidates.append(jdk_dir / "bin" / "java.exe")
-
+        roots.append(Path(program_files) / "Eclipse Adoptium")
+        roots.append(Path(program_files) / "Java")
     elif platform == "macos":
-        candidates.extend([
+        roots.append(Path("/Library/Java/JavaVirtualMachines"))
+        cands.extend([
+            Path("/opt/homebrew/opt/openjdk/bin/java"),
+            Path("/usr/local/opt/openjdk/bin/java"),
             Path("/usr/bin/java"),
-            Path("/Library/Java/JavaVirtualMachines"),
         ])
-        # Homebrew
-        for brew_dir in [Path("/opt/homebrew/opt/openjdk/bin/java"),
-                         Path("/usr/local/opt/openjdk/bin/java")]:
-            candidates.append(brew_dir)
-
     else:  # linux
-        candidates.extend([
-            Path("/usr/bin/java"),
-            Path("/usr/local/bin/java"),
-        ])
+        cands.extend([Path("/usr/bin/java"), Path("/usr/local/bin/java")])
 
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_file():
-            logger.debug("Found java at: %s", candidate)
-            return candidate
+    for root in roots:
+        if not root.exists():
+            continue
+        for dist in sorted(root.iterdir(), reverse=True):
+            # Adoptium/Oracle: <dist>/bin/java(.exe); macOS bundle:
+            # <dist>/Contents/Home/bin/java.
+            cands.append(dist / "bin" / exe)
+            cands.append(dist / "Contents" / "Home" / "bin" / exe)
 
-    logger.debug("java not found on this system")
-    return None
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for c in cands:
+        try:
+            rc = c.resolve()
+        except OSError:
+            rc = c
+        if rc not in seen and c.exists() and c.is_file():
+            seen.add(rc)
+            out.append(c)
+    return out
+
+
+def find_java() -> Path | None:
+    """Find a Java executable, preferring the newest installed major version.
+
+    FreeRouting v2.2.x needs Java 25; an older PATH java (e.g. 21) would force
+    the v1.9.0 fallback (F13). Preferring the newest discovered JDK lets the
+    router use its newest JAR without any per-machine configuration. An explicit
+    ``KICAD_MCP_JAVA_PATH`` / ``config.java_path`` still overrides this in the
+    caller, so a user can pin a specific runtime.
+
+    Returns:
+        Path to the newest java executable found, or None.
+    """
+    cands = _java_candidates()
+    if not cands:
+        logger.debug("java not found on this system")
+        return None
+    if len(cands) == 1:
+        return cands[0]
+
+    best: Path | None = None
+    best_ver = -1
+    for c in cands:
+        ver = detect_java_major_version(c)
+        if ver is not None and ver > best_ver:
+            best_ver, best = ver, c
+    chosen = best if best is not None else cands[0]
+    logger.debug(
+        "Selected java: %s (major %s of %d candidates)",
+        chosen, best_ver if best is not None else "unknown", len(cands),
+    )
+    return chosen
 
 
 def _freerouting_min_java(jar_name: str) -> int:

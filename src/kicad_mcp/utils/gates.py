@@ -51,12 +51,31 @@ def check_gate(file_path: Path, validator_name: str) -> dict[str, Any] | None:
     return None
 
 
-def _gate_message(validator_name: str, gated_tool: str, gap: dict[str, Any], fix_hint: str) -> str:
+def _gate_message(
+    validator_name: str,
+    gated_tool: str,
+    gap: dict[str, Any],
+    fix_hint: str,
+    *,
+    advisory: bool = False,
+) -> str:
     if not gap["ran"]:
+        if advisory:
+            return (
+                f"Advisory: {gated_tool} is proceeding without a recorded pass of "
+                f"{validator_name} for the current file state. Consider running "
+                f"{validator_name}(path) first to catch ERC/connectivity issues; "
+                f"{gated_tool} will continue regardless."
+            )
         return (
             f"{gated_tool} requires {validator_name} to have passed on the current "
             f"file state first — it has not been run (or the file changed since). "
             f"Call {validator_name}(path), resolve any issues, then retry."
+        )
+    if advisory:
+        return (
+            f"Advisory: the most recent {validator_name} run did not pass. "
+            f"{fix_hint} {gated_tool} will continue regardless."
         )
     return (
         f"{gated_tool}: the most recent {validator_name} run did not pass. "
@@ -100,5 +119,5 @@ def warn_if_ungated(
         return None
     return {
         "type": f"{validator_name}_not_passed",
-        "message": _gate_message(validator_name, gated_tool, gap, fix_hint),
+        "message": _gate_message(validator_name, gated_tool, gap, fix_hint, advisory=True),
     }

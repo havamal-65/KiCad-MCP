@@ -211,7 +211,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Args:
             path: Path to .kicad_pcb file.
             include: Optional list of sections to return. Omit for all sections.
-                     Valid values: components, nets, tracks, vias, zones.
+                     Valid values: components, nets, tracks, vias, zones, pads.
+                     "pads" is opt-in (only when explicitly listed): it attaches a
+                     per-pad net map to each component ([{"pad", "net"}, ...]) so a
+                     full netlist can be reconstructed from one call, without a
+                     get_net_connections fan-out (F7). Pad nets are read from the
+                     .kicad_pcb on disk, so save the board first for live edits.
                      The "info" section is always returned regardless of this filter.
 
         Returns:
@@ -221,10 +226,26 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_board_ops()
         result = ops.read_board(p)
 
-        VALID = {"components", "nets", "tracks", "vias", "zones"}
+        VALID = {"components", "nets", "tracks", "vias", "zones", "pads"}
+        want_pads = include is not None and "pads" in include
         if include:
             keep = set(include) & VALID
+            if want_pads:
+                keep.add("components")  # per-pad nets attach to components
             result = {k: v for k, v in result.items() if k == "info" or k in keep}
+
+        if want_pads and isinstance(result.get("components"), list):
+            from kicad_mcp.utils.placement_metrics import read_board_pads
+            content = p.read_text(encoding="utf-8")
+            by_ref: dict[str, list[dict[str, str]]] = {}
+            for pr in read_board_pads(content):
+                by_ref.setdefault(pr["ref"], []).append(
+                    {"pad": pr["pad"], "net": pr["net_name"]}
+                )
+            components: list[Any] = result["components"]
+            for comp in components:
+                if isinstance(comp, dict):
+                    comp["pads"] = by_ref.get(comp.get("reference", ""), [])
 
         change_log.record("read_board", {"path": path})
         return json.dumps({"status": "success", **limit_response(result)}, indent=2)

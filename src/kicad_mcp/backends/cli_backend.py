@@ -409,6 +409,30 @@ class CLIDRCOps(DRCOps):
 
         return erc_result
 
+    def generate_netlist(
+        self, schematic_path: Path, output: Path, fmt: str = "kicadsexpr",
+    ) -> dict[str, Any]:
+        """Export a netlist from a schematic via ``kicad-cli sch export netlist``.
+
+        Used as the headless fallback when no live KiCad connection is available
+        but kicad-cli is on PATH (F6). ``fmt`` defaults to ``kicadsexpr`` (valid
+        on KiCad 9 and 10); other formats: kicadxml, spice, orcadpcb2, etc.
+        """
+        output.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            "sch", "export", "netlist",
+            "--output", str(output),
+            "--format", fmt,
+            str(schematic_path),
+        ]
+        result = self._run(args)
+        return {
+            "generated": output.exists(),
+            "output_file": str(output),
+            "format": fmt,
+            "returncode": result.returncode,
+        }
+
 
 class CLIBackend(KiCadBackend):
     """Backend using kicad-cli for headless operations."""

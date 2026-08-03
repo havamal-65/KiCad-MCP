@@ -394,6 +394,52 @@ def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, An
     return min(rungs, key=_unrouted_key), False
 
 
+def _resolve_routing_runtime(
+    config: KiCadMCPConfig, freerouting_jar: str, java_path: str,
+) -> dict[str, Any]:
+    """Report which Java + FreeRouting the router will use, and how each was
+    chosen — without launching anything (F13). Mirrors the resolution order in
+    ``_impl_run_freerouter`` so the preflight can't disagree with the real run.
+    """
+    from kicad_mcp.utils.platform_helper import detect_java_major_version
+
+    # Read config defensively: this info-only preflight must never break routing,
+    # and some harnesses pass a bare dict rather than a KiCadMCPConfig.
+    cfg_java = getattr(config, "java_path", None)
+    cfg_jar = getattr(config, "freerouting_jar", None)
+
+    java: Path | None
+    java_source: str
+    if java_path:
+        java, java_source = Path(java_path), "argument"
+    elif cfg_java:
+        java, java_source = cfg_java, "KICAD_MCP_JAVA_PATH/config"
+    else:
+        java, java_source = find_java(), "auto-detected (PATH)"
+    java_major = (
+        detect_java_major_version(java)
+        if (java is not None and java.exists()) else None
+    )
+
+    jar: Path | None
+    jar_source: str
+    if freerouting_jar:
+        jar, jar_source = Path(freerouting_jar), "argument"
+    elif cfg_jar:
+        jar, jar_source = cfg_jar, "config"
+    else:
+        jar, jar_source = find_freerouting_jar(java_major), f"auto (java {java_major})"
+
+    return {
+        "java_path": str(java) if java else None,
+        "java_source": java_source,
+        "java_major": java_major,
+        "freerouting_jar": jar.name if jar else None,
+        "jar_source": jar_source,
+        "freerouting_version": _freerouting_version_from_jar(jar.name) if jar else None,
+    }
+
+
 def _impl_run_freerouter(
     dsn_path: str,
     output: str,
@@ -1193,6 +1239,14 @@ def register_tools(
         report["steps"].append({
             "step": "placement_quality_gate",
             "status": "success",
+        })
+
+        # Routing preflight (F13): surface which FreeRouting + Java runtime this
+        # run resolved, and how — so the router version is never a silent guess.
+        report["steps"].append({
+            "step": "routing_preflight",
+            "status": "info",
+            **_resolve_routing_runtime(config, freerouting_jar, java_path),
         })
 
         # Step 1: Clean board (optional)

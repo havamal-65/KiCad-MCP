@@ -67,6 +67,74 @@ def _is_on_grid(value: float, grid: float = _SCH_GRID_MM, tolerance: float = 0.0
     return abs(value - _snap_to_grid(value, grid)) <= tolerance
 
 
+# --- symbol-name index cache (F5b) -------------------------------------------
+# search_symbols scans every stock symbol library on each call. A full
+# S-expression parse of ~200 multi-MB .kicad_sym files is slow (>2 min on a
+# multi-version install). Cache each file's top-level symbol names keyed by
+# mtime, extracted with a cheap paren-depth scan instead of a full parse.
+_SYMBOL_TOKEN_RE = re.compile(r'\(\s*symbol\s+"([^"]+)"')
+_symbol_name_cache: dict[Path, tuple[float, list[str]]] = {}
+
+
+def _top_level_symbol_names(text: str) -> list[str]:
+    """Top-level symbol names in a .kicad_sym body, without a full parse.
+
+    Top-level symbols sit at paren-depth 1 (directly inside the root
+    ``kicad_symbol_lib``); unit sub-symbols nest deeper and are excluded, matching
+    what the old full-tree top-level walk returned. String literals are skipped so
+    parens inside quoted text don't perturb the depth count.
+    """
+    names: list[str] = []
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == "(":
+            if depth == 1:
+                m = _SYMBOL_TOKEN_RE.match(text, i)
+                if m:
+                    names.append(m.group(1))
+            depth += 1
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            i += 1
+            continue
+        i += 1
+    return names
+
+
+def _cached_symbol_names(lib_path: Path) -> list[str]:
+    """Top-level symbol names for a library file, cached by mtime (F5b)."""
+    try:
+        mtime = lib_path.stat().st_mtime
+    except OSError:
+        return []
+    hit = _symbol_name_cache.get(lib_path)
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    try:
+        text = lib_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    names = _top_level_symbol_names(text)
+    _symbol_name_cache[lib_path] = (mtime, names)
+    return names
+
+
 # Half a grid step — the coincidence/on-segment tolerance for stub collision
 # checks (#19). A stub endpoint or segment within this distance of another pin
 # would create a silent schematic short.
@@ -2892,6 +2960,12 @@ class FileSchematicOps(SchematicOps):
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
+        # Snap the symbol origin to the schematic grid so the power pin lands
+        # on-grid — off-grid power flags produce endpoint_off_grid ERC warnings
+        # and diagonal wire stubs (F9).
+        x = _snap_to_grid(x)
+        y = _snap_to_grid(y)
+
         # Power symbols use lib_id "power:<name>" and Reference "#PWR0XX"
         # Auto-increment PWR reference by scanning existing ones
         content = path.read_text(encoding="utf-8")
@@ -3062,8 +3136,11 @@ class FileSchematicOps(SchematicOps):
         for i, s in enumerate(symbols):
             try:
                 name = s.get("name", "")
-                x = float(s.get("x", 0.0))
-                y = float(s.get("y", 0.0))
+                # Snap the symbol origin to the schematic grid so the power pin
+                # lands on-grid — off-grid power flags produce endpoint_off_grid
+                # ERC warnings and diagonal wire stubs (F9).
+                x = _snap_to_grid(float(s.get("x", 0.0)))
+                y = _snap_to_grid(float(s.get("y", 0.0)))
                 rotation = float(s.get("rotation", 0.0))
 
                 if not name:
@@ -4498,25 +4575,20 @@ class FileLibraryOps(LibraryOps):
         self._footprint_libs = sorted(set(self._footprint_map.values()))
 
     def search_symbols(self, query: str) -> list[dict[str, Any]]:
-        results = []
+        results: list[dict[str, Any]] = []
         query_lower = query.lower()
         for lib_path in self._symbol_libs:
             lib_name = lib_path.stem
-            try:
-                tree = parse_sexp_file(lib_path)
-                for node in tree:
-                    if (isinstance(node, list) and len(node) >= 2
-                            and node[0] == "symbol"):
-                        sym_name = node[1] if isinstance(node[1], str) else ""
-                        if query_lower in sym_name.lower():
-                            results.append({
-                                "name": sym_name,
-                                "library": lib_name,
-                                "lib_id": f"{lib_name}:{sym_name}",
-                            })
-            except Exception as e:
-                logger.debug("Error reading symbol lib %s: %s", lib_path, e)
-        return results[:50]  # Limit results
+            for sym_name in _cached_symbol_names(lib_path):
+                if query_lower in sym_name.lower():
+                    results.append({
+                        "name": sym_name,
+                        "library": lib_name,
+                        "lib_id": f"{lib_name}:{sym_name}",
+                    })
+                    if len(results) >= 50:
+                        return results
+        return results  # already capped at 50
 
     def search_footprints(self, query: str) -> list[dict[str, Any]]:
         results = []

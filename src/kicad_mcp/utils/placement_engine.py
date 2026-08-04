@@ -40,6 +40,7 @@ from kicad_mcp.utils.keepout import (
 )
 from kicad_mcp.utils.placement_config import (
     classify_net,
+    get_bool,
     get_float,
     get_int,
     get_str,
@@ -2025,6 +2026,207 @@ def normalize_orientations(
     return plan, warnings
 
 
+def tidy_placement(
+    parts: list[PartRecord],
+    plan: dict[str, tuple[float, float, float]],
+    roles: dict[str, str],
+    anchors: dict[str, tuple[float, float, float]],
+    board_rect: tuple[float, float, float, float],
+    decap_pairing: dict[str, str | None] | None = None,
+    keepout_filter: _KeepoutFilter | None = None,
+) -> tuple[dict[str, tuple[float, float, float]], list[dict[str, object]]]:
+    """Post-legalization tidy-up (FC — F12/F15): make the layout look aligned and
+    square without regressing routing.
+
+    Four bounded steps — coarse-grid snap, same-footprint row/column alignment,
+    paired-part orientation squaring, and far-decap tightening — each accepting a
+    move only when it stays legal (in outline, no courtyard overlap, keep-out
+    clean) AND does not increase Total HPWL (the same never-worse guard as
+    ``normalize_orientations`` pass (b)). Anchors (edge connectors) are never moved
+    — they are fixed obstacles and absent from ``plan``. Sequential single-part
+    commits keep the layout overlap-free at every step, so no re-legalize is
+    needed. Deterministic; a no-op when ``TIDY_ENABLE`` is false.
+    """
+    warnings: list[dict[str, object]] = []
+    if not get_bool("TIDY_ENABLE"):
+        return plan, warnings
+
+    by_ref = {p["ref"]: p for p in parts}
+    plan = dict(plan)
+    bxmin, bymin, bxmax, bymax = board_rect
+    grid = get_float("TIDY_GRID_MM")
+    band = get_float("TIDY_ALIGN_BAND_MM")
+    quantum = get_float("ORIENT_ROTATION_QUANTUM_DEG")
+
+    def legal_single(ref: str, x: float, y: float, rot: float) -> bool:
+        nb = _board_box(by_ref[ref], (x, y), rot)
+        if nb[0] < bxmin - 1e-6 or nb[1] < bymin - 1e-6 or \
+           nb[2] > bxmax + 1e-6 or nb[3] > bymax + 1e-6:
+            return False
+        pos_all = dict(plan)
+        pos_all.update(anchors)
+        for other, opos in pos_all.items():
+            if other == ref:
+                continue
+            other_rec = by_ref.get(other)
+            if other_rec is None:  # anchor obstacle with no record — skip defensively
+                continue
+            obox = _board_box(other_rec, (opos[0], opos[1]), opos[2])
+            if _boxes_overlap(nb, obox, gap=0.0):
+                return False
+        if keepout_filter is not None and not keepout_filter.empty:
+            pos_all[ref] = (x, y, rot)
+            if keepout_filter.conflicts({ref: (x, y, rot)}, pos_all):
+                return False
+        return True
+
+    pairing = decap_pairing or {}
+
+    def _decap_max(state: dict[str, tuple[float, float, float]]) -> float:
+        dm, _ = measure_decap_distances(parts, roles, pairing, {**state, **anchors})
+        return dm if dm is not None else 0.0
+
+    def accept(ref: str, new_pos: tuple[float, float, float]) -> bool:
+        x, y, rot = new_pos
+        if not legal_single(ref, x, y, rot):
+            return False
+        trial = dict(plan)
+        trial[ref] = new_pos
+        # Never worse on wire length OR decoupling distance. Decaps carry no HPWL
+        # (power/GND pads), so grid-snapping a part near a decap could otherwise
+        # push the cap off its IC undetected — guard both.
+        if _total_hpwl_of(parts, trial, anchors) > _total_hpwl_of(parts, plan, anchors) + 1e-9:
+            return False
+        if pairing and _decap_max(trial) > _decap_max(plan) + 1e-9:
+            return False
+        return True
+
+    def snap(v: float) -> float:
+        return round(round(v / grid) * grid, 4)
+
+    # Decoupling caps are already hugging their IC; the tidy pass leaves their
+    # position to step 4 (tighten-only) rather than grid-snapping / aligning them.
+    movable = sorted(
+        (r for r in plan if r in by_ref and roles.get(r) != ROLE_DECOUPLING_CAP),
+        key=_ref_key,
+    )
+    hpwl_before = _total_hpwl_of(parts, plan, anchors)
+
+    # Step 1 — coarse-grid snap.
+    for ref in movable:
+        x, y, rot = plan[ref]
+        cand = (snap(x), snap(y), rot)
+        if cand != (x, y, rot) and accept(ref, cand):
+            plan[ref] = cand
+
+    # Step 2 — align rows/columns of same-footprint parts to a shared grid line.
+    families: dict[str, list[str]] = {}
+    for ref in movable:
+        families.setdefault(by_ref[ref]["lib_id"], []).append(ref)
+    for lib_id in sorted(families):
+        members = sorted(families[lib_id], key=_ref_key)
+        if len(members) < 2:
+            continue
+        for axis in (1, 0):  # y (rows share a y line) then x (columns share x)
+            vals = sorted(plan[r][axis] for r in members)
+            median = snap(vals[len(vals) // 2])
+            for ref in members:
+                pos = plan[ref]
+                if 1e-9 < abs(pos[axis] - median) <= band + 1e-9:
+                    nx = median if axis == 0 else pos[0]
+                    ny = median if axis == 1 else pos[1]
+                    cand = (nx, ny, pos[2])
+                    if accept(ref, cand):
+                        plan[ref] = cand
+
+    # Step 3 — square paired same-footprint parts to their modal orientation.
+    # Grouped by lib_id (what orientation_consistency scores); this runs on the
+    # already snapped + aligned layout, so freed space lets snaps succeed that
+    # normalize_orientations' tighter pass could not.
+    fam_rot: dict[str, list[str]] = {}
+    for ref in movable:
+        if _orientation_eligible(ref, roles):
+            fam_rot.setdefault(by_ref[ref]["lib_id"], []).append(ref)
+    for lib_id in sorted(fam_rot):
+        members = sorted(fam_rot[lib_id], key=_ref_key)
+        if len(members) < 2:
+            continue
+        buckets: dict[float, int] = {}
+        for ref in members:
+            q = _quantize_rot(plan[ref][2], quantum)
+            buckets[q] = buckets.get(q, 0) + 1
+        modal = sorted(buckets.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        for ref in members:
+            x, y, cur = plan[ref]
+            if _quantize_rot(cur, quantum) == modal:
+                continue
+            cand = (x, y, modal)
+            if accept(ref, cand):
+                plan[ref] = cand
+
+    # Step 4 — tighten far decaps toward the IC they decouple.
+    decap_max = get_float("DECAP_MAX_MM")
+
+    def centre(ref: str) -> tuple[float, float] | None:
+        p = by_ref.get(ref)
+        pos = plan.get(ref) if ref in plan else anchors.get(ref)
+        if p is None or pos is None:
+            return None
+        xmin, ymin, xmax, ymax = _courtyard_of(p)
+        rx, ry = _rotate((xmin + xmax) / 2.0, (ymin + ymax) / 2.0, pos[2])
+        return (pos[0] + rx, pos[1] + ry)
+
+    for cap in sorted((c for c in pairing if c in plan), key=_ref_key):
+        ic = pairing[cap]
+        if ic is None:
+            continue
+        cc = centre(cap)
+        ic_c = centre(ic)
+        if cc is None or ic_c is None:
+            continue
+        cur_dist = math.hypot(cc[0] - ic_c[0], cc[1] - ic_c[1])
+        if cur_dist <= decap_max + 1e-9:
+            continue
+        rot = plan[cap][2]
+        cxmin, cymin, cxmax, cymax = _courtyard_of(by_ref[cap])
+        off = _rotate((cxmin + cxmax) / 2.0, (cymin + cymax) / 2.0, rot)
+        # Bounded grid of candidate origins around the IC centre; keep the legal
+        # one that puts the cap centre closest to the IC (and strictly closer).
+        half = min(cur_dist, 10.0)
+        n_side = min(int(round(2.0 * half / grid)) + 1, 41)
+        step = (2.0 * half) / (n_side - 1) if n_side > 1 else grid
+        best_pos: tuple[float, float, float] | None = None
+        best_d = cur_dist
+        for i in range(n_side):
+            ox = snap(ic_c[0] - half + i * step)
+            for j in range(n_side):
+                oy = snap(ic_c[1] - half + j * step)
+                d = math.hypot(ox + off[0] - ic_c[0], oy + off[1] - ic_c[1])
+                if d < best_d - 1e-9 and legal_single(cap, ox, oy, rot):
+                    best_d = d
+                    best_pos = (ox, oy, rot)
+        if best_pos is not None and accept(cap, best_pos):
+            plan[cap] = best_pos
+        else:
+            warnings.append({
+                "type": "decap_tidy_deferred",
+                "cap": cap,
+                "ic": ic,
+                "distance_mm": round(cur_dist, 4),
+                "reason": "no nearer legal slot free",
+            })
+
+    hpwl_after = _total_hpwl_of(parts, plan, anchors)
+    dmax_after, _ = measure_decap_distances(parts, roles, pairing, {**plan, **anchors})
+    warnings.append({
+        "type": "tidy_summary",
+        "hpwl_before": round(hpwl_before, 4),
+        "hpwl_after": round(hpwl_after, 4),
+        "decap_max_mm": dmax_after,
+    })
+    return plan, warnings
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -2098,11 +2300,20 @@ def plan_placement(
         keepout_filter=keepout_filter,
     )
 
+    # Tidy-up pass (FC — F12/F15) — grid-snap, align, square, tighten decaps;
+    # each move guarded legal + HPWL-non-increasing. Runs last so it refines the
+    # normalized layout; the K2 audit below re-checks its output.
+    plan, tidy_warnings = tidy_placement(
+        parts, plan, roles, anchors, board_rect,
+        decap_pairing=decap_pairing, keepout_filter=keepout_filter,
+    )
+
     warnings: list[dict[str, object]] = []
     warnings.extend({k: v for k, v in w.items()} for w in decap_warnings)
     warnings.extend(place_warnings)  # type: ignore[arg-type]
     warnings.extend(legal_warnings)
     warnings.extend(orient_warnings)
+    warnings.extend(tidy_warnings)
 
     # K2 final audit (REQ-KAVOID-004): report any non-anchored part left in a
     # keep-out, using the gate's own checker on the final geometry so the

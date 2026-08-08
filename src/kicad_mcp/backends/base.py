@@ -102,6 +102,21 @@ class BoardOps(ABC):
         """Refill all copper zones (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support zone refill")
 
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        """Bulk-read every footprint's reference-designator field geometry
+        (position, size, visibility, and body bbox) — requires a live bridge."""
+        raise NotImplementedError("This backend does not support reference-text reads")
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        """Move and/or show-hide a footprint's reference-designator field
+        (requires a live pcbnew bridge backend)."""
+        raise NotImplementedError("This backend does not support reference-text edits")
+
     def get_stackup(self, path: Path) -> dict[str, Any]:
         """Return the board's layer stackup (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support stackup queries")

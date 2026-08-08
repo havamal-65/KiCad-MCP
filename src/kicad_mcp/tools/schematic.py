@@ -800,7 +800,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON {"status": "success", "connected": [...], "failed": [...]}.
             connected entries: {pin, reference, pin_number, x, y,
                                 label_uuid, wire_uuid (null if stub_length=0)}.
-            failed entries: {pin, reason}.
+            failed entries: {pin, reason}. If the pin is missing because of a
+            known KiCad 9->10 symbol pin rename (e.g. the USB-C shield pin
+            S1 -> SH) and the renamed pin exists on the symbol, the failure
+            also carries {known_rename, suggested_pin} and a
+            {type: "pin_rename_9_to_10"} warning naming the new pin — the
+            connection is NOT auto-substituted; re-run with the suggested pin.
             May include "warnings": each stub is collision-checked against every
             other pin; if the preferred direction would short onto a neighbour
             the stub is rerouted, shortened, or (last resort) terminated on the

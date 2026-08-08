@@ -219,3 +219,47 @@ def test_third_party_dir_bad_json_uses_default(tmp_path, monkeypatch):
     monkeypatch.setattr(kv, "config_dir", lambda v: tmp_path / "kicad" / v)
     monkeypatch.setattr(kv, "documents_dir", lambda: tmp_path / "Documents")
     assert kv.third_party_dir("10.0") == tmp_path / "Documents" / "KiCad" / "10.0" / "3rdparty"
+
+
+# --- pin renames (KIR3 FE / REQ-FE-1) ----------------------------------------
+
+def test_pin_rename_shield_full_lib_id():
+    assert kv.lookup_pin_rename("Connector:USB_C_Receptacle_USB2.0_16P", "S1") == "SH"
+
+
+def test_pin_rename_shield_all_library_variants():
+    # Verified against the installed 9.0/10.0 Connector libraries: every
+    # USB_C_Receptacle* variant renamed S1 -> SH.
+    for sym in (
+        "USB_C_Receptacle",
+        "USB_C_Receptacle_PowerOnly_6P",
+        "USB_C_Receptacle_PowerOnly_24P",
+        "USB_C_Receptacle_USB2.0_14P",
+        "USB_C_Receptacle_USB2.0_16P",
+    ):
+        assert kv.lookup_pin_rename(f"Connector:{sym}", "S1") == "SH"
+
+
+def test_pin_rename_bare_symbol_name_accepted():
+    assert kv.lookup_pin_rename("USB_C_Receptacle_USB2.0_16P", "S1") == "SH"
+
+
+def test_pin_rename_unknown_pin_returns_none():
+    assert kv.lookup_pin_rename("Connector:USB_C_Receptacle_USB2.0_16P", "A1") is None
+
+
+def test_pin_rename_unknown_symbol_returns_none():
+    assert kv.lookup_pin_rename("Device:R", "S1") is None
+
+
+def test_pin_rename_empty_lib_id_returns_none():
+    assert kv.lookup_pin_rename("", "S1") is None
+
+
+def test_pin_rename_table_extensible_without_logic_change(monkeypatch):
+    # AC-FE-2: a new entry works through the same lookup, no code change.
+    extended = dict(kv.PIN_RENAMES_9_TO_10)
+    extended["Fake_Symbol"] = {"OLD": "NEW"}
+    monkeypatch.setattr(kv, "PIN_RENAMES_9_TO_10", extended)
+    assert kv.lookup_pin_rename("Lib:Fake_Symbol_Variant", "OLD") == "NEW"
+    assert kv.lookup_pin_rename("Connector:USB_C_Receptacle", "S1") == "SH"

@@ -3324,6 +3324,7 @@ class FileSchematicOps(SchematicOps):
     ) -> dict[str, Any]:
         import uuid as _uuid
 
+        from kicad_mcp.utils.kicad_version import lookup_pin_rename
         from kicad_mcp.utils.validation import validate_net_name
         validate_net_name(net)
 
@@ -3365,10 +3366,39 @@ class FileSchematicOps(SchematicOps):
             pin_positions = info.get("pin_positions", {})
             pin_pos = pin_positions.get(pin_number)
             if pin_pos is None:
-                failed.append({
+                failure: dict[str, Any] = {
                     "pin": pin_str,
                     "reason": f"pin '{pin_number}' not found on '{reference}'",
-                })
+                }
+                # Known KiCad 9->10 pin rename (FE / REQ-FE-1): name the new
+                # pin, but only when it actually exists on this placed symbol
+                # — a wrong symbol carrying neither pin must not get a
+                # misleading rename hint. Warn only; never auto-substitute
+                # (REQ-FE-2), so the pin stays in failed[] and nothing is
+                # written for it.
+                renamed = lookup_pin_rename(info.get("lib_id", ""), pin_number)
+                if renamed is not None and renamed in pin_positions:
+                    suggested = f"{reference}.{renamed}"
+                    failure["reason"] = (
+                        f"pin '{pin_number}' not found on '{reference}' — "
+                        f"renamed to '{renamed}' in KiCad 10 (known KiCad "
+                        f"9->10 symbol pin rename). Re-run with "
+                        f"'{suggested}'. Not auto-substituted."
+                    )
+                    failure["known_rename"] = {
+                        "from": pin_number,
+                        "to": renamed,
+                        "lib_id": info.get("lib_id", ""),
+                        "note": "known KiCad 9->10 symbol pin rename",
+                    }
+                    failure["suggested_pin"] = suggested
+                    warnings.append({
+                        "type": "pin_rename_9_to_10",
+                        "pin": pin_str,
+                        "suggested_pin": suggested,
+                        "message": failure["reason"],
+                    })
+                failed.append(failure)
                 continue
 
             sx = float(info["position"]["x"])

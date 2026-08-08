@@ -43,6 +43,35 @@ ENV_PREFERRED = "KICAD_MCP_KICAD_VERSION"
 
 _VERSION_DIR_RE = re.compile(r"\d+\.\d+")
 
+# Known symbol pin-number renames across KiCad majors (KIR3 FE / REQ-FE-1).
+# Outer key: symbol-name prefix, matched against the part of a lib_id after
+# the ':' (so "Connector:USB_C_Receptacle_USB2.0_16P" is matched by the
+# "USB_C_Receptacle" prefix). Inner mapping: OLD pin number (KiCad 9) ->
+# NEW pin number (KiCad 10+). Seed evidence-based renames only — verified
+# 2026-08-08 against the installed 9.0/10.0 Connector libraries: every
+# USB_C_Receptacle* variant renamed its shield pin S1 -> SH, and no other
+# symbol in our builds renamed any pin between 9 and 10.
+PIN_RENAMES_9_TO_10: dict[str, dict[str, str]] = {
+    "USB_C_Receptacle": {"S1": "SH"},
+}
+
+
+def lookup_pin_rename(lib_id: str, missing_pin: str) -> str | None:
+    """The KiCad-10 pin number for *missing_pin* if it is a known 9->10 rename.
+
+    *lib_id* is a full ``Library:Symbol`` id; a bare symbol name is accepted.
+    Returns ``None`` when the symbol has no rename table or the pin is not in
+    it. Callers must still check the renamed pin actually exists on their
+    placed symbol before suggesting it (a wrong symbol may have neither pin).
+    """
+    sym = lib_id.split(":", 1)[1] if ":" in lib_id else lib_id
+    for prefix, table in PIN_RENAMES_9_TO_10.items():
+        if sym.startswith(prefix):
+            renamed = table.get(missing_pin)
+            if renamed is not None:
+                return renamed
+    return None
+
 
 @dataclass(frozen=True)
 class KicadInstall:

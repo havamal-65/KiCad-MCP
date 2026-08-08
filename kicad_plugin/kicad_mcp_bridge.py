@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.4.1-k10s2"
+_BRIDGE_VERSION = "2.5.0-silk"
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1151,119 @@ def _handle_set_footprint_value(path: str, reference: str, value: str) -> dict[s
     return _run_on_main_thread(_do)
 
 
+# --- Reference-text (silkscreen refdes) handlers (FD / KIR3 S4) -------------
+# The bridge previously only knew whole-footprint moves (SetPosition) and
+# reference renames (SetReference). tidy_silkscreen needs to move and hide the
+# footprint's Reference *field* (a PCB_FIELD / EDA_TEXT) — a distinct object
+# with its own position and visibility. These three handlers are the primitive.
+
+def _ref_text_record(fp) -> dict[str, Any]:
+    """Geometry of one footprint's Reference field, in mm, board coordinates.
+
+    Positions come from the PCB_FIELD directly (absolute board frame). Bounding
+    boxes are wrapped defensively — a KiCad API drift on GetBoundingBox degrades
+    to a text-height estimate rather than crashing the whole bulk read (risk #5).
+    """
+    import pcbnew
+    ref_field = fp.Reference()
+    rpos = ref_field.GetPosition()
+    # Reference-text bbox (silkscreen footprint of the refdes).
+    try:
+        rbb = ref_field.GetBoundingBox()
+        ref_w = pcbnew.ToMM(rbb.GetWidth())
+        ref_h = pcbnew.ToMM(rbb.GetHeight())
+    except Exception:
+        th = pcbnew.ToMM(ref_field.GetTextHeight())
+        ref_h = th
+        ref_w = th * max(1, len(fp.GetReference())) * 0.75
+    # Footprint body/pad bbox with text excluded (two-arg form: no text, no
+    # invisible text) — the obstacle the refdes must sit clear of.
+    try:
+        fbb = fp.GetBoundingBox(False, False)
+        fp_x0 = pcbnew.ToMM(fbb.GetLeft())
+        fp_y0 = pcbnew.ToMM(fbb.GetTop())
+        fp_x1 = pcbnew.ToMM(fbb.GetRight())
+        fp_y1 = pcbnew.ToMM(fbb.GetBottom())
+    except Exception:
+        c = fp.GetPosition()
+        cx, cy = pcbnew.ToMM(c.x), pcbnew.ToMM(c.y)
+        fp_x0, fp_y0, fp_x1, fp_y1 = cx - 0.5, cy - 0.5, cx + 0.5, cy + 0.5
+    return {
+        "reference": fp.GetReference(),
+        "visible": bool(ref_field.IsVisible()),
+        "layer": fp.GetLayerName(),
+        "ref_x": pcbnew.ToMM(rpos.x),
+        "ref_y": pcbnew.ToMM(rpos.y),
+        "ref_w": ref_w,
+        "ref_h": ref_h,
+        "fp_x0": fp_x0, "fp_y0": fp_y0, "fp_x1": fp_x1, "fp_y1": fp_y1,
+    }
+
+
+def _handle_get_reference_text(path: str, reference: str) -> dict[str, Any]:
+    def _do():
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        return _ref_text_record(fp)
+    return _run_on_main_thread(_do)
+
+
+def _handle_get_reference_texts(path: str) -> dict[str, Any]:
+    """Bulk read: one Reference-field record per footprint, one dispatch.
+
+    tidy_silkscreen plans against this single snapshot (obstacle map + current
+    refdes positions) instead of one round-trip per footprint (risk #4).
+    """
+    def _do():
+        board = _get_open_board(path)
+        refs = [_ref_text_record(fp) for fp in board.GetFootprints()]
+        return {"references": refs}
+    return _run_on_main_thread(_do)
+
+
+def _handle_set_reference_text(path: str, reference: str,
+                                x: float | None = None, y: float | None = None,
+                                dx: float | None = None, dy: float | None = None,
+                                visible: bool | None = None) -> dict[str, Any]:
+    """Move and/or show/hide a footprint's Reference field on the live board.
+
+    Absolute ``(x, y)`` takes precedence over relative ``(dx, dy)``; either may
+    be combined with a ``visible`` toggle. Only the Reference field is touched —
+    never nets, the footprint body, or the Value field.
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        ref_field = fp.Reference()
+        bpos = ref_field.GetPosition()
+        before = {
+            "x": pcbnew.ToMM(bpos.x), "y": pcbnew.ToMM(bpos.y),
+            "visible": bool(ref_field.IsVisible()),
+        }
+        if visible is not None:
+            ref_field.SetVisible(bool(visible))
+        if x is not None and y is not None:
+            ref_field.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
+        elif dx is not None or dy is not None:
+            cur = ref_field.GetPosition()
+            ref_field.SetPosition(
+                pcbnew.VECTOR2I(cur.x + _mm(dx or 0.0), cur.y + _mm(dy or 0.0)))
+        _save_and_refresh(board)
+        apos = ref_field.GetPosition()
+        after = {
+            "x": pcbnew.ToMM(apos.x), "y": pcbnew.ToMM(apos.y),
+            "visible": bool(ref_field.IsVisible()),
+        }
+        return {"status": "ok", "reference": reference,
+                "before": before, "after": after}
+    return _run_on_main_thread(_do)
+
+
 def _handle_refill_zones(path: str) -> dict[str, Any]:
     def _do():
         import pcbnew
@@ -1457,6 +1570,15 @@ _DISPATCH = {
     "set_footprint_value": lambda req: _handle_set_footprint_value(
         req["path"], req["reference"], req["value"],
     ),
+    "get_reference_text": lambda req: _handle_get_reference_text(
+        req["path"], req["reference"],
+    ),
+    "get_reference_texts": lambda req: _handle_get_reference_texts(req["path"]),
+    "set_reference_text": lambda req: _handle_set_reference_text(
+        req["path"], req["reference"],
+        req.get("x"), req.get("y"), req.get("dx"), req.get("dy"),
+        req.get("visible"),
+    ),
     "refill_zones":       lambda req: _handle_refill_zones(req["path"]),
     "save_board":         lambda req: _handle_save_board(req["path"]),
     "clear_routes":       lambda req: _handle_clear_routes(
@@ -1486,7 +1608,7 @@ _MUTATING_METHODS = frozenset({
     "place_component", "place_components_bulk", "move_component",
     "remove_component", "add_track", "add_via", "assign_net",
     "set_footprint_value", "refill_zones", "save_board", "clear_routes",
-    "add_board_outline", "auto_place", "import_ses",
+    "add_board_outline", "auto_place", "import_ses", "set_reference_text",
 })
 
 

@@ -183,6 +183,24 @@ class _LiveBoardOps(BoardOps):
             "set_footprint_value", path, reference, value)
         return result
 
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        # bridge extra (not on the BoardOps base); IPC has no equivalent, so
+        # _call falls through to the bridge on the IPC side's AttributeError
+        result: dict[str, Any] = self._call("get_reference_texts", path)
+        return result
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra (not on the BoardOps base)
+        result: dict[str, Any] = self._call(
+            "set_reference_text", path, reference,
+            x=x, y=y, dx=dx, dy=dy, visible=visible)
+        return result
+
     def refill_zones(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("refill_zones", path)
         return result

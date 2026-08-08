@@ -335,6 +335,32 @@ class PluginBoardOps(BoardOps):
                           reference=reference, value=value)
         return result
 
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        # bridge extra: bulk read of every footprint's Reference-field geometry
+        result: dict[str, Any] = self._call("get_reference_texts", path)
+        return result
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra: move/show/hide a footprint's Reference field
+        kwargs: dict[str, Any] = {"reference": reference}
+        if x is not None:
+            kwargs["x"] = x
+        if y is not None:
+            kwargs["y"] = y
+        if dx is not None:
+            kwargs["dx"] = dx
+        if dy is not None:
+            kwargs["dy"] = dy
+        if visible is not None:
+            kwargs["visible"] = visible
+        result: dict[str, Any] = self._call("set_reference_text", path, **kwargs)
+        return result
+
     def refill_zones(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("refill_zones", path)
         return result

@@ -69,6 +69,44 @@ def _impl_clear_routes(
     return json.dumps(result, indent=2)
 
 
+def _clear_routes_for_reroute(
+    p: Path, backend: BackendProtocol, change_log: ChangeLog,
+) -> dict[str, Any]:
+    """Clear routed tracks ahead of a re-route (F16), pipeline-grade fallbacks.
+
+    ``_impl_clear_routes`` (the standalone tool body) falls back only on
+    BridgeTemporarilyUnavailableError. Inside the autoroute pipeline the clear
+    must also degrade like the clean/export/import steps do: on a backend with
+    no live board ops (NotImplementedError/AttributeError) and on a
+    reachable-but-boardless bridge (#13C), fall to the file backend. Raises on
+    real failures. Always writes the clear_routes backup first.
+    """
+    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
+    try:
+        result = backend.get_board_modify_ops().clear_routes(p, backup=True)
+    except (NotImplementedError, AttributeError, BridgeTemporarilyUnavailableError):
+        result = FileBoardOps().clear_routes(p, backup=True)
+    except Exception as exc:
+        if _is_boardless_bridge_error(exc):
+            result = FileBoardOps().clear_routes(p, backup=True)
+        else:
+            raise
+    change_log.record(
+        "clear_routes",
+        {
+            "path": str(p),
+            "tracks_removed": result.get("tracks_removed", 0),
+            "vias_removed": result.get("vias_removed", 0),
+            "reason": "autoroute pre-clear (F16 idempotent re-route)",
+        },
+        file_modified=str(p),
+        backup_path=result.get("backup_path"),
+    )
+    return result
+
+
 def _is_boardless_bridge_error(err: object) -> bool:
     """True if *err* is the reachable-but-boardless bridge failure (#13C).
 
@@ -323,6 +361,51 @@ def _parse_freerouting_track_length(ses_path: Path) -> float | None:
     return total
 
 
+def _ses_well_formed(ses_path: Path) -> bool:
+    """True when *ses_path* looks like a complete Specctra session file.
+
+    Guards the via-ladder and import against the truncated SES a killed
+    FreeRouting process can leave behind (a timeout ``proc.kill()`` can land
+    mid-write). LC-1 probe, verified on pcbnew 9.0.7 AND 10.0.4:
+    ``ImportSpecctraSES`` returns false on a truncated file (without mutating
+    the board) but imports a well-formed *partial* session fine — so this check
+    is exactly the line between "importable" and "hard failure".
+
+    Checks: readable, first token is ``(session``, and parentheses balance.
+    The scan is quote-aware with backslash-escape handling (net names like
+    ``"Net-(C1-Pad1)"`` put parens inside quoted strings — 66 such strings in
+    the LC-0 sample SES), mirroring ``sexp_parser._walk_balanced_parens``.
+    """
+    try:
+        text = ses_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not text.lstrip().startswith("(session"):
+        return False
+    depth = 0
+    in_quote = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            continue
+        if in_quote:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_quote
+
+
 # Via-cost ladder for the v2.x adaptive auto-tune (REQ-FR-6). 50 is FreeRouting's
 # max-completeness default; higher costs trade completeness for fewer vias. The
 # completeness optimum is board-dependent and non-monotonic, so the whole ladder
@@ -363,6 +446,32 @@ def _detect_freerouting_is_v2(
         return False
 
 
+def _rank_via_ladder(rungs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """All rungs in import-preference order (REQ-FR-6 + FF next-best retry).
+
+    Fully-routed rungs first (fewest vias, then shortest track length, then
+    lowest via cost), then incomplete rungs by fewest unrouted with the same
+    tie-break. ``ranked[0]`` is the REQ-FR-6 winner; the tail is the retry
+    order when the winner's session fails to import (REQ-FF-5).
+    """
+    inf = float("inf")
+
+    def _via_key(r: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            r.get("vias") if r.get("vias") is not None else inf,
+            r.get("track_length") if r.get("track_length") is not None else inf,
+            r.get("via_costs", inf),
+        )
+
+    def _unrouted_key(r: dict[str, Any]) -> tuple[Any, ...]:
+        u = r.get("unrouted")
+        return (u if u is not None else inf, *_via_key(r))
+
+    complete = sorted((r for r in rungs if r.get("unrouted") == 0), key=_via_key)
+    rest = sorted((r for r in rungs if r.get("unrouted") != 0), key=_unrouted_key)
+    return complete + rest
+
+
 def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
     """Pick the best via-cost rung — REQ-FR-6.
 
@@ -374,24 +483,8 @@ def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, An
     ``rungs`` entries carry: via_costs, unrouted (int|None), vias (int|None),
     track_length (float|None). Returns ``(winner, fully_complete)``.
     """
-    inf = float("inf")
-
-    def _via_key(r: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            r.get("vias") if r.get("vias") is not None else inf,
-            r.get("track_length") if r.get("track_length") is not None else inf,
-            r.get("via_costs", inf),
-        )
-
-    complete = [r for r in rungs if r.get("unrouted") == 0]
-    if complete:
-        return min(complete, key=_via_key), True
-
-    def _unrouted_key(r: dict[str, Any]) -> tuple[Any, ...]:
-        u = r.get("unrouted")
-        return (u if u is not None else inf, *_via_key(r))
-
-    return min(rungs, key=_unrouted_key), False
+    winner = _rank_via_ladder(rungs)[0]
+    return winner, winner.get("unrouted") == 0
 
 
 def _resolve_routing_runtime(
@@ -1132,11 +1225,20 @@ def register_tools(
         clean_board: bool = True,
         adaptive_via_cost: bool = True,
         via_cost_ladder: list[int] | None = None,
+        clear_routed_tracks: bool = True,
     ) -> str:
         """Run the full auto-routing pipeline on a PCB board.
 
-        Complete workflow: clean board -> export DSN -> run FreeRouting -> import SES.
+        Complete workflow: clear existing routes -> clean board -> export DSN ->
+        run FreeRouting -> import SES.
         Creates a backup of the board before any modifications.
+
+        Re-running autoroute is idempotent (F16): existing routed tracks are
+        cleared first (with a .clear_routes_backup.kicad_pcb), because the SES
+        import ADDS tracks — without the clear, a re-route stacks a second copy
+        of every route on top of the old ones. Pass clear_routed_tracks=False
+        only when deliberately keeping hand-routed tracks; the run then warns
+        that the result may stack.
 
         Board outline and loadability are validated inside export_dsn — no separate
         preflight step is needed here.
@@ -1159,11 +1261,17 @@ def register_tools(
             adaptive_via_cost: Auto-tune the via cost on v2.x (default true).
             via_cost_ladder: Override the via-cost ladder (default
                 [50, 100, 150, 200, 300]). Ignored on v1.x / when adaptive off.
+            clear_routed_tracks: Clear existing routed tracks/vias before
+                routing (default true — idempotent re-route, backup written).
+                False keeps existing tracks and warns about stacking.
 
         Returns:
             JSON with comprehensive routing report. status is "success" (fully
             routed), "partial" (routed but connections remain — carries
-            unrouted), "success_with_drc_errors", or "error".
+            unrouted), "success_with_drc_errors", or "error". On an import
+            failure the status is "error" with error_code "ses_import_failed"
+            and the DSN/SES artifacts are preserved on disk for diagnosis —
+            the board file itself is never modified by a failed import.
         """
         p = validate_kicad_path(path, ".kicad_pcb")
         dsn = p.parent / "freerouting.dsn"
@@ -1249,6 +1357,46 @@ def register_tools(
             **_resolve_routing_runtime(config, freerouting_jar, java_path),
         })
 
+        # Step 1a: Clear existing routes (F16) — idempotent re-route. Routed
+        # tracks survive the clean step below (it removes only net-less
+        # tracks), and the SES import ADDS tracks (LC-1: 477 -> 746 on an
+        # already-routed board), so without this a re-run stacks a second copy
+        # of every route (observed live: 222 -> 413).
+        if clear_routed_tracks:
+            try:
+                clear_result = _clear_routes_for_reroute(p, backend, change_log)
+            except Exception as exc:
+                report["status"] = "error"
+                report["message"] = f"Pre-route clearing failed: {exc}"
+                return json.dumps(report, indent=2)
+            report["steps"].append({
+                "step": "clear_routes",
+                "status": "success",
+                "tracks_removed": clear_result.get("tracks_removed", 0),
+                "vias_removed": clear_result.get("vias_removed", 0),
+                "backup_path": clear_result.get("backup_path"),
+            })
+        else:
+            # Warning-only detection; text-scan approximation is acceptable.
+            import re as _re
+            try:
+                board_text = p.read_text(encoding="utf-8")
+            except OSError:
+                board_text = ""
+            existing = len(_re.findall(r"\(segment[\s(]", board_text)) + len(
+                _re.findall(r"\(via[\s(]", board_text))
+            if existing:
+                report["steps"].append({
+                    "step": "clear_routes",
+                    "status": "skipped",
+                    "existing_tracks": existing,
+                    "warning": (
+                        f"{existing} existing routed track/via item(s) retained — "
+                        "the imported result may stack on top of them; pass "
+                        "clear_routed_tracks=True (default) for a clean re-route."
+                    ),
+                })
+
         # Step 1: Clean board (optional)
         if clean_board:
             result_json = _impl_clean_board_for_routing(
@@ -1264,6 +1412,7 @@ def register_tools(
         # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board),
         # falling back to subprocess pcbnew when the bridge is unreachable or
         # reachable-but-boardless (#13C).
+        dsn.unlink(missing_ok=True)  # stale-artifact guard (FF)
         try:
             dsn_result = _export_dsn_with_fallback(backend, p, dsn)
             # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
@@ -1288,39 +1437,58 @@ def register_tools(
         route_complete = False
         route_unrouted: int | None = None
 
+        import_candidates: list[dict[str, Any]]
         if is_v2 and adaptive_via_cost:
             ladder = via_cost_ladder or _VIA_COST_LADDER
             rungs: list[dict[str, Any]] = []
             for vc in ladder:
                 ses_vc = p.parent / f"freerouting_vc{vc}.ses"
+                # Stale-artifact guard (FF): failure paths preserve SES files
+                # under these deterministic names, so a leftover from a
+                # previous run must be removed before launch — admission below
+                # may only ever see THIS run's output.
+                ses_vc.unlink(missing_ok=True)
                 temp_ses.append(ses_vc)
                 rj = json.loads(_impl_run_freerouter(
                     str(dsn), str(ses_vc), max_passes, freerouting_jar,
                     java_path, config, change_log, via_costs=vc,
                 ))
-                report["steps"].append({"step": "run_freerouter", **rj})
+                step: dict[str, Any] = {"step": "run_freerouter", **rj}
+                # A rung is admitted only if its SES exists AND is structurally
+                # valid — a truncated file from a timeout kill imports as a
+                # hard ImportSpecctraSES failure (REQ-FF-3, LC-1).
                 if ses_vc.exists():
-                    rungs.append({
-                        "via_costs": vc,
-                        "unrouted": rj.get("unrouted"),
-                        "vias": rj.get("vias"),
-                        "track_length": _parse_freerouting_track_length(ses_vc),
-                        "ses_path": str(ses_vc),
-                    })
+                    if _ses_well_formed(ses_vc):
+                        rungs.append({
+                            "via_costs": vc,
+                            "unrouted": rj.get("unrouted"),
+                            "vias": rj.get("vias"),
+                            "track_length": _parse_freerouting_track_length(ses_vc),
+                            "ses_path": str(ses_vc),
+                        })
+                    else:
+                        step["invalid_ses"] = True
+                report["steps"].append(step)
                 if rj.get("status") == "timeout":
                     break  # a stall won't improve at higher costs — stop laddering
 
             if not rungs:
                 report["status"] = "error"
-                report["message"] = "FreeRouting produced no session on any via-cost rung"
-                dsn.unlink(missing_ok=True)
-                for s in temp_ses:
-                    s.unlink(missing_ok=True)
+                report["error_code"] = "no_valid_session"
+                report["message"] = (
+                    "FreeRouting produced no valid session on any via-cost "
+                    "rung. The DSN and any session files are preserved for "
+                    "inspection; the board was not modified."
+                )
+                report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+                report["dsn_preserved"] = str(dsn) if dsn.exists() else None
                 return json.dumps(report, indent=2)
 
-            winner, route_complete = _select_via_ladder_winner(rungs)
-            ses = Path(winner["ses_path"])
+            ranked = _rank_via_ladder(rungs)
+            winner = ranked[0]
+            route_complete = winner.get("unrouted") == 0
             route_unrouted = winner.get("unrouted")
+            import_candidates = ranked
             report["via_ladder"] = {
                 "tried": [r["via_costs"] for r in rungs],
                 "selected_via_cost": winner["via_costs"],
@@ -1329,35 +1497,85 @@ def register_tools(
                 "unrouted": route_unrouted,
             }
         else:
+            ses.unlink(missing_ok=True)  # stale-artifact guard (FF)
             rj = json.loads(_impl_run_freerouter(
                 str(dsn), str(ses), max_passes, freerouting_jar, java_path,
                 config, change_log,
             ))
-            report["steps"].append({"step": "run_freerouter", **rj})
             temp_ses.append(ses)
-            if rj.get("status") in ("error", "timeout") or not ses.exists():
+            single_invalid = ses.exists() and not _ses_well_formed(ses)
+            single_step: dict[str, Any] = {"step": "run_freerouter", **rj}
+            if single_invalid:
+                single_step["invalid_ses"] = True
+            report["steps"].append(single_step)
+            if (rj.get("status") in ("error", "timeout") or not ses.exists()
+                    or single_invalid):
                 report["status"] = "error"
-                report["message"] = f"FreeRouting failed: {rj.get('message', '')}"
-                dsn.unlink(missing_ok=True)
+                if single_invalid:
+                    report["error_code"] = "no_valid_session"
+                    report["message"] = (
+                        "FreeRouting produced an invalid (truncated?) session "
+                        "file. It and the DSN are preserved for inspection; "
+                        "the board was not modified."
+                    )
+                else:
+                    report["message"] = f"FreeRouting failed: {rj.get('message', '')}"
+                report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+                report["dsn_preserved"] = str(dsn) if dsn.exists() else None
                 return json.dumps(report, indent=2)
             route_unrouted = rj.get("unrouted")
             # unrouted 0 → complete; None → v1.x can't report (treat as complete,
             # its optimizer is strong); >0 → partial.
             route_complete = route_unrouted in (0, None)
+            import_candidates = [{"ses_path": str(ses)}]
 
         # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves),
         # falling back to a headless subprocess that loads the board fresh from disk when the
         # bridge is unreachable, boardless, or stale (#7 — preserves file-written Values).
-        try:
-            ses_result = _import_ses_with_fallback(backend, p, ses)
-            report["steps"].append({"step": "import_ses", "status": "success", **ses_result})
-        except Exception as exc:
+        # On the via-ladder, the winner is tried first and each remaining valid
+        # rung is the retry order (REQ-FF-5); a failed import never writes the
+        # board (bridge raises before save, subprocess saves only on success —
+        # LC-1 verified on KiCad 9 + 10), so retrying is safe.
+        import_attempts: list[dict[str, Any]] = []
+        ses_result: dict[str, Any] | None = None
+        imported_rung: dict[str, Any] | None = None
+        for candidate in import_candidates:
+            cand_path = Path(candidate["ses_path"])
+            try:
+                ses_result = _import_ses_with_fallback(backend, p, cand_path)
+                imported_rung = candidate
+                break
+            except Exception as exc:
+                logger.warning("import_ses failed for %s: %s", cand_path, exc)
+                import_attempts.append({
+                    "ses_path": str(cand_path),
+                    "via_costs": candidate.get("via_costs"),
+                    "error": str(exc),
+                })
+        if ses_result is None or imported_rung is None:
             report["status"] = "error"
-            report["message"] = f"SES import failed: {exc}"
-            for s in temp_ses:
-                s.unlink(missing_ok=True)
-            dsn.unlink(missing_ok=True)
+            report["error_code"] = "ses_import_failed"
+            report["message"] = (
+                "SES import failed for every candidate session. The board "
+                "file was NOT modified (a failed import never saves). The DSN "
+                "and session files are preserved on disk for inspection or a "
+                "manual import_ses; per-file errors are in import_attempts."
+            )
+            report["import_attempts"] = import_attempts
+            report["board_modified"] = False
+            report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+            report["dsn_preserved"] = str(dsn) if dsn.exists() else None
             return json.dumps(report, indent=2)
+        import_step: dict[str, Any] = {"step": "import_ses", "status": "success", **ses_result}
+        if import_attempts:
+            import_step["failed_attempts"] = import_attempts
+        report["steps"].append(import_step)
+        # If a retry rung (not the winner) imported, the routed/unrouted truth
+        # comes from THAT rung.
+        if "via_costs" in imported_rung:
+            route_unrouted = imported_rung.get("unrouted")
+            route_complete = route_unrouted == 0
+            report["via_ladder"]["imported_via_cost"] = imported_rung.get("via_costs")
 
         new_tracks = ses_result.get("new_tracks", 0)
         if route_complete:

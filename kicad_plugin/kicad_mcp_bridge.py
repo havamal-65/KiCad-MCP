@@ -51,7 +51,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.5.0-silk"
+_BRIDGE_VERSION = "2.6.0-sync"
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1151,40 @@ def _handle_set_footprint_value(path: str, reference: str, value: str) -> dict[s
     return _run_on_main_thread(_do)
 
 
+def _handle_set_footprint_metadata(
+    path: str, reference: str, sheet_path: str = None, fields: dict = None,
+) -> dict[str, Any]:
+    """Set a footprint's KIID sheet path and/or named text fields (KIR4 NS).
+
+    Replaces sync's file-side sheet-path/ClusterId injection — the last board
+    writes that happened behind the bridge's back. SetPath(KIID_PATH) and
+    SetField verified on KiCad 9.0.7 and 10.0.4 (NS probes P8).
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        if sheet_path is None and not fields:
+            return {
+                "reference": reference,
+                "sheet_path_set": False,
+                "fields_set": [],
+            }
+        if sheet_path is not None:
+            fp.SetPath(pcbnew.KIID_PATH(sheet_path))
+        for k, v in (fields or {}).items():
+            fp.SetField(k, v)
+        _save_and_refresh(board)
+        return {
+            "reference": reference,
+            "sheet_path_set": sheet_path is not None,
+            "fields_set": sorted((fields or {}).keys()),
+        }
+    return _run_on_main_thread(_do)
+
+
 # --- Reference-text (silkscreen refdes) handlers (FD / KIR3 S4) -------------
 # The bridge previously only knew whole-footprint moves (SetPosition) and
 # reference renames (SetReference). tidy_silkscreen needs to move and hide the
@@ -1570,6 +1604,10 @@ _DISPATCH = {
     "set_footprint_value": lambda req: _handle_set_footprint_value(
         req["path"], req["reference"], req["value"],
     ),
+    "set_footprint_metadata": lambda req: _handle_set_footprint_metadata(
+        req["path"], req["reference"],
+        req.get("sheet_path"), req.get("fields"),
+    ),
     "get_reference_text": lambda req: _handle_get_reference_text(
         req["path"], req["reference"],
     ),
@@ -1607,7 +1645,8 @@ _DISPATCH = {
 _MUTATING_METHODS = frozenset({
     "place_component", "place_components_bulk", "move_component",
     "remove_component", "add_track", "add_via", "assign_net",
-    "set_footprint_value", "refill_zones", "save_board", "clear_routes",
+    "set_footprint_value", "set_footprint_metadata", "refill_zones",
+    "save_board", "clear_routes",
     "add_board_outline", "auto_place", "import_ses", "set_reference_text",
 })
 

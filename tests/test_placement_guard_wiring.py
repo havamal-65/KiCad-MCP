@@ -28,8 +28,15 @@ from kicad_mcp.backends.plugin_backend import PluginBoardOps
 # ---------------------------------------------------------------------------
 
 def test_file_place_new_ref_appends(tmp_board: Path):
+    from unittest.mock import patch
+
+    from tests.netlist_stub import MINIMAL_MOD
+
     ops = FileBoardOps()
-    result = ops.place_component(tmp_board, "R9", "DoesNotExist:Stub", 5.0, 5.0)
+    # KIR4 NS: stub fabrication removed — resolve real (minimal) footprint text.
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               return_value=MINIMAL_MOD):
+        result = ops.place_component(tmp_board, "R9", "Test:Square", 5.0, 5.0)
     assert result["reference"] == "R9"
     refs = [c["reference"] for c in ops.get_components(tmp_board)]
     assert refs.count("R9") == 1
@@ -86,14 +93,20 @@ def test_file_bulk_in_batch_dup_refuses_whole_batch(tmp_board: Path):
 
 
 def test_file_bulk_onboard_collisions_are_per_item(tmp_board: Path):
+    from unittest.mock import patch
+
+    from tests.netlist_stub import MINIMAL_MOD
+
     # R1 identical → idempotent skip; C1 at a new position → per-item refusal
     # with the existing state; X9 is clean → placed. One write.
     ops = FileBoardOps()
-    result = ops.place_components_bulk(tmp_board, [
-        {"reference": "R1", "footprint": "Device:R", "x": 100.0, "y": 100.0},
-        {"reference": "C1", "footprint": "Device:C", "x": 55.0, "y": 55.0},
-        {"reference": "X9", "footprint": "DoesNotExist:Stub", "x": 5.0, "y": 5.0},
-    ])
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               return_value=MINIMAL_MOD):
+        result = ops.place_components_bulk(tmp_board, [
+            {"reference": "R1", "footprint": "Device:R", "x": 100.0, "y": 100.0},
+            {"reference": "C1", "footprint": "Device:C", "x": 55.0, "y": 55.0},
+            {"reference": "X9", "footprint": "Test:Square", "x": 5.0, "y": 5.0},
+        ])
     assert result["idempotent"] == ["R1"]
     assert result["placed"] == ["X9"]
     assert len(result["failed"]) == 1

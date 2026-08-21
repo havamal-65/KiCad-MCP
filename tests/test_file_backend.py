@@ -203,31 +203,51 @@ def test_place_components_bulk_single_write(tmp_empty_board: Path, fixture_footp
         write_calls.append(str(self))
         return original_write(self, *args, **kwargs)
 
+    from tests.netlist_stub import MINIMAL_MOD
+
     ops = FileBoardOps()
     components = [
         {"reference": "R1", "footprint": "Device:R", "x": 10.0, "y": 10.0},
         {"reference": "C1", "footprint": "Device:C", "x": 20.0, "y": 10.0},
     ]
 
-    with patch.object(Path, "write_text", counting_write):
+    # KIR4 NS: stubs removed — resolve real (minimal) footprint text so both
+    # items place and the single-write behavior is what's under test.
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               return_value=MINIMAL_MOD), \
+         patch.object(Path, "write_text", counting_write):
         result = ops.place_components_bulk(tmp_empty_board, components)
 
     # Should have written the file exactly once (regardless of component count)
     assert len(write_calls) == 1
-    assert "R1" in result["placed"] or "C1" in result["placed"] or len(result["failed"]) == 2
+    assert set(result["placed"]) == {"R1", "C1"}
 
 
-def test_place_components_bulk_returns_placed(tmp_empty_board: Path):
+def test_place_components_bulk_refuses_missing_footprints(tmp_empty_board: Path):
+    """KIR4 NS: stub fabrication removed — unresolvable footprints become
+    loud per-item failures and the board gains NO footprint blocks."""
     ops = FileBoardOps()
-    # Use stub footprints (library not found → stub placed)
     components = [
         {"reference": "X1", "footprint": "DoesNotExist:Stub", "x": 5.0, "y": 5.0},
         {"reference": "X2", "footprint": "DoesNotExist:Stub", "x": 15.0, "y": 5.0},
     ]
+    before = tmp_empty_board.read_text(encoding="utf-8")
     result = ops.place_components_bulk(tmp_empty_board, components)
-    # Stubs are placed (no footprint lib required for stub path)
-    assert set(result["placed"]) == {"X1", "X2"}
-    assert result["failed"] == []
+    assert result["placed"] == []
+    assert {f["reference"] for f in result["failed"]} == {"X1", "X2"}
+    assert all(
+        "stub placement removed (KIR4 NS)" in f["reason"]
+        for f in result["failed"]
+    )
+    assert tmp_empty_board.read_text(encoding="utf-8") == before
+
+
+def test_place_component_refuses_missing_footprint(tmp_empty_board: Path):
+    """Single-place path: same loud refusal, exact NS §5 message."""
+    import pytest as _pytest
+    ops = FileBoardOps()
+    with _pytest.raises(ValueError, match="stub placement removed"):
+        ops.place_component(tmp_empty_board, "X1", "DoesNotExist:Stub", 5.0, 5.0)
 
 
 def test_place_components_bulk_missing_reference(tmp_empty_board: Path):

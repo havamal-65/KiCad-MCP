@@ -65,7 +65,9 @@ _EMPTY_PCB = textwrap.dedent("""\
 """)
 
 
-def _make_backend():
+def _make_backend(netlist_text: str):
+    from tests.netlist_stub import DrcOpsStub
+
     from kicad_mcp.backends.base import BackendProtocol
     from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
@@ -82,20 +84,36 @@ def _make_backend():
         def get_schematic_modify_ops(self):
             return FileSchematicOps()
 
+        def get_drc_ops(self):
+            return DrcOpsStub(netlist_text)
+
     return _Backend()
 
 
+_NETLIST_COMPONENTS = [
+    {"ref": "R1", "value": "10k", "footprint": "Test:R_0805"},
+    {"ref": "C1", "value": "100nF", "footprint": "Test:C_0603"},
+]
+
+
 def _call_sync(sch_path: Path, pcb_path: Path) -> dict:
+    from tests.netlist_stub import MINIMAL_MOD, make_pretty_lib, render_netlist
+
     mcp = fastmcp.FastMCP("test")
+    netlist_text = render_netlist(_NETLIST_COMPONENTS)
     schematic.register_tools(
-        mcp, _make_backend(), ChangeLog(pcb_path.parent / "changes.json"))
+        mcp, _make_backend(netlist_text),
+        ChangeLog(pcb_path.parent / "changes.json"))
     tool_fn = next(
         t.fn for t in mcp._tool_manager._tools.values()
         if t.name == "sync_schematic_to_pcb"
     )
-    # No .kicad_mod resolution — stub placement path is fine for ref counting.
-    with patch("kicad_mcp.backends.file_backend._load_kicad_mod",
-               return_value=None):
+    pretty = make_pretty_lib(pcb_path.parent, ["R_0805", "C_0603"])
+    # KIR4 NS: stub placement is removed — resolve real (minimal) footprints.
+    with patch("kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+               return_value={"Test": pretty}), \
+         patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               return_value=MINIMAL_MOD):
         return json.loads(tool_fn(str(sch_path), str(pcb_path)))
 
 
@@ -147,8 +165,12 @@ def test_resync_after_partial_manual_placement(tmp_path: Path):
     sch.write_text(_SCH, encoding="utf-8")
     pcb.write_text(_EMPTY_PCB, encoding="utf-8")
 
+    from tests.netlist_stub import MINIMAL_MOD
+
     from kicad_mcp.backends.file_backend import FileBoardOps
-    FileBoardOps().place_component(pcb, "R1", "Test:R_0805", 30.0, 30.0)
+    with patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               return_value=MINIMAL_MOD):
+        FileBoardOps().place_component(pcb, "R1", "Test:R_0805", 30.0, 30.0)
 
     result = _call_sync(sch, pcb)
     placed = [a["reference"] for a in result["actions"] if a["type"] == "placed"]

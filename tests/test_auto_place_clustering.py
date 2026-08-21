@@ -146,32 +146,79 @@ def test_parser_no_instances_block_no_sheet_path():
 # Sync → injection roundtrip
 # ---------------------------------------------------------------------------
 
-def test_inject_footprint_sheet_path_adds_clause(tmp_path: Path):
-    """_inject_footprint_sheet_path adds (path "...") to an existing footprint."""
-    from kicad_mcp.tools.schematic import _inject_footprint_sheet_path
-
+def test_set_footprint_metadata_adds_sheet_path(tmp_path: Path):
+    """set_footprint_metadata adds (path "...") to an existing footprint
+    (KIR4 NS: the sync-side inject helper moved into FileBoardOps)."""
     board = tmp_path / "no_path.kicad_pcb"
     board.write_text(_board(
         {"ref": "R1", "at_x": 10, "at_y": 10},
     ), encoding="utf-8")
 
-    _inject_footprint_sheet_path(board, "R1", "/aaaa-1111")
+    result = FileBoardOps().set_footprint_metadata(
+        board, "R1", sheet_path="/aaaa-1111")
+    assert result == {
+        "reference": "R1", "sheet_path_set": True, "fields_set": [],
+    }
     content = board.read_text(encoding="utf-8")
     assert '(path "/aaaa-1111")' in content
 
 
-def test_inject_footprint_sheet_path_overwrites_existing(tmp_path: Path):
-    from kicad_mcp.tools.schematic import _inject_footprint_sheet_path
-
+def test_set_footprint_metadata_overwrites_sheet_path(tmp_path: Path):
     board = tmp_path / "with_path.kicad_pcb"
     board.write_text(_board(
         {"ref": "R1", "at_x": 10, "at_y": 10, "sheet_path": "/old"},
     ), encoding="utf-8")
 
-    _inject_footprint_sheet_path(board, "R1", "/new")
+    FileBoardOps().set_footprint_metadata(board, "R1", sheet_path="/new")
     content = board.read_text(encoding="utf-8")
     assert '(path "/new")' in content
     assert '(path "/old")' not in content
+
+
+def test_set_footprint_metadata_combined_single_write(tmp_path: Path):
+    """One call carrying BOTH sheet_path and a field performs ONE file write
+    and returns the bridge-parity shape (NS spec §3)."""
+    from unittest.mock import patch as _patch
+
+    board = tmp_path / "combined.kicad_pcb"
+    board.write_text(_board(
+        {"ref": "R1", "at_x": 10, "at_y": 10},
+    ), encoding="utf-8")
+
+    write_calls: list[str] = []
+    original_write = Path.write_text
+
+    def counting_write(self, *args, **kwargs):
+        write_calls.append(str(self))
+        return original_write(self, *args, **kwargs)
+
+    with _patch.object(Path, "write_text", counting_write):
+        result = FileBoardOps().set_footprint_metadata(
+            board, "R1", sheet_path="/abc", fields={"ClusterId": "rf"})
+    assert len(write_calls) == 1
+    assert result == {
+        "reference": "R1", "sheet_path_set": True, "fields_set": ["ClusterId"],
+    }
+    content = board.read_text(encoding="utf-8")
+    assert '(path "/abc")' in content
+    assert '(property "ClusterId" "rf")' in content
+
+
+def test_set_footprint_metadata_noop_and_missing_ref(tmp_path: Path):
+    board = tmp_path / "noop.kicad_pcb"
+    board.write_text(_board(
+        {"ref": "R1", "at_x": 10, "at_y": 10},
+    ), encoding="utf-8")
+    before = board.read_text(encoding="utf-8")
+
+    result = FileBoardOps().set_footprint_metadata(board, "R1")
+    assert result == {
+        "reference": "R1", "sheet_path_set": False, "fields_set": [],
+    }
+    assert board.read_text(encoding="utf-8") == before
+
+    with pytest.raises(ValueError, match="not found on board"):
+        FileBoardOps().set_footprint_metadata(board, "ZZ9", sheet_path="/x")
 
 
 # ---------------------------------------------------------------------------
@@ -231,15 +278,15 @@ def test_cluster_id_groups_independent_of_sheet(tmp_path: Path):
     assert audio == list(range(audio[0], audio[0] + 3)), f"audio_block not contiguous: {placed_order}"
 
 
-def test_inject_footprint_property_adds_cluster_id(tmp_path: Path):
-    """_inject_footprint_property adds ClusterId to an existing footprint."""
-    from kicad_mcp.tools.schematic import _inject_footprint_property
-
+def test_set_footprint_metadata_adds_cluster_id(tmp_path: Path):
+    """set_footprint_metadata adds ClusterId to an existing footprint
+    (KIR4 NS: the sync-side inject helper moved into FileBoardOps)."""
     board = tmp_path / "no_cluster.kicad_pcb"
     board.write_text(_board(
         {"ref": "R1", "at_x": 10, "at_y": 10},
     ), encoding="utf-8")
 
-    _inject_footprint_property(board, "R1", "ClusterId", "rf_block")
+    FileBoardOps().set_footprint_metadata(
+        board, "R1", fields={"ClusterId": "rf_block"})
     content = board.read_text(encoding="utf-8")
     assert '(property "ClusterId" "rf_block")' in content

@@ -46,61 +46,47 @@ def _sync_fn(backend, change_log):
     )
 
 
-def test_sync_refuses_on_validator_failure(tmp_path: Path):
+def test_sync_refuses_on_unresolvable_footprint(tmp_path: Path):
+    """KIR4 NS: the hard sync gate is footprint resolvability (KiCad's netlist
+    proves symbol-side validity; the pin↔pad check lives in the standalone
+    validate_symbol_footprint_pairs tool)."""
+    from tests.netlist_stub import DrcOpsStub, render_netlist
+
     sch = tmp_path / "p.kicad_sch"
     pcb = tmp_path / "p.kicad_pcb"
     sch.write_text("(kicad_sch)", encoding="utf-8")
     pcb.write_text("(kicad_pcb)", encoding="utf-8")
 
     backend = MagicMock()
+    backend.get_drc_ops.return_value = DrcOpsStub(render_netlist([
+        {"ref": "U1", "value": "X", "footprint": "Pkg:Bad"},
+    ]))
     tool_fn = _sync_fn(backend, ChangeLog(tmp_path / "changes.json"))
 
     with patch(
-        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-        return_value=_FAIL,
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+        return_value={},
     ):
         result = json.loads(tool_fn(str(sch), str(pcb), apply_footprint_changes=True))
 
     assert result["status"] == "blocked", result
-    assert result["reason"] == "symbol_footprint_validator_failed", result
-    assert result["mismatches"][0]["ref"] == "U1"
-    assert "U1" in result["message"] and "missing pads" in result["message"]
+    assert result["reason"] == "footprint_unresolvable", result
+    assert result["unresolvable"][0]["ref"] == "U1"
 
-    # The gate fires before any board work — backend ops must never be touched.
+    # The gate fires before any board work — board ops must never be touched.
     backend.get_board_ops.assert_not_called()
     backend.get_board_modify_ops.assert_not_called()
-    backend.get_schematic_ops.assert_not_called()
-
-
-def test_sync_proceeds_when_validator_passes(tmp_path: Path):
-    """Sanity: a passing validator does not short-circuit — sync moves past the
-    gate (and then fails later on the empty fixtures, which is fine; we only
-    assert it is NOT the validator block)."""
-    sch = tmp_path / "p.kicad_sch"
-    pcb = tmp_path / "p.kicad_pcb"
-    sch.write_text("(kicad_sch)", encoding="utf-8")
-    pcb.write_text("(kicad_pcb)", encoding="utf-8")
-
-    backend = MagicMock()
-    backend.get_schematic_ops.return_value.read_schematic.return_value = {"symbols": []}
-    backend.get_board_ops.return_value.read_board.return_value = {"components": []}
-    tool_fn = _sync_fn(backend, ChangeLog(tmp_path / "changes.json"))
-
-    with patch(
-        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-        return_value=_PASS,
-    ):
-        result = json.loads(tool_fn(str(sch), str(pcb)))
-
-    assert result.get("reason") != "symbol_footprint_validator_failed", result
 
 
 # ── §6.3 soft gate — warn when validate_schematic_for_pcb hasn't passed ───────
 
 def _empty_backend():
+    from tests.netlist_stub import DrcOpsStub, render_netlist
+
     backend = MagicMock()
     backend.get_schematic_ops.return_value.read_schematic.return_value = {"symbols": []}
-    backend.get_board_ops.return_value.read_board.return_value = {"components": []}
+    backend.get_board_ops.return_value.get_components.return_value = []
+    backend.get_drc_ops.return_value = DrcOpsStub(render_netlist([]))
     return backend
 
 
@@ -111,11 +97,7 @@ def test_sync_warns_when_schematic_not_validated(tmp_path: Path):
     pcb.write_text("(kicad_pcb)", encoding="utf-8")
     tool_fn = _sync_fn(_empty_backend(), ChangeLog(tmp_path / "changes.json"))
 
-    with patch(
-        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-        return_value=_PASS,
-    ):
-        result = json.loads(tool_fn(str(sch), str(pcb)))
+    result = json.loads(tool_fn(str(sch), str(pcb)))
 
     warn_types = [w.get("type") for w in result.get("warnings", [])]
     assert "validate_schematic_for_pcb_not_passed" in warn_types, result
@@ -130,11 +112,7 @@ def test_sync_no_gate_warning_after_validation(tmp_path: Path):
     record_validation(sch, "validate_schematic_for_pcb", {"passed": True})
     tool_fn = _sync_fn(_empty_backend(), ChangeLog(tmp_path / "changes.json"))
 
-    with patch(
-        "kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-        return_value=_PASS,
-    ):
-        result = json.loads(tool_fn(str(sch), str(pcb)))
+    result = json.loads(tool_fn(str(sch), str(pcb)))
 
     warn_types = [w.get("type") for w in result.get("warnings", [])]
     assert "validate_schematic_for_pcb_not_passed" not in warn_types, result

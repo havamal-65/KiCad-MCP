@@ -101,7 +101,9 @@ _R_ONE_PAD_MOD = "\n".join(
 ) + "\n"
 
 
-def _make_backend():
+def _make_backend(netlist_text: str):
+    from tests.netlist_stub import DrcOpsStub
+
     from kicad_mcp.backends.base import BackendProtocol
     from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
@@ -118,21 +120,47 @@ def _make_backend():
         def get_schematic_modify_ops(self):
             return FileSchematicOps()
 
+        def get_drc_ops(self):
+            return DrcOpsStub(netlist_text)
+
     return _Backend()
 
 
 def _call_sync(sch_path: Path, pcb_path: Path, mods: dict[str, str], **kwargs) -> dict:
-    """Drive sync_schematic_to_pcb with _load_kicad_mod patched to serve *mods*."""
+    """Drive sync_schematic_to_pcb with _load_kicad_mod patched to serve *mods*,
+    the netlist stubbed from the schematic's Footprint field (KIR4 NS), and the
+    footprint gate resolved against a tmp .pretty dir holding the resolvable
+    mods."""
+    from tests.netlist_stub import render_netlist
+
+    sch_fp = re.search(
+        r'\(property "Footprint" "([^"]*)"',
+        sch_path.read_text(encoding="utf-8"),
+    ).group(1)
+    netlist_text = render_netlist([
+        {"ref": "R1", "value": "10k", "footprint": sch_fp},
+    ])
     mcp = fastmcp.FastMCP("test")
-    schematic.register_tools(mcp, _make_backend(), ChangeLog(pcb_path.parent / "changes.json"))
+    schematic.register_tools(
+        mcp, _make_backend(netlist_text),
+        ChangeLog(pcb_path.parent / "changes.json"))
     tool_fn = next(
         t.fn for t in mcp._tool_manager._tools.values() if t.name == "sync_schematic_to_pcb"
     )
 
+    pretty = pcb_path.parent / "Test.pretty"
+    pretty.mkdir(exist_ok=True)
+    for lib_id, text in mods.items():
+        name = lib_id.split(":", 1)[1]
+        (pretty / f"{name}.kicad_mod").write_text(text, encoding="utf-8")
+
     def fake_load(lib_id: str, project_dir=None):
         return mods.get(lib_id)
 
-    with patch("kicad_mcp.backends.file_backend._load_kicad_mod", side_effect=fake_load):
+    with patch("kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+               return_value={"Test": pretty}), \
+         patch("kicad_mcp.backends.file_backend._load_kicad_mod",
+               side_effect=fake_load):
         return json.loads(tool_fn(str(sch_path), str(pcb_path), **kwargs))
 
 
@@ -229,15 +257,17 @@ def test_swap_reports_unmatched_pads(project):
 # Skip-with-reason cases
 # ---------------------------------------------------------------------------
 
-def test_skip_when_new_footprint_unresolvable(project):
+def test_blocked_when_new_footprint_unresolvable(project):
+    """KIR4 NS: an unresolvable footprint now BLOCKS sync at the gate (before
+    any mutation) instead of being skipped mid-swap — stricter, never guessed."""
     sch, pcb = project(sch_footprint="Test:Missing")
     result = _call_sync(sch, pcb, {}, apply_footprint_changes=True)
 
-    assert result["summary"]["footprint_changes_applied"] == 0
-    assert result["summary"]["footprint_changes_skipped"] == 1
-    skip = result["footprint_changes_skipped"][0]
-    assert skip["reference"] == "R1"
-    assert "not found" in skip["reason"]
+    assert result["status"] == "blocked"
+    assert result["reason"] == "footprint_unresolvable"
+    entry = result["unresolvable"][0]
+    assert entry["ref"] == "R1"
+    assert "not found" in entry["reason"]
     # Board untouched
     assert "Test:R_0603" in pcb.read_text(encoding="utf-8")
 
@@ -362,16 +392,17 @@ def test_swap_via_file_when_no_bridge(project):
     assert "Test:R_0603" not in pcb.read_text(encoding="utf-8")
 
 
-def test_no_reload_warning_when_swap_uses_file_backend(project):
-    """With the file backend end-to-end (pcb_ops is FileBoardOps), a swap edits
-    the file but no live board is open — so no board_reload_required warning."""
+def test_reload_warning_when_swap_uses_file_backend(project):
+    """KIR4 NS (spec A4): every file-path swap now emits board_reload_required
+    — the file backend only serves writes when KiCad is closed, where the
+    warning is moot but harmless and kept for continuity."""
     sch, pcb = project()
     result = _call_sync(
         sch, pcb, {"Test:R_0805": _R_0805_MOD}, apply_footprint_changes=True,
     )
 
     reload_warnings = [w for w in result["warnings"] if w.get("type") == "board_reload_required"]
-    assert reload_warnings == []
+    assert len(reload_warnings) == 1
     # Value still synced to the schematic value through set_footprint_value.
     assert '(property "Value" "10k"' in _footprint_block(
         pcb.read_text(encoding="utf-8"), "Test:R_0805"

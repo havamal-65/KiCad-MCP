@@ -117,6 +117,18 @@ class BoardOps(ABC):
         (requires a live pcbnew bridge backend)."""
         raise NotImplementedError("This backend does not support reference-text edits")
 
+    def set_footprint_value(self, path: Path, reference: str, value: str) -> dict[str, Any]:
+        """Set a footprint's Value text on the board."""
+        raise NotImplementedError("This backend does not support value edits")
+
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Set a footprint's KIID sheet path and/or named text fields."""
+        raise NotImplementedError("This backend does not support footprint metadata")
+
     def get_stackup(self, path: Path) -> dict[str, Any]:
         """Return the board's layer stackup (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support stackup queries")
@@ -426,6 +438,12 @@ class DRCOps(ABC):
     def run_erc(self, schematic_path: Path, output: Path | None = None) -> dict[str, Any]:
         """Run Electrical Rules Check on a schematic."""
         raise NotImplementedError("This backend does not support ERC")
+
+    def generate_netlist(
+        self, schematic_path: Path, output: Path, fmt: str = "kicadsexpr",
+    ) -> dict[str, Any]:
+        """Generate a netlist from a schematic (kicad-cli backends)."""
+        raise NotImplementedError("This backend does not support netlist generation")
 
 
 class LibraryOps(ABC):

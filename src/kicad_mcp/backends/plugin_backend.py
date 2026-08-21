@@ -335,6 +335,19 @@ class PluginBoardOps(BoardOps):
                           reference=reference, value=value)
         return result
 
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"reference": reference}
+        if sheet_path is not None:
+            kwargs["sheet_path"] = sheet_path
+        if fields is not None:
+            kwargs["fields"] = fields
+        result: dict[str, Any] = self._call("set_footprint_metadata", path, **kwargs)
+        return result
+
     def get_reference_texts(self, path: Path) -> dict[str, Any]:
         # bridge extra: bulk read of every footprint's Reference-field geometry
         result: dict[str, Any] = self._call("get_reference_texts", path)

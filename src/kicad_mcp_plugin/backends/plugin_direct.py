@@ -183,6 +183,17 @@ class _LiveBoardOps(BoardOps):
             "set_footprint_value", path, reference, value)
         return result
 
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra; IPC has no equivalent, so _call falls through to the
+        # bridge on the IPC side's AttributeError (KIR4 NS).
+        result: dict[str, Any] = self._call(
+            "set_footprint_metadata", path, reference, sheet_path, fields)
+        return result
+
     def get_reference_texts(self, path: Path) -> dict[str, Any]:
         # bridge extra (not on the BoardOps base); IPC has no equivalent, so
         # _call falls through to the bridge on the IPC side's AttributeError

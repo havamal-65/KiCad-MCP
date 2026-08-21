@@ -47,14 +47,23 @@ def _impl_clear_routes(
     Tries the live in-memory bridge path so the bridge cache stays in sync with
     disk. Falls back to FileBoardOps when the bridge is unreachable.
     """
-    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.backends.file_backend import BoardOpenInKiCadError, FileBoardOps
     from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
 
     p = validate_kicad_path(path, ".kicad_pcb")
     try:
         result = backend.get_board_modify_ops().clear_routes(p, backup=backup)
     except BridgeTemporarilyUnavailableError:
-        result = FileBoardOps().clear_routes(p, backup=backup)
+        try:
+            result = FileBoardOps().clear_routes(p, backup=backup)
+        except BoardOpenInKiCadError as exc:
+            # KIR4 NS invariant: the board is open in KiCad but no live path
+            # can serve the write — refuse loudly, never edit behind KiCad.
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
 
     change_log.record(
         "clear_routes",

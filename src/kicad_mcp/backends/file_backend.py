@@ -162,6 +162,36 @@ def _point_on_segment(
 
 
 # ---------------------------------------------------------------------------
+# No-file-write invariant (KIR4 NS / REQ-NS-3)
+# ---------------------------------------------------------------------------
+
+class BoardOpenInKiCadError(RuntimeError):
+    """A .kicad_pcb write was refused because KiCad has the board open."""
+
+    def __init__(self, path: Path, lock_file: Path) -> None:
+        super().__init__(
+            f"'{path.name}' is open in KiCad (lock file {lock_file.name} present). "
+            "Board edits must go through the live path while KiCad is open; close "
+            "the board in KiCad, or if this lock is stale from a crash, delete it."
+        )
+        self.lock_file = lock_file
+
+
+def _refuse_if_open_in_kicad(path: Path) -> None:
+    """Defense-in-depth guard for every file-side board write.
+
+    KiCad drops ``~<name>.kicad_pcb.lck`` beside every open board (NS probe
+    P4). Lock present + a KiCad process running → refuse. A stale lock with
+    no KiCad running does not refuse. ``is_kicad_running`` caches for ~10 s,
+    so the guard can lag KiCad open/close by up to that much — accepted.
+    """
+    from kicad_mcp.utils.platform_helper import is_kicad_running
+    lock = path.parent / f"~{path.name}.lck"
+    if lock.exists() and is_kicad_running():
+        raise BoardOpenInKiCadError(path, lock)
+
+
+# ---------------------------------------------------------------------------
 # Footprint library helpers used by place_component
 # ---------------------------------------------------------------------------
 
@@ -882,6 +912,7 @@ class FileBoardOps(BoardOps):
         self, path: Path, reference: str, footprint: str,
         x: float, y: float, layer: str = "F.Cu", rotation: float = 0.0,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         # Duplicate-ref guard (#16, REQ-DUP-1..3): never append a second
@@ -896,31 +927,16 @@ class FileBoardOps(BoardOps):
         fp_uuid = str(_uuid.uuid4())
 
         kicad_mod = _load_kicad_mod(footprint, self._project_dir)
-        if kicad_mod:
-            fp_sexp = _embed_kicad_mod_as_pcb_footprint(
-                kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+        if not kicad_mod:
+            # A pad-less stub is a silent lie the rest of the pipeline builds
+            # on (nets can't assign, DRC can't see the part) — fail loudly.
+            raise ValueError(
+                f"footprint '{footprint}' not found in libraries — stub "
+                f"placement removed (KIR4 NS)"
             )
-        else:
-            logger.warning(
-                "Footprint '%s' not found in libraries, placing stub without pad geometry",
-                footprint,
-            )
-            rot_clause = f" {rotation}" if rotation else ""
-            fp_sexp = (
-                f'\t(footprint "{footprint}"\n'
-                f'\t\t(layer "{layer}")\n'
-                f'\t\t(at {x} {y}{rot_clause})\n'
-                f'\t\t(uuid "{fp_uuid}")\n'
-                f'\t\t(property "Reference" "{reference}" (at 0 0 0)\n'
-                f'\t\t\t(layer "F.SilkS")\n'
-                f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
-                f'\t\t)\n'
-                f'\t\t(property "Value" "" (at 0 0 0)\n'
-                f'\t\t\t(layer "F.Fab")\n'
-                f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
-                f'\t\t)\n'
-                f'\t)\n'
-            )
+        fp_sexp = _embed_kicad_mod_as_pcb_footprint(
+            kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+        )
 
         content = path.read_text(encoding="utf-8")
         last_paren = content.rfind(")")
@@ -941,6 +957,7 @@ class FileBoardOps(BoardOps):
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_footprint_block_by_reference(content, reference)
         if location is None:
@@ -995,6 +1012,7 @@ class FileBoardOps(BoardOps):
         pad→net map) is what sync_schematic_to_pcb consumes to re-place a
         swapped footprint at the same location with the same nets.
         """
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_footprint_block_by_reference(content, reference)
         if location is None:
@@ -1019,6 +1037,7 @@ class FileBoardOps(BoardOps):
         end_x: float, end_y: float, width: float,
         layer: str = "F.Cu", net: str = "",
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         track_uuid = str(uuid.uuid4())
 
@@ -1051,6 +1070,7 @@ class FileBoardOps(BoardOps):
         size: float = 0.8, drill: float = 0.4,
         net: str = "", via_type: str = "through",
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         via_uuid = str(uuid.uuid4())
 
@@ -1081,6 +1101,7 @@ class FileBoardOps(BoardOps):
     def assign_net(
         self, path: Path, reference: str, pad: str, net: str,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_footprint_block_by_reference(content, reference)
         if location is None:
@@ -1158,6 +1179,7 @@ class FileBoardOps(BoardOps):
         set_footprint_value contract so sync_schematic_to_pcb can push the
         schematic value to whichever backend is live without branching.
         """
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_footprint_block_by_reference(content, reference)
         if location is None:
@@ -1178,6 +1200,64 @@ class FileBoardOps(BoardOps):
             "reference": reference,
             "old_value": old_value,
             "new_value": value,
+        }
+
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Set a footprint's KIID sheet path and/or named fields (KIR4 NS).
+
+        File-side counterpart of the bridge handler — legal only when KiCad
+        is closed (guard). One read-modify-write regardless of how many edits;
+        return shape identical to the bridge's. Sheet-path and property edits
+        are the former sync-side inject helpers, merged.
+        """
+        _refuse_if_open_in_kicad(path)
+        if sheet_path is None and not fields:
+            return {
+                "reference": reference,
+                "sheet_path_set": False,
+                "fields_set": [],
+            }
+
+        content = path.read_text(encoding="utf-8")
+        located = find_footprint_block_by_reference(content, reference)
+        if located is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        start, end = located
+        block = content[start:end + 1]
+
+        def _upsert_after_uuid(blk: str, clause_re: str, clause: str) -> str:
+            existing = re.search(clause_re, blk)
+            if existing:
+                return blk[:existing.start()] + clause + blk[existing.end():]
+            new_blk, n = re.subn(
+                r'(\(uuid\s+"[^"]+"\)\n)', rf'\1\t\t{clause}\n', blk, count=1,
+            )
+            if n == 0:
+                raise ValueError(
+                    f"could not find (uuid ...) anchor in footprint {reference}"
+                )
+            return new_blk
+
+        if sheet_path is not None:
+            block = _upsert_after_uuid(
+                block, r'\(path\s+"[^"]*"\)', f'(path "{sheet_path}")',
+            )
+        for name, val in (fields or {}).items():
+            block = _upsert_after_uuid(
+                block,
+                rf'\(property\s+"{re.escape(name)}"\s+"[^"]*"[^)]*\)',
+                f'(property "{name}" "{val}")',
+            )
+
+        path.write_text(content[:start] + block + content[end + 1:], encoding="utf-8")
+        return {
+            "reference": reference,
+            "sheet_path_set": sheet_path is not None,
+            "fields_set": sorted((fields or {}).keys()),
         }
 
 
@@ -1511,6 +1591,8 @@ class FileBoardOps(BoardOps):
     ) -> dict[str, Any]:
         """Add a rectangular Edge.Cuts board outline to the PCB file.
 
+        Refuses when KiCad has the board open (KIR4 NS guard).
+
         Inserts a ``gr_rect`` element on the Edge.Cuts layer.  Any existing
         ``gr_rect`` on Edge.Cuts is replaced so the outline stays unique.
 
@@ -1525,6 +1607,7 @@ class FileBoardOps(BoardOps):
         Returns:
             Dict with x, y, width, height, x2, y2.
         """
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         content = path.read_text(encoding="utf-8")
@@ -1935,6 +2018,7 @@ class FileBoardOps(BoardOps):
         Returns:
             Dict with tracks_removed, vias_removed, backup_path.
         """
+        _refuse_if_open_in_kicad(path)
         import shutil as _shutil
 
         backup_path_str: str | None = None
@@ -1995,6 +2079,9 @@ class FileBoardOps(BoardOps):
     ) -> dict[str, Any]:
         """Place multiple components in a single file read/write cycle.
 
+        Refuses when KiCad has the board open (KIR4 NS guard, first statement
+        after the docstring).
+
         Reads the board file once, appends all footprint blocks, then writes once.
         components: list of dicts with keys: reference, footprint, x, y,
                     and optionally layer (default "F.Cu") and rotation (default 0.0).
@@ -2005,6 +2092,7 @@ class FileBoardOps(BoardOps):
         collides with a component already on the board gets a per-item outcome
         (idempotent skip or refusal) while clean items proceed.
         """
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         batch_dupes = find_batch_duplicate_refs(components)
@@ -2062,27 +2150,16 @@ class FileBoardOps(BoardOps):
             try:
                 fp_uuid = str(_uuid.uuid4())
                 kicad_mod = _load_kicad_mod(footprint, self._project_dir)
-                if kicad_mod:
-                    fp_sexp = _embed_kicad_mod_as_pcb_footprint(
-                        kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+                if not kicad_mod:
+                    # No silent pad-less stubs (KIR4 NS) — the except below
+                    # turns this into a per-item failed[] entry.
+                    raise ValueError(
+                        f"footprint '{footprint}' not found in libraries — "
+                        f"stub placement removed (KIR4 NS)"
                     )
-                else:
-                    rot_clause = f" {rotation}" if rotation else ""
-                    fp_sexp = (
-                        f'\t(footprint "{footprint}"\n'
-                        f'\t\t(layer "{layer}")\n'
-                        f'\t\t(at {x} {y}{rot_clause})\n'
-                        f'\t\t(uuid "{fp_uuid}")\n'
-                        f'\t\t(property "Reference" "{reference}" (at 0 0 0)\n'
-                        f'\t\t\t(layer "F.SilkS")\n'
-                        f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
-                        f'\t\t)\n'
-                        f'\t\t(property "Value" "" (at 0 0 0)\n'
-                        f'\t\t\t(layer "F.Fab")\n'
-                        f'\t\t\t(effects (font (size 1 1) (thickness 0.15)))\n'
-                        f'\t\t)\n'
-                        f'\t)\n'
-                    )
+                fp_sexp = _embed_kicad_mod_as_pcb_footprint(
+                    kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
+                )
                 inserts.append(fp_sexp)
                 placed.append(reference)
             except Exception as exc:

@@ -99,34 +99,40 @@ def _files(tmp_path: Path) -> tuple[str, str]:
     return str(sch), str(pcb)
 
 
-_FAIL_SF = {
-    "passed": False,
-    "mismatches": [],
-    "unresolvable": [{"ref": "U1", "footprint": "BadLib:NoSuchFP",
-                      "reason": "library not found"}],
-}
+# KIR4 NS: the blocked shape comes from sync v2's footprint gate — driven by a
+# stubbed netlist naming an unresolvable footprint (no fp-lib-table entry).
+
+def _blocked_backend(tmp_path: Path):
+    from tests.netlist_stub import DrcOpsStub, render_netlist
+
+    backend = MagicMock()
+    backend.get_drc_ops.return_value = DrcOpsStub(render_netlist([
+        {"ref": "U1", "value": "X", "footprint": "BadLib:NoSuchFP"},
+    ]))
+    return backend
 
 
 # ── REQ-TEST-003 — sync enrichment, no PCB op ────────────────────────────────
 
 def test_sync_enriches_unresolvable_with_candidates(tmp_path, monkeypatch):
-    monkeypatch.setattr("kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-                        lambda p: copy.deepcopy(_FAIL_SF))
+    monkeypatch.setattr(
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+        lambda project_dir=None: {},
+    )
     monkeypatch.setattr(
         "kicad_mcp.backends.file_backend.FileLibraryOps.search_footprints",
         lambda self, q: [{"name": "NoSuchFP", "library": "Other", "lib_id": "Other:NoSuchFP"}],
     )
-    backend = MagicMock()
+    backend = _blocked_backend(tmp_path)
     sch, pcb = _files(tmp_path)
 
     result = json.loads(_sync_fn(backend, tmp_path)(sch, pcb))
 
     assert result["status"] == "blocked"
-    assert result["reason"] == "symbol_footprint_validator_failed"
+    assert result["reason"] == "footprint_unresolvable"
     cands = result["unresolvable"][0]["candidates"]
     assert cands and cands[0]["lib_id"] == "Other:NoSuchFP"
-    assert "candidates" in result["message"]
-    # No PCB read/modify was attempted — the precondition fires first.
+    # No PCB read/modify was attempted — the gate fires before any mutation.
     backend.get_board_ops.assert_not_called()
     backend.get_board_modify_ops.assert_not_called()
 
@@ -134,22 +140,23 @@ def test_sync_enriches_unresolvable_with_candidates(tmp_path, monkeypatch):
 # ── REQ-TEST-004 — additivity + passing path ─────────────────────────────────
 
 def test_enrichment_is_additive(tmp_path, monkeypatch):
-    monkeypatch.setattr("kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-                        lambda p: copy.deepcopy(_FAIL_SF))
+    monkeypatch.setattr(
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+        lambda project_dir=None: {},
+    )
     monkeypatch.setattr(
         "kicad_mcp.backends.file_backend.FileLibraryOps.search_footprints",
         lambda self, q: [{"name": "NoSuchFP", "library": "Other", "lib_id": "Other:NoSuchFP"}],
     )
     sch, pcb = _files(tmp_path)
-    result = json.loads(_sync_fn(MagicMock(), tmp_path)(sch, pcb))
+    result = json.loads(_sync_fn(_blocked_backend(tmp_path), tmp_path)(sch, pcb))
 
     assert result["status"] == "blocked"
-    assert result["reason"] == "symbol_footprint_validator_failed"
-    assert result["mismatches"] == []
+    assert result["reason"] == "footprint_unresolvable"
     entry = result["unresolvable"][0]
     assert entry["ref"] == "U1"
     assert entry["footprint"] == "BadLib:NoSuchFP"
-    assert entry["reason"] == "library not found"
+    assert entry["reason"] == "footprint library not found"
 
 
 def test_passing_validator_runs_no_candidate_machinery(tmp_path, monkeypatch):
@@ -181,15 +188,17 @@ def test_passing_validator_runs_no_candidate_machinery(tmp_path, monkeypatch):
 # ── REQ-TEST-005 — empty candidates ──────────────────────────────────────────
 
 def test_empty_candidates_no_hint(tmp_path, monkeypatch):
-    monkeypatch.setattr("kicad_mcp.tools.drc.run_validate_symbol_footprint_pairs",
-                        lambda p: copy.deepcopy(_FAIL_SF))
+    monkeypatch.setattr(
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+        lambda project_dir=None: {},
+    )
     monkeypatch.setattr(
         "kicad_mcp.backends.file_backend.FileLibraryOps.search_footprints",
         lambda self, q: [],
     )
     sch, pcb = _files(tmp_path)
-    result = json.loads(_sync_fn(MagicMock(), tmp_path)(sch, pcb))
+    result = json.loads(_sync_fn(_blocked_backend(tmp_path), tmp_path)(sch, pcb))
 
     assert result["unresolvable"][0]["candidates"] == []
-    assert "candidates" not in result["message"]
     assert result["status"] == "blocked"
+    assert result["reason"] == "footprint_unresolvable"

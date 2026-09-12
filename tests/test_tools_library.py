@@ -188,3 +188,85 @@ def test_list_libraries_project_dir_includes_project_libs(tmp_path: Path, _no_sy
     result = json.loads(tools["list_libraries"](project_dir=str(project)))
     names = [e["name"] for e in result["libraries"]]
     assert "AirQuality_Project" in names
+
+
+# ---------------------------------------------------------------------------
+# RW-S1 C5 (spec-multi-unit test 16) — get_symbol_info exposes unit structure
+# ---------------------------------------------------------------------------
+
+FIXTURE_SYM_LIB = """\
+(kicad_symbol_lib (version 20241209) (generator "test")
+  (symbol "DUAL" (pin_numbers (hide no)) (pin_names (offset 0))
+    (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (property "Reference" "U" (at 0 0 0)
+      (effects (font (size 1.27 1.27)))
+    )
+    (symbol "DUAL_0_1"
+      (pin passive line (at 0 7.62 270) (length 2.54)
+        (name "COM" (effects (font (size 1.27 1.27))))
+        (number "5" (effects (font (size 1.27 1.27))))
+      )
+    )
+    (symbol "DUAL_1_1"
+      (pin passive line (at -7.62 0 0) (length 2.54)
+        (name "A1" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27))))
+      )
+      (pin passive line (at 7.62 0 180) (length 2.54)
+        (name "B1" (effects (font (size 1.27 1.27))))
+        (number "2" (effects (font (size 1.27 1.27))))
+      )
+    )
+    (symbol "DUAL_2_1"
+      (pin passive line (at -7.62 0 0) (length 2.54)
+        (name "A2" (effects (font (size 1.27 1.27))))
+        (number "3" (effects (font (size 1.27 1.27))))
+      )
+      (pin passive line (at 7.62 0 180) (length 2.54)
+        (name "B2" (effects (font (size 1.27 1.27))))
+        (number "4" (effects (font (size 1.27 1.27))))
+      )
+    )
+  )
+  (symbol "RR" (pin_numbers (hide no)) (pin_names (offset 0))
+    (exclude_from_sim no) (in_bom yes) (on_board yes)
+    (symbol "RR_0_1"
+      (pin passive line (at -2.54 0 0) (length 0)
+        (name "~" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27))))
+      )
+      (pin passive line (at 2.54 0 180) (length 0)
+        (name "~" (effects (font (size 1.27 1.27))))
+        (number "2" (effects (font (size 1.27 1.27))))
+      )
+    )
+  )
+)
+"""
+
+
+def test_get_symbol_info_unit_count_and_pins(tmp_path: Path):
+    from kicad_mcp.backends.file_backend import FileLibraryOps
+
+    lib = tmp_path / "TestLib.kicad_sym"
+    lib.write_text(FIXTURE_SYM_LIB, encoding="utf-8")
+
+    with patch(
+        "kicad_mcp.utils.kicad_paths.find_symbol_libraries", return_value=[lib]
+    ), patch(
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map", return_value={}
+    ):
+        ops = FileLibraryOps()
+
+    # Multi-unit: unit 0 = pins common to all units, then one entry per unit.
+    info = ops.get_symbol_info("TestLib:DUAL")
+    assert "error" not in info
+    assert info["unit_count"] == 2
+    assert info["unit_pins"] == {"0": ["5"], "1": ["1", "2"], "2": ["3", "4"]}
+
+    # Single-unit symbol authored the stock way (all pins in "_0_1"):
+    # unit_count is 1 and unit_pins reports the structure as authored.
+    info = ops.get_symbol_info("TestLib:RR")
+    assert "error" not in info
+    assert info["unit_count"] == 1
+    assert info["unit_pins"] == {"0": ["1", "2"]}

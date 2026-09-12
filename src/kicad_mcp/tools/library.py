@@ -157,7 +157,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             lib_id: Symbol identifier in 'Library:Symbol' format (e.g. 'Device:R', 'MCU_Microchip:ATmega328P-AU').
 
         Returns:
-            JSON with symbol details: description, pins, properties.
+            JSON with symbol details: description, pins, properties, plus
+            unit_count and unit_pins ({"0": [...], "1": [...], ...} — pin
+            numbers grouped by owning unit; unit 0 = pins common to all units
+            of a multi-unit symbol). unit_count > 1 means placing the full
+            component takes one add_component call per unit, same reference.
         """
         ops = backend.get_library_ops()
         result = ops.get_symbol_info(lib_id)

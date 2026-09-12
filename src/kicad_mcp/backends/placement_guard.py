@@ -174,3 +174,35 @@ def find_batch_duplicate_refs(components: list[dict[str, Any]]) -> list[str]:
             dupes.append(ref)
         seen.add(ref)
     return dupes
+
+
+def find_batch_duplicate_ref_units(
+    components: list[dict[str, Any]],
+) -> list[str]:
+    """(reference, unit) pairs repeated within one schematic bulk input list.
+
+    The schematic-side twin of find_batch_duplicate_refs: symbols may span
+    multiple units, so one batch legally places the same reference more than
+    once as long as each item names a different unit (multi-unit symbols,
+    RW-S1). A repeated (reference, unit) pair is still a malformed list and
+    refuses the whole batch. Board callers keep find_batch_duplicate_refs —
+    footprints have no units.
+
+    Returns "REF (unit N)" strings for each duplicated pair, first-seen order.
+    """
+    seen: set[tuple[str, int]] = set()
+    dupes: list[str] = []
+    for comp in components:
+        ref = str(comp.get("reference", ""))
+        if not ref:
+            continue
+        try:
+            unit = int(comp.get("unit", 1))
+        except (TypeError, ValueError):
+            unit = 1
+        key = (ref, unit)
+        label = f"{ref} (unit {unit})"
+        if key in seen and label not in dupes:
+            dupes.append(label)
+        seen.add(key)
+    return dupes

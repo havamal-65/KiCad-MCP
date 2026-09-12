@@ -24,6 +24,7 @@ from kicad_mcp.backends.base import (
 from kicad_mcp.backends.placement_guard import (
     DuplicateRefError,
     check_placement,
+    find_batch_duplicate_ref_units,
     find_batch_duplicate_refs,
     idempotent_success,
     index_existing,
@@ -2258,6 +2259,64 @@ class FileSchematicOps(SchematicOps):
             return self._read_with_sexp(path)
 
     @staticmethod
+    def _merge_unit_rows(symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """One row per reference, with ``units_placed`` (RW-S1 C4).
+
+        Multi-unit symbols place one block per unit, all sharing a reference;
+        readers must never report two rows for one component. Non-power rows
+        sharing a reference merge into the first row (document order wins for
+        position/value), gaining ``units_placed`` and per-block
+        ``unit_instances``. Power symbols and ref-less rows pass through
+        untouched. Malformed duplicates — the same unit twice, or blocks
+        disagreeing on lib_id or footprint — are recorded on the merged row
+        (``duplicate_units`` / ``lib_id_conflict`` / ``footprint_conflict``)
+        for validate_schematic and the sync footprint-swap gate.
+        """
+        merged: list[dict[str, Any]] = []
+        by_ref: dict[str, dict[str, Any]] = {}
+        for sym in symbols:
+            ref = sym.get("reference", "")
+            if not ref or sym.get("is_power") or ref.startswith("#"):
+                passthrough = dict(sym)
+                passthrough.setdefault("units_placed", [int(sym.get("unit", 1))])
+                merged.append(passthrough)
+                continue
+            unit = int(sym.get("unit", 1))
+            row = by_ref.get(ref)
+            if row is None:
+                row = dict(sym)
+                row["units_placed"] = [unit]
+                row["unit_instances"] = [
+                    {"unit": unit, "position": sym.get("position", {})},
+                ]
+                by_ref[ref] = row
+                merged.append(row)
+                continue
+            if unit in row["units_placed"]:
+                row.setdefault("duplicate_units", []).append(unit)
+            else:
+                row["units_placed"] = sorted(row["units_placed"] + [unit])
+            row["unit_instances"].append(
+                {"unit": unit, "position": sym.get("position", {})},
+            )
+            lib_a = row.get("lib_id", "")
+            lib_b = sym.get("lib_id", "")
+            if lib_a and lib_b and lib_a != lib_b:
+                conflicts = row.setdefault("lib_id_conflict", [lib_a])
+                if lib_b not in conflicts:
+                    conflicts.append(lib_b)
+            fp_a = row.get("footprint", "")
+            fp_b = sym.get("footprint", "")
+            if fp_a and fp_b and fp_a != fp_b:
+                fp_conflicts = row.setdefault("footprint_conflict", [fp_a])
+                if fp_b not in fp_conflicts:
+                    fp_conflicts.append(fp_b)
+            elif fp_b and not fp_a:
+                # Whichever unit carries the footprint wins for the merged row.
+                row["footprint"] = fp_b
+        return merged
+
+    @staticmethod
     def _skip_at_to_pos(at: Any) -> dict[str, float] | None:
         """Extract x,y position from a kicad-skip 'at' ParsedValue."""
         if hasattr(at, "value") and isinstance(at.value, list) and len(at.value) >= 2:
@@ -2299,7 +2358,17 @@ class FileSchematicOps(SchematicOps):
                 pos = self._skip_at_to_pos(sym.at)
                 if pos:
                     symbol_data["position"] = pos
+            if hasattr(sym, "unit"):
+                un = sym.unit
+                try:
+                    raw = un.value if hasattr(un, "value") else un
+                    if isinstance(raw, list):
+                        raw = raw[0]
+                    symbol_data["unit"] = int(float(raw))
+                except (TypeError, ValueError, IndexError):
+                    pass
             symbols.append(symbol_data)
+        symbols = self._merge_unit_rows(symbols)
 
         wires = []
         for wire in getattr(sch, "wire", []):
@@ -2466,6 +2535,8 @@ class FileSchematicOps(SchematicOps):
                 sh = _parse_sheet_node(node)
                 if sh:
                     sheets.append(sh)
+
+        symbols = self._merge_unit_rows(symbols)
 
         return {
             "info": {
@@ -2758,88 +2829,97 @@ class FileSchematicOps(SchematicOps):
     def annotate(self, path: Path) -> dict[str, Any]:
         """Assign sequential reference designators to symbols that have '?' in their reference.
 
-        Processes symbols in document order.  Only modifies references outside the
-        lib_symbols block (i.e. actual placed instances, not library definitions).
+        Processes symbol blocks in document order. Only modifies references
+        outside the lib_symbols block (i.e. actual placed instances, not
+        library definitions). Multi-unit aware (RW-S1 C4): blocks sharing an
+        unannotated reference with DISTINCT units are one component and
+        receive one number (every block and its instances entry rewritten to
+        the same reference); blocks repeating the same (reference, unit) are
+        separate components and number independently — preserving the classic
+        many-"R?" placeholder flow.
         """
-        import re
-
         content = path.read_text(encoding="utf-8")
 
         # Locate the lib_symbols block so we can skip it
-        lib_sym_start = -1
-        lib_sym_end = -1
-        m = re.search(r'\(lib_symbols\b', content)
-        if m:
-            lib_sym_start = m.start()
-            depth = 0
-            for i in range(lib_sym_start, len(content)):
-                if content[i] == '(':
-                    depth += 1
-                elif content[i] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        lib_sym_end = i + 1
-                        break
+        lib_symbols_start = content.find("(lib_symbols")
+        lib_symbols_end = -1
+        if lib_symbols_start != -1:
+            walked = _walk_balanced_parens(content, lib_symbols_start)
+            if walked is not None:
+                lib_symbols_end = walked
 
-        def in_lib_symbols(pos: int) -> bool:
-            return lib_sym_start <= pos < lib_sym_end
+        # Collect placed symbol blocks carrying an unannotated reference,
+        # in document order. Same ref grammar as before: starts with a letter
+        # or '#', ends in '?', no interior '?'.
+        prop_ref_pat = re.compile(r'\(property\s+"Reference"\s+"([A-Za-z#][^?"]*\?)"')
+        entries: list[dict[str, Any]] = []
+        search_start = 0
+        while True:
+            idx = content.find("(symbol", search_start)
+            if idx == -1:
+                break
+            if lib_symbols_start != -1 and lib_symbols_start <= idx <= lib_symbols_end:
+                search_start = lib_symbols_end + 1
+                continue
+            end = _walk_balanced_parens(content, idx)
+            if end is None:
+                break
+            block = content[idx:end + 1]
+            pm = prop_ref_pat.search(block)
+            if pm:
+                unit_m = re.search(r"\(unit\s+(\d+)\)", block)
+                entries.append({
+                    "start": idx,
+                    "end": end,
+                    "old_ref": pm.group(1),
+                    "unit": int(unit_m.group(1)) if unit_m else 1,
+                })
+            search_start = end + 1
 
-        # Find all (reference "X?") occurrences outside lib_symbols, in document order.
-        # These appear inside (instances ...) blocks.
-        inst_ref_pat = re.compile(r'\(reference\s+"([A-Za-z#][^?"]*\?)"\)')
-        # Also find (property "Reference" "X?") outside lib_symbols.
-        prop_ref_pat = re.compile(r'(\(property\s+"Reference"\s+)"([A-Za-z#][^?"]*\?)"')
-
-        # Group counters by prefix
-        counters: dict[str, int] = {}
-
-        # Collect instance-reference matches (these drive numbering)
-        inst_matches = [
-            m for m in inst_ref_pat.finditer(content)
-            if not in_lib_symbols(m.start())
-        ]
-        if not inst_matches:
+        if not entries:
             return {"annotated_count": 0, "message": "No unannotated symbols found"}
 
-        # Assign numbers in document order; build a list of replacements (start, end, new_text)
-        replacements: list[tuple[int, int, str]] = []
-        # Maps the full old ref string → assigned new ref (for updating property lines)
-        old_to_new: dict[str, str] = {}
+        # Number assignment: one number per component. A block joins the open
+        # group for its old reference unless that group already contains its
+        # unit — a repeated unit means a separate component, which claims the
+        # next number and becomes the new open group.
+        counters: dict[str, int] = {}
+        open_groups: dict[str, dict[str, Any]] = {}
+        for e in entries:
+            old_ref = e["old_ref"]
+            grp = open_groups.get(old_ref)
+            if grp is None or e["unit"] in grp["units"]:
+                prefix = old_ref.rstrip("?")
+                if prefix not in counters:
+                    counters[prefix] = 1
+                grp = {"new_ref": f"{prefix}{counters[prefix]}", "units": set()}
+                counters[prefix] += 1
+                open_groups[old_ref] = grp
+            grp["units"].add(e["unit"])
+            e["new_ref"] = grp["new_ref"]
 
-        for m in inst_matches:
-            old_ref = m.group(1)
-            prefix = old_ref.rstrip("?")
-            if prefix not in counters:
-                counters[prefix] = 1
-            new_ref = f"{prefix}{counters[prefix]}"
-            counters[prefix] += 1
-            # Replace just the quoted ref value inside the (reference "...") expression
-            replacements.append((m.start(1), m.end(1), new_ref))
-            old_to_new.setdefault(old_ref, new_ref)
-
-        # Apply instance-reference replacements in reverse order
-        for start, end, new_ref in reversed(replacements):
-            content = content[:start] + new_ref + content[end:]
-
-        # Now update each (property "Reference" "X?") outside lib_symbols.
-        # We can't correlate them 1-to-1 with instances at this point (already replaced),
-        # so re-scan the original positions shifted by our edits by working on the new content.
-        prop_replacements: list[tuple[int, int, str]] = []
-        for m in prop_ref_pat.finditer(content):
-            if in_lib_symbols(m.start()):
-                continue
-            old_ref = m.group(2)
-            if old_ref in old_to_new:
-                # Replace the value part only
-                prop_replacements.append((m.start(2), m.end(2), old_to_new[old_ref]))
-
-        for start, end, new_ref in reversed(prop_replacements):
-            content = content[:start] + new_ref + content[end:]
+        # Rewrite each block (property AND instances references) from the end
+        # of the file backward so earlier offsets stay valid.
+        for e in reversed(entries):
+            block = content[e["start"]:e["end"] + 1]
+            escaped = re.escape(e["old_ref"])
+            new_ref = e["new_ref"]
+            block = re.sub(
+                rf'(\(property\s+"Reference"\s+)"{escaped}"',
+                lambda m: f'{m.group(1)}"{new_ref}"',
+                block,
+            )
+            block = re.sub(
+                rf'(\(reference\s+)"{escaped}"',
+                lambda m: f'{m.group(1)}"{new_ref}"',
+                block,
+            )
+            content = content[:e["start"]] + block + content[e["end"] + 1:]
 
         path.write_text(content, encoding="utf-8")
         return {
-            "annotated_count": len(replacements),
-            "message": f"Annotated {len(replacements)} reference(s)",
+            "annotated_count": len(entries),
+            "message": f"Annotated {len(entries)} reference(s)",
         }
 
     @staticmethod
@@ -2849,11 +2929,14 @@ class FileSchematicOps(SchematicOps):
         mirror: str | None, footprint: str,
         properties: dict[str, str] | None,
         symbol_uuid: str, sch_uuid: str,
+        unit: int = 1,
     ) -> str:
         """Build the (symbol ...) s-expression block for a regular component.
 
         Pure formatting helper — does no file I/O, no library caching, no UUID
         generation. Caller supplies the symbol UUID and schematic UUID.
+        ``unit`` lands in both the block header and the instances path entry
+        (RW-S1 measured fact 2).
         """
         at_clause = f"(at {x} {y} {rotation})"
         mirror_clause = f"\n    (mirror {mirror})" if mirror in ("x", "y") else ""
@@ -2883,36 +2966,187 @@ class FileSchematicOps(SchematicOps):
                 offset += 2
 
         return (
-            f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit 1)\n'
+            f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit {unit})\n'
             f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'{prop_lines}'
             f'    (instances\n'
             f'      (project ""\n'
             f'        (path "/{sch_uuid}"\n'
-            f'          (reference "{reference}") (unit 1)\n'
+            f'          (reference "{reference}") (unit {unit})\n'
             f'        )\n'
             f'      )\n'
             f'    )\n'
             f'  )\n'
         )
 
+    @staticmethod
+    def _find_symbol_blocks_by_reference(
+        content: str, reference: str,
+    ) -> list[dict[str, Any]]:
+        """Every placed symbol block carrying this Reference property.
+
+        Multi-unit symbols place one block per unit, all sharing the same
+        reference (RW-S1 measured fact 2), so by-reference edits must see all
+        of them. Skips the lib_symbols section. Returns
+        ``[{"start", "end", "unit", "lib_id"}, ...]`` in document order; end
+        is inclusive of the closing paren. A block without a ``(unit N)``
+        marker reports unit 1.
+        """
+        escaped_ref = re.escape(reference)
+        ref_pattern = re.compile(rf'\(property\s+"Reference"\s+"{escaped_ref}"')
+
+        lib_symbols_start = content.find("(lib_symbols")
+        lib_symbols_end = -1
+        if lib_symbols_start != -1:
+            walked = _walk_balanced_parens(content, lib_symbols_start)
+            if walked is not None:
+                lib_symbols_end = walked
+
+        blocks: list[dict[str, Any]] = []
+        search_start = 0
+        while True:
+            idx = content.find("(symbol", search_start)
+            if idx == -1:
+                break
+            if lib_symbols_start != -1 and lib_symbols_start <= idx <= lib_symbols_end:
+                search_start = lib_symbols_end + 1
+                continue
+            end = _walk_balanced_parens(content, idx)
+            if end is None:
+                break
+            block = content[idx:end + 1]
+            if ref_pattern.search(block):
+                unit_m = re.search(r"\(unit\s+(\d+)\)", block)
+                lib_m = re.search(r'\(lib_id\s+"([^"]+)"\)', block)
+                blocks.append({
+                    "start": idx,
+                    "end": end,
+                    "unit": int(unit_m.group(1)) if unit_m else 1,
+                    "lib_id": lib_m.group(1) if lib_m else "",
+                })
+            search_start = end + 1
+        return blocks
+
+    def _cached_lib_symbol_unit_info(
+        self, content: str, lib_id: str,
+    ) -> tuple[dict[int, list[dict[str, Any]]], int] | None:
+        """Unit info for a lib_id from the schematic's lib_symbols cache.
+
+        Follows one (extends "Parent") level within the cache — the parent is
+        cached alongside the child by _ensure_lib_symbol_cached. Returns None
+        when the cache has no entry for the lib_id.
+        """
+        lib_sym_start = content.find("(lib_symbols")
+        if lib_sym_start == -1:
+            return None
+        lib_sym_end = _walk_balanced_parens(content, lib_sym_start)
+        if lib_sym_end is None:
+            return None
+        section = content[lib_sym_start:lib_sym_end + 1]
+
+        def _block_for(name: str) -> str | None:
+            m = re.search(rf'\(symbol\s+"{re.escape(name)}"', section)
+            if m is None:
+                return None
+            end = _walk_balanced_parens(section, m.start())
+            if end is None:
+                return None
+            return section[m.start():end + 1]
+
+        block = _block_for(lib_id)
+        if block is None:
+            return None
+        try:
+            # parse_sexp_content of a single block returns that (symbol ...)
+            # node directly (["symbol", "<lib_id>", ...]).
+            parsed = parse_sexp_content(block)
+        except Exception:
+            return None
+        if not (isinstance(parsed, list) and parsed and parsed[0] == "symbol"):
+            return None
+        unit_pins, unit_count = _lib_symbol_unit_info(parsed)
+        if not unit_pins:
+            ext_m = re.search(r'\(extends\s+"([^"]+)"', block)
+            if ext_m:
+                lib_name = lib_id.split(":", 1)[0] if ":" in lib_id else ""
+                parent_id = (
+                    f"{lib_name}:{ext_m.group(1)}" if lib_name else ext_m.group(1)
+                )
+                parent_block = _block_for(parent_id) or _block_for(ext_m.group(1))
+                if parent_block is not None:
+                    try:
+                        parent_parsed = parse_sexp_content(parent_block)
+                        if (isinstance(parent_parsed, list) and parent_parsed
+                                and parent_parsed[0] == "symbol"):
+                            unit_pins, unit_count = _lib_symbol_unit_info(
+                                parent_parsed)
+                    except Exception:
+                        pass
+        return unit_pins, unit_count
+
+    def _validate_unit_placement(
+        self, content: str, lib_id: str, reference: str, unit: int,
+    ) -> None:
+        """C1 validation for (reference, unit) placement. Raises ValueError.
+
+        Checks, in order: unit within the symbol's unit range; reference not
+        already bound to a different lib_id; (reference, unit) not already
+        placed. References containing '?' are unannotated placeholders — they
+        are exempt from the duplicate/mismatch checks so the classic
+        place-many-then-annotate flow keeps working (amendment A5).
+        """
+        info = self._cached_lib_symbol_unit_info(content, lib_id)
+        if info is not None:
+            _, unit_count = info
+            if not (1 <= unit <= unit_count):
+                raise ValueError(
+                    f"symbol '{lib_id}' has {unit_count} unit(s); "
+                    f"requested unit {unit}"
+                )
+        elif unit != 1:
+            # No cache entry to size the symbol against: only the default
+            # single-unit placement is safe to accept.
+            raise ValueError(
+                f"symbol '{lib_id}' has 1 unit(s); requested unit {unit}"
+            )
+
+        if "?" in reference:
+            return
+        existing = self._find_symbol_blocks_by_reference(content, reference)
+        for blk in existing:
+            if blk["lib_id"] and blk["lib_id"] != lib_id:
+                raise ValueError(
+                    f"reference '{reference}' is already placed as "
+                    f"'{blk['lib_id']}'; all units must share one symbol"
+                )
+        if any(blk["unit"] == unit for blk in existing):
+            raise ValueError(
+                f"reference '{reference}' unit {unit} is already placed"
+            )
+
     def add_component(
         self, path: Path, lib_id: str, reference: str, value: str,
         x: float, y: float, rotation: float = 0.0,
         mirror: str | None = None, footprint: str = "",
         properties: dict[str, str] | None = None,
+        unit: int = 1,
     ) -> dict[str, Any]:
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
         content = path.read_text(encoding="utf-8")
         content = self._ensure_lib_symbol_cached(content, lib_id, schematic_path=path)
+        # Placing another unit of a multi-unit symbol = same reference, same
+        # lib_id, different unit (RW-S1 C1). Validates unit range and
+        # (reference, unit) collisions before anything is written.
+        self._validate_unit_placement(content, lib_id, reference, int(unit))
         sch_uuid = self._find_schematic_uuid(content)
 
         sym_sexp = self._build_symbol_block(
             lib_id, reference, value, x, y, rotation,
             mirror, footprint, properties, symbol_uuid, sch_uuid,
+            unit=int(unit),
         )
 
         insert_pos = self._find_insertion_point(content)
@@ -2926,6 +3160,7 @@ class FileSchematicOps(SchematicOps):
             "position": {"x": x, "y": y},
             "rotation": rotation,
             "uuid": symbol_uuid,
+            "unit": int(unit),
         }
         if footprint:
             result["footprint"] = footprint
@@ -3100,6 +3335,27 @@ class FileSchematicOps(SchematicOps):
     ) -> dict[str, Any]:
         import uuid as _uuid
 
+        # Within-batch duplicate guard, keyed on (reference, unit) so one
+        # batch can legally place two units of one multi-unit reference
+        # (RW-S1 C1 / amendment A1). A repeated pair refuses the whole batch
+        # with the file untouched, mirroring the board-side REQ-DUP-4 shape.
+        batch_dupes = find_batch_duplicate_ref_units(components)
+        if batch_dupes:
+            return {
+                "status": "refused",
+                "reason": (
+                    "duplicate (reference, unit) within the batch: "
+                    + ", ".join(batch_dupes)
+                    + " — batch refused, schematic untouched"
+                ),
+                "placed": [],
+                "failed": [
+                    {"reference": label,
+                     "reason": "duplicate (reference, unit) within batch"}
+                    for label in batch_dupes
+                ],
+            }
+
         content = path.read_text(encoding="utf-8")
 
         # Cache each unique lib_id once. Components whose lib_id can't be
@@ -3125,6 +3381,10 @@ class FileSchematicOps(SchematicOps):
         failed: list[dict[str, Any]] = []
         blocks: list[str] = []
 
+        # Accepted-so-far state: pending blocks aren't in `content` until the
+        # single write below, so per-item validation must also see them.
+        accepted: dict[str, dict[str, Any]] = {}
+
         for i, c in enumerate(components):
             try:
                 lib_id = c.get("lib_id", "")
@@ -3136,6 +3396,7 @@ class FileSchematicOps(SchematicOps):
                 mirror = c.get("mirror")
                 footprint = c.get("footprint", "")
                 properties = c.get("properties")
+                unit = int(c.get("unit", 1))
 
                 if not lib_id or not reference:
                     failed.append({
@@ -3151,16 +3412,33 @@ class FileSchematicOps(SchematicOps):
                     })
                     continue
 
+                # C1 validation against the file, then against items already
+                # accepted in this batch (ref/lib mismatch — exact-pair dupes
+                # were pre-refused by the batch guard).
+                self._validate_unit_placement(content, lib_id, reference, unit)
+                prev = accepted.get(reference)
+                if prev is not None and "?" not in reference:
+                    if prev["lib_id"] != lib_id:
+                        raise ValueError(
+                            f"reference '{reference}' is already placed as "
+                            f"'{prev['lib_id']}'; all units must share one symbol"
+                        )
+
                 symbol_uuid = str(_uuid.uuid4())
                 blocks.append(self._build_symbol_block(
                     lib_id, reference, value, x, y, rotation,
                     mirror, footprint, properties, symbol_uuid, sch_uuid,
+                    unit=unit,
                 ))
+                accepted.setdefault(
+                    reference, {"lib_id": lib_id, "units": set()},
+                )["units"].add(unit)
                 placed.append({
                     "reference": reference,
                     "lib_id": lib_id,
                     "uuid": symbol_uuid,
                     "position": {"x": x, "y": y},
+                    "unit": unit,
                 })
             except Exception as exc:
                 failed.append({
@@ -3270,6 +3548,7 @@ class FileSchematicOps(SchematicOps):
         connect_pins_bulk call never re-parses a reference it already touched.
         """
         obstacles: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
         for node in tree:
             if not (isinstance(node, list) and len(node) >= 2 and node[0] == "symbol"):
                 continue
@@ -3281,6 +3560,12 @@ class FileSchematicOps(SchematicOps):
                     break
             if not ref:
                 continue
+            # A multi-unit reference spans several blocks; the resolver
+            # already covers all of them in one call — process each ref once
+            # or its pins would enter the cloud once per block (C3b).
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
             if ref not in ref_cache:
                 ref_cache[ref] = self._resolve_pin_positions(tree, ref, path)
             info = ref_cache[ref]
@@ -3295,6 +3580,19 @@ class FileSchematicOps(SchematicOps):
                     })
                 except (KeyError, TypeError, ValueError):
                     continue
+            # Every common-pin materialization is an obstacle — one per
+            # placed unit, all sharing the pin_id (C3b: common pins must not
+            # vanish from the cloud).
+            for num, entries in info.get("common_pin_positions", {}).items():
+                for mat in entries:
+                    try:
+                        obstacles.append({
+                            "x": float(mat["x"]),
+                            "y": float(mat["y"]),
+                            "pin_id": f"{ref}.{num}",
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
         return obstacles
 
     @staticmethod
@@ -3441,8 +3739,37 @@ class FileSchematicOps(SchematicOps):
                 continue
 
             pin_positions = info.get("pin_positions", {})
+            common_positions = info.get("common_pin_positions", {})
+            unit_positions = info.get("unit_positions", {})
+
+            # A pin materializes at one point (normal unit pin) or at every
+            # placed instance (unit-0 common pin — netting fewer than all of
+            # them is an ERC different_unit_net error, RW-S1 measured fact 4).
             pin_pos = pin_positions.get(pin_number)
-            if pin_pos is None:
+            if pin_pos is not None:
+                materializations = [{
+                    "unit": int(pin_pos.get("unit", 1)),
+                    "x": float(pin_pos["x"]),
+                    "y": float(pin_pos["y"]),
+                }]
+            elif pin_number in common_positions:
+                materializations = [
+                    {"unit": int(m["unit"]),
+                     "x": float(m["x"]),
+                     "y": float(m["y"])}
+                    for m in common_positions[pin_number]
+                ]
+            elif pin_number in info.get("unplaced_pins", {}):
+                owner_unit = info["unplaced_pins"][pin_number]
+                failed.append({
+                    "pin": pin_str,
+                    "reason": (
+                        f"pin '{pin_number}' of '{reference}' belongs to "
+                        f"unit {owner_unit}, which is not placed"
+                    ),
+                })
+                continue
+            else:
                 failure: dict[str, Any] = {
                     "pin": pin_str,
                     "reason": f"pin '{pin_number}' not found on '{reference}'",
@@ -3454,7 +3781,8 @@ class FileSchematicOps(SchematicOps):
                 # (REQ-FE-2), so the pin stays in failed[] and nothing is
                 # written for it.
                 renamed = lookup_pin_rename(info.get("lib_id", ""), pin_number)
-                if renamed is not None and renamed in pin_positions:
+                if renamed is not None and (
+                        renamed in pin_positions or renamed in common_positions):
                     suggested = f"{reference}.{renamed}"
                     failure["reason"] = (
                         f"pin '{pin_number}' not found on '{reference}' — "
@@ -3478,71 +3806,99 @@ class FileSchematicOps(SchematicOps):
                 failed.append(failure)
                 continue
 
-            sx = float(info["position"]["x"])
-            sy = float(info["position"]["y"])
-            px = float(pin_pos["x"])
-            py = float(pin_pos["y"])
+            materializations.sort(key=lambda m: m["unit"])
 
-            # The label/junction point must land on KiCad's 1.27 mm grid or
-            # later grid-drawn wires can never attach to it. The pin-attached
-            # end stays exactly on the pin — moving it would disconnect the
-            # stub — so an off-grid pin gets a warning, never a silent move.
-            if not (_is_on_grid(px) and _is_on_grid(py)):
-                warnings.append({
-                    "type": "off_grid_pin",
-                    "pin": pin_str,
-                    "position": {"x": px, "y": py},
-                    "message": (
-                        f"Pin {pin_str} at ({px}, {py}) is off the 1.27 mm grid; "
-                        f"its stub will be slightly diagonal to reach an on-grid "
-                        f"connection point. Consider move_schematic_component to "
-                        f"an on-grid origin."
-                    ),
-                })
+            # One wire+label per materialization, each stub directed away
+            # from its OWN instance's body (C3) — a unit-2 pin's stub points
+            # away from unit 2, not unit 1.
+            placements: list[dict[str, Any]] = []
+            for mat in materializations:
+                px = mat["x"]
+                py = mat["y"]
+                up = unit_positions.get(str(mat["unit"]))
+                if up is not None:
+                    sx = float(up["x"])
+                    sy = float(up["y"])
+                else:
+                    sx = float(info["position"]["x"])
+                    sy = float(info["position"]["y"])
 
-            if stub_length > 0:
-                # Choose a collision-free stub direction (#19): the stub must
-                # not land its endpoint or run its segment onto another pin.
-                end_x, end_y, stub_warning = self._choose_stub(
-                    px, py, sx, sy, stub_length, obstacles, pin_str,
-                )
-                if stub_warning is not None:
-                    warnings.append(stub_warning)
-            else:
-                end_x = px
-                end_y = py
+                # The label/junction point must land on KiCad's 1.27 mm grid or
+                # later grid-drawn wires can never attach to it. The pin-attached
+                # end stays exactly on the pin — moving it would disconnect the
+                # stub — so an off-grid pin gets a warning, never a silent move.
+                if not (_is_on_grid(px) and _is_on_grid(py)):
+                    warnings.append({
+                        "type": "off_grid_pin",
+                        "pin": pin_str,
+                        "position": {"x": px, "y": py},
+                        "message": (
+                            f"Pin {pin_str} at ({px}, {py}) is off the 1.27 mm grid; "
+                            f"its stub will be slightly diagonal to reach an on-grid "
+                            f"connection point. Consider move_schematic_component to "
+                            f"an on-grid origin."
+                        ),
+                    })
 
-            label_uuid = str(_uuid.uuid4())
-            wire_uuid: str | None = None
+                if stub_length > 0:
+                    # Choose a collision-free stub direction (#19): the stub must
+                    # not land its endpoint or run its segment onto another pin.
+                    end_x, end_y, stub_warning = self._choose_stub(
+                        px, py, sx, sy, stub_length, obstacles, pin_str,
+                    )
+                    if stub_warning is not None:
+                        warnings.append(stub_warning)
+                else:
+                    end_x = px
+                    end_y = py
 
-            # Emit a wire only when the stub has a real length. The #19 fallback
-            # can terminate the stub on the pin (end == pin) even though
-            # stub_length > 0 — that must not write a zero-length wire.
-            if stub_length > 0 and (end_x, end_y) != (px, py):
-                wire_uuid = str(_uuid.uuid4())
+                label_uuid = str(_uuid.uuid4())
+                wire_uuid: str | None = None
+
+                # Emit a wire only when the stub has a real length. The #19 fallback
+                # can terminate the stub on the pin (end == pin) even though
+                # stub_length > 0 — that must not write a zero-length wire.
+                if stub_length > 0 and (end_x, end_y) != (px, py):
+                    wire_uuid = str(_uuid.uuid4())
+                    blocks.append(
+                        f'  (wire (pts (xy {px} {py}) (xy {end_x} {end_y}))\n'
+                        f'    (stroke (width 0) (type default))\n'
+                        f'    (uuid "{wire_uuid}")\n'
+                        f'  )\n'
+                    )
+
                 blocks.append(
-                    f'  (wire (pts (xy {px} {py}) (xy {end_x} {end_y}))\n'
-                    f'    (stroke (width 0) (type default))\n'
-                    f'    (uuid "{wire_uuid}")\n'
+                    f'  (label "{net}" (at {end_x} {end_y} 0)\n'
+                    f'    (effects (font (size 1.27 1.27)))\n'
+                    f'    (uuid "{label_uuid}")\n'
                     f'  )\n'
                 )
 
-            blocks.append(
-                f'  (label "{net}" (at {end_x} {end_y} 0)\n'
-                f'    (effects (font (size 1.27 1.27)))\n'
-                f'    (uuid "{label_uuid}")\n'
-                f'  )\n'
-            )
+                placements.append({
+                    "unit": mat["unit"],
+                    "x": end_x,
+                    "y": end_y,
+                    "label_uuid": label_uuid,
+                    "wire_uuid": wire_uuid,
+                })
 
-            connected.append({
+            # Entry shape: top-level fields = the lowest-unit placement
+            # (backward compatible); placements only for multi-instance
+            # (common-pin) connections.
+            first = placements[0]
+            entry: dict[str, Any] = {
                 "pin": pin_str,
                 "reference": reference,
                 "pin_number": pin_number,
-                "x": end_x,
-                "y": end_y,
-                "label_uuid": label_uuid,
-                "wire_uuid": wire_uuid,
-            })
+                "x": first["x"],
+                "y": first["y"],
+                "label_uuid": first["label_uuid"],
+                "wire_uuid": first["wire_uuid"],
+                "instances": len(placements),
+            }
+            if len(placements) > 1:
+                entry["placements"] = placements
+            connected.append(entry)
 
         if blocks:
             insert_pos = self._find_insertion_point(content)
@@ -3610,15 +3966,23 @@ class FileSchematicOps(SchematicOps):
                 rotation = m.get("rotation")
                 if rotation is not None:
                     rotation = float(rotation)
+                unit = int(m.get("unit", 1))
 
-                location = find_symbol_block_by_reference(content, ref)
-                if location is None:
+                blocks = self._find_symbol_blocks_by_reference(content, ref)
+                if not blocks:
                     failed.append({
                         "index": i, "reference": ref,
                         "reason": f"symbol '{ref}' not found",
                     })
                     continue
-                start, end = location
+                target = next((b for b in blocks if b["unit"] == unit), None)
+                if target is None:
+                    failed.append({
+                        "index": i, "reference": ref,
+                        "reason": f"reference '{ref}' unit {unit} is not placed",
+                    })
+                    continue
+                start, end = target["start"], target["end"]
                 block = content[start:end + 1]
 
                 new_block, _, _, new_rot = self._rewrite_symbol_at(
@@ -3631,6 +3995,7 @@ class FileSchematicOps(SchematicOps):
                     "reference": ref,
                     "position": {"x": x, "y": y},
                     "rotation": new_rot,
+                    "unit": unit,
                 })
             except Exception as exc:
                 # Make the per-item reason self-contained by attaching the
@@ -3688,15 +4053,30 @@ class FileSchematicOps(SchematicOps):
 
         return new_block, old_x, old_y, new_rot
 
+    def _locate_unit_block(
+        self, content: str, path: Path, reference: str, unit: int,
+    ) -> tuple[int, int]:
+        """Find the block for (reference, unit), raising ValueError.
+
+        Multi-unit aware (RW-S1 C4): a reference may span several blocks; the
+        requested unit selects one. Blocks without a unit marker count as
+        unit 1.
+        """
+        blocks = self._find_symbol_blocks_by_reference(content, reference)
+        if not blocks:
+            raise ValueError(
+                f"Symbol with reference '{reference}' not found in {path}")
+        for blk in blocks:
+            if blk["unit"] == unit:
+                return blk["start"], blk["end"]
+        raise ValueError(f"reference '{reference}' unit {unit} is not placed")
+
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
-        rotation: float | None = None,
+        rotation: float | None = None, unit: int = 1,
     ) -> dict[str, Any]:
         content = path.read_text(encoding="utf-8")
-        location = find_symbol_block_by_reference(content, reference)
-        if location is None:
-            raise ValueError(f"Symbol with reference '{reference}' not found in {path}")
-        start, end = location
+        start, end = self._locate_unit_block(content, path, reference, int(unit))
         block = content[start:end + 1]
 
         try:
@@ -3711,6 +4091,7 @@ class FileSchematicOps(SchematicOps):
             "reference": reference,
             "position": {"x": x, "y": y},
             "rotation": new_rot,
+            "unit": int(unit),
         }
 
     def update_component_property(
@@ -3764,15 +4145,36 @@ class FileSchematicOps(SchematicOps):
             "value": property_value,
         }
 
-    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
+    def remove_component(
+        self, path: Path, reference: str, unit: int | None = None,
+    ) -> dict[str, Any]:
         content = path.read_text(encoding="utf-8")
-        location = find_symbol_block_by_reference(content, reference)
-        if location is None:
+        blocks = self._find_symbol_blocks_by_reference(content, reference)
+        if not blocks:
             raise ValueError(f"Symbol with reference '{reference}' not found in {path}")
-        start, end = location
-        content = remove_sexp_block(content, start, end)
+
+        if unit is None:
+            # Whole-component semantics: every unit block of the reference
+            # goes (today's behavior generalized to multi-unit, RW-S1 C4).
+            for blk in reversed(blocks):
+                content = remove_sexp_block(content, blk["start"], blk["end"])
+            path.write_text(content, encoding="utf-8")
+            return {
+                "reference": reference,
+                "removed": True,
+                "units_removed": sorted(b["unit"] for b in blocks),
+            }
+
+        target = next((b for b in blocks if b["unit"] == int(unit)), None)
+        if target is None:
+            raise ValueError(f"reference '{reference}' unit {unit} is not placed")
+        content = remove_sexp_block(content, target["start"], target["end"])
         path.write_text(content, encoding="utf-8")
-        return {"reference": reference, "removed": True}
+        return {
+            "reference": reference,
+            "removed": True,
+            "unit": int(unit),
+        }
 
     def remove_wire(
         self, path: Path, start_x: float, start_y: float,
@@ -3912,45 +4314,60 @@ class FileSchematicOps(SchematicOps):
         """
         import math
 
-        # 1. Find the symbol instance by reference
-        sym_node = None
+        # 1. Collect ALL placed instance blocks for the reference — a
+        # multi-unit symbol places one block per unit, all sharing the same
+        # reference (RW-S1 measured fact 2).
+        instances: list[dict[str, Any]] = []
         for node in tree:
             if not isinstance(node, list) or len(node) < 2:
                 continue
             if node[0] != "symbol":
                 continue
+            is_match = False
             for child in node[1:]:
                 if (isinstance(child, list) and len(child) >= 3
                         and child[0] == "property" and child[1] == "Reference"
                         and child[2] == reference):
-                    sym_node = node
+                    is_match = True
                     break
-            if sym_node is not None:
-                break
+            if not is_match:
+                continue
+            inst: dict[str, Any] = {
+                "x": 0.0, "y": 0.0, "rotation": 0.0, "mirror": None,
+                "lib_id": "", "unit": 1,
+            }
+            for child in node[1:]:
+                if not isinstance(child, list) or len(child) < 2:
+                    continue
+                tag = child[0] if isinstance(child[0], str) else ""
+                if tag == "at" and len(child) >= 3:
+                    inst["x"] = float(child[1])
+                    inst["y"] = float(child[2])
+                    if len(child) >= 4:
+                        inst["rotation"] = float(child[3])
+                elif tag == "lib_id":
+                    inst["lib_id"] = child[1]
+                elif tag == "mirror":
+                    inst["mirror"] = child[1]
+                elif tag == "unit":
+                    try:
+                        inst["unit"] = int(float(child[1]))
+                    except (TypeError, ValueError):
+                        pass
+            instances.append(inst)
 
-        if sym_node is None:
+        if not instances:
             return {"error": f"Symbol with reference '{reference}' not found"}
 
-        # Extract symbol placement: at, lib_id, mirror
-        sx, sy, sym_rot = 0.0, 0.0, 0.0
-        lib_id = ""
-        sym_mirror = None
-        for child in sym_node[1:]:
-            if not isinstance(child, list) or len(child) < 2:
-                continue
-            tag = child[0] if isinstance(child[0], str) else ""
-            if tag == "at" and len(child) >= 3:
-                sx = float(child[1])
-                sy = float(child[2])
-                if len(child) >= 4:
-                    sym_rot = float(child[3])
-            elif tag == "lib_id":
-                lib_id = child[1]
-            elif tag == "mirror":
-                sym_mirror = child[1]
-
+        lib_id = next((i["lib_id"] for i in instances if i["lib_id"]), "")
         if not lib_id:
             return {"error": f"Symbol '{reference}' has no lib_id"}
+
+        # First-placed instance per unit (first wins on a malformed file with
+        # a duplicated unit, matching by-ref block resolution elsewhere).
+        unit_instances: dict[int, dict[str, Any]] = {}
+        for inst in instances:
+            unit_instances.setdefault(int(inst["unit"]), inst)
 
         # 2. Find the lib_symbols entry in the schematic
         lib_symbols_node = None
@@ -4000,26 +4417,15 @@ class FileSchematicOps(SchematicOps):
             if lib_sym is None:
                 return {"error": f"Library symbol '{lib_id}' not found in lib_symbols cache"}
 
-        # 3. Extract pins from lib symbol (recurse into sub-symbols).
-        # If the cached symbol uses (extends "ParentName"), the pin definitions
-        # live in the parent symbol inside the source .kicad_sym library file.
-        def _collect_pins_from_node(node: list[Any]) -> list[dict[str, Any]]:
-            collected: list[dict[str, Any]] = []
-            for child in node[1:]:
-                if not isinstance(child, list) or len(child) < 2:
-                    continue
-                if child[0] == "pin":
-                    collected.append(_parse_pin_node(child))
-                elif child[0] == "symbol":
-                    for sub_child in child[1:]:
-                        if (isinstance(sub_child, list) and len(sub_child) >= 2
-                                and sub_child[0] == "pin"):
-                            collected.append(_parse_pin_node(sub_child))
-            return collected
+        # 3. Extract pins from the lib symbol, grouped by owning unit
+        # (sub-symbol names "<NAME>_<unit>_<style>", RW-S1 measured fact 1).
+        # If the cached symbol uses (extends "ParentName"), the pin
+        # definitions live in the parent symbol inside the source .kicad_sym
+        # library file; the same unit mapping applies on the parent (C2.5 —
+        # probed as non-interacting: stock multi-unit symbols don't extend).
+        unit_pins, unit_count = _lib_symbol_unit_info(lib_sym)
 
-        pins = _collect_pins_from_node(lib_sym)
-
-        if not pins:
+        if not any(unit_pins.values()):
             # Check for (extends "ParentName") and resolve from source library
             parent_name: str | None = None
             for child in lib_sym[1:]:
@@ -4050,8 +4456,9 @@ class FileSchematicOps(SchematicOps):
                                     break
                             if parent_node is None:
                                 break
-                            pins = _collect_pins_from_node(parent_node)
-                            if pins:
+                            unit_pins, unit_count = _lib_symbol_unit_info(
+                                parent_node)
+                            if any(unit_pins.values()):
                                 break
                             # Look for another level of extends
                             next_parent: str | None = None
@@ -4066,63 +4473,105 @@ class FileSchematicOps(SchematicOps):
                     except Exception:
                         pass
 
-        # 4. Transform pin positions to absolute schematic coordinates.
+        # Single-unit fold rule (C2): when the symbol has exactly one
+        # non-zero unit, unit-0 pins are NOT common — they belong to unit 1
+        # (many stock single-unit symbols keep every pin in "<NAME>_0_1").
+        if unit_count <= 1:
+            folded: list[dict[str, Any]] = []
+            for u in sorted(unit_pins):
+                folded.extend(unit_pins[u])
+            unit_pins = {1: folded}
+
+        # 4. Transform pin positions to absolute schematic coordinates,
+        # each pin against the instance of its OWNING unit (the conflation
+        # fix — previously every pin resolved against the first block found).
         #
-        # Mirrors KiCad's own SCH_SYMBOL TRANSFORM (eeschema/sch_symbol.cpp):
-        # the library point is first Y-flipped (the library frame is Y-up, the
-        # schematic is Y-down) to (u, v) = (px, -py), then rotated with KiCad's
-        # on-screen-counterclockwise convention, then mirrored. KiCad applies
-        # the symbol mirror AFTER rotation, as a negation of the transformed
-        # axis: mirror X negates the transformed Y, mirror Y negates the
-        # transformed X. Audited against eeschema ground truth for every
-        # rotation (0/90/180/270) x mirror (none/x/y) combination -- see
+        # The per-instance transform mirrors KiCad's own SCH_SYMBOL TRANSFORM
+        # (eeschema/sch_symbol.cpp): the library point is first Y-flipped (the
+        # library frame is Y-up, the schematic is Y-down) to (u, v) =
+        # (px, -py), then rotated with KiCad's on-screen-counterclockwise
+        # convention, then mirrored. KiCad applies the symbol mirror AFTER
+        # rotation, as a negation of the transformed axis: mirror X negates
+        # the transformed Y, mirror Y negates the transformed X. Audited
+        # against eeschema ground truth for every rotation (0/90/180/270) x
+        # mirror (none/x/y) combination -- see
         # tests/test_symbol_pin_rotation.py. The previous transposed rotation
         # (px*cos - py*sin / px*sin + py*cos, with a pre-rotation mirror)
         # matched eeschema only at 0/180 degrees and for mirrored 90/270, and
         # was reflected through the symbol origin at un-mirrored 90/270 -- the
         # schematic-domain twin of the board rotation bug fixed in b65df77.
-        rad = math.radians(sym_rot)
-        cos_r = math.cos(rad)
-        sin_r = math.sin(rad)
-
-        pin_positions: dict[str, dict[str, float]] = {}
-        for pin in pins:
-            pos = pin.get("position")
-            if pos is None:
-                continue
-            # Library coordinates are Y-up, schematic is Y-down: Y-flip first.
-            u = pos["x"]
-            v = -pos["y"]
-
-            # KiCad rotation convention (positive angle = counterclockwise on
-            # screen); identical to the board-domain transform.
+        def _xform(inst: dict[str, Any], px: float, py: float) -> tuple[float, float]:
+            rad = math.radians(inst["rotation"])
+            cos_r = math.cos(rad)
+            sin_r = math.sin(rad)
+            u = px
+            v = -py
             rot_x = u * cos_r + v * sin_r
             rot_y = -u * sin_r + v * cos_r
-
-            # Symbol mirror is applied after rotation, negating the axis.
-            if sym_mirror == "x":
+            if inst["mirror"] == "x":
                 rot_y = -rot_y
-            elif sym_mirror == "y":
+            elif inst["mirror"] == "y":
                 rot_x = -rot_x
+            return round(inst["x"] + rot_x, 4), round(inst["y"] + rot_y, 4)
 
-            abs_x = sx + rot_x
-            abs_y = sy + rot_y
+        placed_units = sorted(unit_instances)
+        pin_positions: dict[str, dict[str, Any]] = {}
+        common_pin_positions: dict[str, list[dict[str, Any]]] = {}
+        unplaced_pins: dict[str, int] = {}
 
-            pin_key = pin.get("number", pin.get("name", ""))
-            if pin_key:
-                pin_positions[pin_key] = {
-                    "x": round(abs_x, 4),
-                    "y": round(abs_y, 4),
-                }
+        for owner in sorted(unit_pins):
+            for pin in unit_pins[owner]:
+                pos = pin.get("position")
+                if pos is None:
+                    continue
+                pin_key = pin.get("number", pin.get("name", ""))
+                if not pin_key:
+                    continue
+                if owner == 0:
+                    # Common pin: materializes at EVERY placed instance and
+                    # each materialization nets independently (measured
+                    # fact 4).
+                    entries: list[dict[str, Any]] = []
+                    for u in placed_units:
+                        ax, ay = _xform(unit_instances[u], pos["x"], pos["y"])
+                        entries.append({"unit": u, "x": ax, "y": ay})
+                    common_pin_positions[pin_key] = entries
+                else:
+                    inst_for_unit = unit_instances.get(owner)
+                    if inst_for_unit is None:
+                        # Owning unit not placed: the pin does not exist on
+                        # the sheet (measured fact 5). Recorded so
+                        # connect_pins can name the missing unit (C3).
+                        unplaced_pins[pin_key] = owner
+                        continue
+                    ax, ay = _xform(inst_for_unit, pos["x"], pos["y"])
+                    pin_positions[pin_key] = {"x": ax, "y": ay, "unit": owner}
 
-        return {
+        # Top-level position/rotation/mirror refer to the lowest placed unit
+        # (identical to today's payload for single-unit symbols); multi-unit
+        # callers use unit_positions.
+        lowest = unit_instances[placed_units[0]]
+        result: dict[str, Any] = {
             "reference": reference,
             "lib_id": lib_id,
-            "position": {"x": sx, "y": sy},
-            "rotation": sym_rot,
-            "mirror": sym_mirror,
+            "position": {"x": lowest["x"], "y": lowest["y"]},
+            "rotation": lowest["rotation"],
+            "mirror": lowest["mirror"],
+            "units_placed": placed_units,
+            "unit_positions": {
+                str(u): {
+                    "x": unit_instances[u]["x"],
+                    "y": unit_instances[u]["y"],
+                    "rotation": unit_instances[u]["rotation"],
+                }
+                for u in placed_units
+            },
             "pin_positions": pin_positions,
+            "common_pin_positions": common_pin_positions,
         }
+        if unplaced_pins:
+            result["unplaced_pins"] = unplaced_pins
+        return result
 
 
     def _build_connectivity(self, path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -4417,26 +4866,44 @@ class FileSchematicOps(SchematicOps):
             return result
 
         # --- Check 1: Duplicate reference designators ---
-        ref_counts: dict[str, list[dict[str, Any]]] = {}
+        # The reader merges multi-unit blocks into one row per reference
+        # (RW-S1 C4), so same reference + distinct units is NOT a duplicate.
+        # A duplicate is the same (reference, unit) twice, or one reference
+        # bound to differing lib_ids — both recorded on the merged row.
         for sym in symbols:
             ref = sym.get("reference", "")
             if not ref or ref.startswith("#"):
                 continue
             if sym.get("is_power"):
                 continue
-            ref_counts.setdefault(ref, []).append(sym)
-
-        for ref, syms in ref_counts.items():
-            if len(syms) > 1:
-                positions = [s.get("position", {}) for s in syms]
-                violations.append({
-                    "severity": "error",
-                    "type": "duplicate_reference",
-                    "description": f"Duplicate reference designator '{ref}' ({len(syms)} instances)",
-                    "reference": ref,
-                    "positions": positions,
-                })
-                error_count += 1
+            dup_units = sym.get("duplicate_units", [])
+            lib_conflict = sym.get("lib_id_conflict", [])
+            if not dup_units and not lib_conflict:
+                continue
+            positions = [
+                inst.get("position", {})
+                for inst in sym.get("unit_instances", [])
+            ] or [sym.get("position", {})]
+            if dup_units:
+                units_txt = ", ".join(str(u) for u in sorted(set(dup_units)))
+                description = (
+                    f"Duplicate reference designator '{ref}' "
+                    f"(unit {units_txt} placed more than once)"
+                )
+            else:
+                description = (
+                    f"Duplicate reference designator '{ref}' "
+                    f"(placed as {' and '.join(lib_conflict)}; "
+                    f"all units must share one symbol)"
+                )
+            violations.append({
+                "severity": "error",
+                "type": "duplicate_reference",
+                "description": description,
+                "reference": ref,
+                "positions": positions,
+            })
+            error_count += 1
 
         # --- Check 2: Floating pins ---
         # Build connectivity and find unconnected pins
@@ -4739,6 +5206,7 @@ class FileLibraryOps(LibraryOps):
                     if (isinstance(node, list) and len(node) >= 2
                             and node[0] == "symbol" and node[1] == sym_name):
                         result = _parse_symbol_detail(node, lib_name)
+                        unit_source = node
                         # If no pins found, the symbol may use (extends "Parent").
                         # Walk the extends chain to inherit pins from the parent.
                         if result.get("pin_count", 0) == 0:
@@ -4757,8 +5225,22 @@ class FileLibraryOps(LibraryOps):
                                             )
                                             result["pins"] = parent_detail.get("pins", [])
                                             result["pin_count"] = len(result["pins"])
+                                            unit_source = parent_node
                                             break
                                     break
+                        # Multi-unit structure (RW-S1 C5): unit 0 = pins
+                        # common to all units; numbers as strings, matching
+                        # existing pin payloads.
+                        unit_pins, unit_count = _lib_symbol_unit_info(unit_source)
+                        result["unit_count"] = unit_count
+                        result["unit_pins"] = {
+                            str(u): [
+                                str(p.get("number", p.get("name", "")))
+                                for p in unit_pins[u]
+                                if p.get("number", p.get("name", ""))
+                            ]
+                            for u in sorted(unit_pins)
+                        }
                         return result
         return {"error": f"Symbol not found: {lib_id}"}
 
@@ -5327,6 +5809,11 @@ def _parse_sch_symbol(node: list[Any]) -> dict[str, Any] | None:
             sym["is_power"] = child[1].startswith("power:")
         elif tag == "at" and len(child) >= 3:
             sym["position"] = {"x": float(child[1]), "y": float(child[2])}
+        elif tag == "unit":
+            try:
+                sym["unit"] = int(float(child[1]))
+            except (TypeError, ValueError):
+                pass
         elif tag == "property" and len(child) >= 3:
             name = child[1]
             value = child[2] if isinstance(child[2], str) else str(child[2])
@@ -5413,6 +5900,45 @@ def _parse_pin_node(child: list[Any]) -> dict[str, Any]:
                 pos["angle"] = 0.0
             pin_info["position"] = pos
     return pin_info
+
+
+# Library sub-symbols are named "<NAME>_<unit>_<bodystyle>" (RW-S1 measured
+# fact 1). Anchored at end-of-name so a parent name like "Test:DUAL" or a
+# symbol whose own name merely contains digits never matches.
+_SUB_SYMBOL_UNIT_RE = re.compile(r"_(\d+)_(\d+)$")
+
+
+def _lib_symbol_unit_info(
+    lib_sym: list[Any],
+) -> tuple[dict[int, list[dict[str, Any]]], int]:
+    """Group a library symbol's pins by owning unit.
+
+    Sub-symbols are named ``<NAME>_<unit>_<bodystyle>``; unit 0 holds pins
+    common to all units. Body styles merge (a de-morgan ``_N_2`` variant is
+    the same unit N). Pins declared directly on the parent symbol land in
+    unit 0. Returns ``(unit -> parsed pins, unit_count)`` where
+    ``unit_count`` counts the distinct non-zero units named by sub-symbols,
+    minimum 1 — many stock single-unit symbols keep every pin in
+    ``<NAME>_0_1``.
+    """
+    unit_pins: dict[int, list[dict[str, Any]]] = {}
+    named_units: set[int] = set()
+    for child in lib_sym[1:]:
+        if not isinstance(child, list) or len(child) < 2:
+            continue
+        if child[0] == "pin":
+            unit_pins.setdefault(0, []).append(_parse_pin_node(child))
+        elif child[0] == "symbol" and isinstance(child[1], str):
+            m = _SUB_SYMBOL_UNIT_RE.search(child[1])
+            unit = int(m.group(1)) if m else 0
+            named_units.add(unit)
+            for sub_child in child[1:]:
+                if (isinstance(sub_child, list) and len(sub_child) >= 2
+                        and sub_child[0] == "pin"):
+                    unit_pins.setdefault(unit, []).append(
+                        _parse_pin_node(sub_child))
+    unit_count = max(1, len({u for u in named_units if u != 0}))
+    return unit_pins, unit_count
 
 
 def _parse_symbol_detail(node: list[Any], lib_name: str) -> dict[str, Any]:

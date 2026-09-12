@@ -205,8 +205,13 @@ class SchematicOps(ABC):
         x: float, y: float, rotation: float = 0.0,
         mirror: str | None = None, footprint: str = "",
         properties: dict[str, str] | None = None,
+        unit: int = 1,
     ) -> dict[str, Any]:
-        """Add a component symbol to the schematic."""
+        """Add a component symbol to the schematic.
+
+        ``unit`` places one unit of a multi-unit symbol; placing another unit
+        is another call with the same reference and lib_id (RW-S1 C1).
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def add_wire(
@@ -243,15 +248,25 @@ class SchematicOps(ABC):
         """Add a junction dot at the given position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
-    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
-        """Remove a placed component symbol from the schematic by reference designator."""
+    def remove_component(
+        self, path: Path, reference: str, unit: int | None = None,
+    ) -> dict[str, Any]:
+        """Remove a placed component symbol from the schematic by reference designator.
+
+        ``unit=None`` removes every unit block of the reference (whole
+        component); an integer removes that unit's block only (RW-S1 C4).
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
-        rotation: float | None = None,
+        rotation: float | None = None, unit: int = 1,
     ) -> dict[str, Any]:
-        """Move a schematic symbol to a new position, optionally updating rotation."""
+        """Move a schematic symbol to a new position, optionally updating rotation.
+
+        For multi-unit symbols ``unit`` selects which unit's block moves;
+        without it, unit 1 moves (RW-S1 C4).
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def update_component_property(

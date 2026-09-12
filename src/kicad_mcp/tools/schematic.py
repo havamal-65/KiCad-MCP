@@ -300,6 +300,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         mirror: str | None = None,
         footprint: str = "",
         properties: dict[str, str] | None = None,
+        unit: int = 1,
     ) -> str:
         """Add a component symbol to the schematic.
 
@@ -314,6 +315,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mirror: Mirror axis - 'x' or 'y', or None for no mirror.
             footprint: Footprint lib_id (e.g. 'Resistor_SMD:R_0402_1005Metric').
             properties: Additional properties dict (e.g. {'Datasheet': '...', 'MPN': '...'}).
+            unit: Which unit of a multi-unit symbol to place (default 1).
+                  To place another unit of the same component, call again with
+                  the SAME reference and lib_id and a different unit — e.g. a
+                  dual op-amp is U1 unit 1 plus U1 unit 2. The same
+                  (reference, unit) twice, a unit beyond the symbol's unit
+                  count, or one reference across two lib_ids is refused.
 
         Returns:
             JSON with placed component details and UUID.
@@ -323,14 +330,19 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_component(
-            p, lib_id, reference, value, x, y,
-            rotation=rotation, mirror=mirror,
-            footprint=footprint, properties=properties,
-        )
+        try:
+            result = ops.add_component(
+                p, lib_id, reference, value, x, y,
+                rotation=rotation, mirror=mirror,
+                footprint=footprint, properties=properties,
+                unit=unit,
+            )
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
             "add_component",
-            {"path": path, "lib_id": lib_id, "reference": reference, "value": value},
+            {"path": path, "lib_id": lib_id, "reference": reference,
+             "value": value, "unit": unit},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -502,9 +514,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                         are needed.
 
         Returns:
-            Single mode: JSON with pin_positions mapping pin numbers to {x, y} coordinates.
-            Batch mode:  JSON with batch dict keyed by reference, each value containing
-                         the same pin_positions structure.
+            Single mode: JSON with pin_positions mapping pin numbers to
+                         {x, y, unit} coordinates, plus units_placed,
+                         unit_positions (per-unit {x, y, rotation}), and
+                         common_pin_positions — pins shared by all units of a
+                         multi-unit symbol, one entry per placed unit
+                         ({unit, x, y}); such pins appear ONLY there, not in
+                         pin_positions. Single-unit symbols: units_placed is
+                         [1] and common_pin_positions is empty.
+            Batch mode:  JSON with batch dict keyed by reference, each value
+                         containing the same structure.
         """
         p = validate_kicad_path(path, ".kicad_sch")
         ops = backend.get_schematic_ops()
@@ -606,17 +625,22 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mirror ('x' or 'y', optional)
             footprint (e.g. 'Resistor_SMD:R_0402_1005Metric', optional)
             properties (dict[str, str], optional)
+            unit (int, default 1 — one batch may place several units of one
+                  multi-unit reference, one entry per unit)
 
         Reads the schematic file once, caches every unique lib_id once, builds
         all symbol blocks in memory, and writes once — collapsing N round-trips
         and N file reads into 1.
 
-        Per-item failures (missing fields, unresolvable lib_id) do NOT abort the
-        batch — successful entries still get placed.
+        Per-item failures (missing fields, unresolvable lib_id, unit out of
+        range, (reference, unit) already placed) do NOT abort the batch —
+        successful entries still get placed. Exception: a (reference, unit)
+        pair repeated WITHIN the input list refuses the whole batch with the
+        file untouched ({"status": "refused"}).
 
         Returns:
             JSON {"status": "success", "placed": [...], "failed": [...]}.
-            placed entries: {reference, lib_id, uuid, position}.
+            placed entries: {reference, lib_id, uuid, position, unit}.
             failed entries: {index, reference, reason}.
         """
         p = validate_kicad_path(path, ".kicad_sch")
@@ -711,10 +735,19 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         The schematic must NOT be open in eeschema while this runs — eeschema
         does not auto-reload after file writes, and you'll see stale content.
 
+        Multi-unit symbols: a pin belonging to unit N connects at unit N's
+        placed block. A COMMON pin (unit 0, e.g. a dual op-amp's V+ ) gets a
+        wire+label at EVERY placed unit — netting fewer than all instances is
+        an ERC different_unit_net error. A pin whose owning unit is not placed
+        fails with "belongs to unit N, which is not placed".
+
         Returns:
             JSON {"status": "success", "connected": [...], "failed": [...]}.
             connected entries: {pin, reference, pin_number, x, y,
-                                label_uuid, wire_uuid (null if stub_length=0)}.
+                                label_uuid, wire_uuid (null if stub_length=0),
+                                instances}. x/y/uuids describe the lowest-unit
+            placement; common pins with instances > 1 add "placements":
+            [{unit, x, y, label_uuid, wire_uuid}, ...] — one per placed unit.
             failed entries: {pin, reason}. If the pin is missing because of a
             known KiCad 9->10 symbol pin rename (e.g. the USB-C shield pin
             S1 -> SH) and the renamed pin exists on the symbol, the failure
@@ -793,7 +826,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """Move multiple schematic components in one call.
 
         Each entry: {"reference": str, "x": float, "y": float,
-                     "rotation": float | None (optional)}.
+                     "rotation": float | None (optional),
+                     "unit": int (optional, default 1 — which unit's block
+                     moves for a multi-unit symbol)}.
         Property labels (Reference, Value, Footprint, etc.) shift by the
         same delta so they stay aligned with the symbol body.
 
@@ -838,13 +873,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         )
         return json.dumps({"status": "success", **result}, indent=2)
 
-    def _remove_schematic_component(sch_p: Path, reference: str) -> dict[str, Any]:
+    def _remove_schematic_component(
+        sch_p: Path, reference: str, unit: int | None = None,
+    ) -> dict[str, Any]:
         backup = create_backup(sch_p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.remove_component(sch_p, reference)
+        result = ops.remove_component(sch_p, reference, unit=unit)
         change_log.record(
             "remove_component",
-            {"path": str(sch_p), "reference": reference, "scope": "schematic"},
+            {"path": str(sch_p), "reference": reference, "scope": "schematic",
+             "unit": unit},
             file_modified=str(sch_p),
             backup_path=str(backup) if backup else None,
         )
@@ -869,12 +907,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return result
 
     @mcp.tool()
-    def remove_component(path: str, reference: str, scope: str = "schematic") -> str:
+    def remove_component(
+        path: str, reference: str, scope: str = "schematic",
+        unit: int | None = None,
+    ) -> str:
         """Remove a component from the schematic and/or PCB by reference designator.
 
         scope="schematic" (default) removes the symbol instance block from the
         .kicad_sch file. This does NOT remove associated wires or labels.
         Power symbols such as #PWR001 or #FLG01 can also be removed.
+        For multi-unit symbols, ``unit`` (schematic scope only) removes just
+        that unit's block; the default None removes every unit of the
+        reference — the whole component.
 
         scope="pcb" removes the footprint from the .kicad_pcb file (live board
         when the bridge is up, file edit otherwise) and returns the captured
@@ -904,7 +948,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         if scope == "schematic":
             sch_p = validate_kicad_path(path, ".kicad_sch")
             try:
-                result = _remove_schematic_component(sch_p, reference)
+                result = _remove_schematic_component(sch_p, reference, unit)
             except ValueError as exc:
                 return json.dumps({"status": "error", "message": str(exc)})
             return json.dumps({"status": "success", **result}, indent=2)
@@ -1098,6 +1142,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         x: float,
         y: float,
         rotation: float | None = None,
+        unit: int = 1,
     ) -> str:
         """Move a schematic component to a new position.
 
@@ -1113,6 +1158,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             x: New X position in schematic units (mm).
             y: New Y position in schematic units (mm).
             rotation: New rotation in degrees (0, 90, 180, 270). Leave None to keep current.
+            unit: Which unit's block to move for a multi-unit symbol
+                  (default 1) — moving a multi-unit reference without unit
+                  moves unit 1 only.
 
         Returns:
             JSON with new position and rotation.
@@ -1123,12 +1171,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
         try:
-            result = ops.move_component(p, reference, x, y, rotation=rotation)
+            result = ops.move_component(p, reference, x, y, rotation=rotation, unit=unit)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
             "move_schematic_component",
-            {"path": path, "reference": reference, "x": x, "y": y, "rotation": rotation},
+            {"path": path, "reference": reference, "x": x, "y": y,
+             "rotation": rotation, "unit": unit},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -1552,7 +1601,6 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         try:
             sch_syms = backend.get_schematic_ops().read_schematic(sch_p).get(
                 "symbols", [])
-            seen_fp: dict[str, str] = {}
             for sym in sch_syms:
                 ref = sym.get("reference", "")
                 if not ref or ref.startswith("#") or sym.get("is_power"):
@@ -1563,11 +1611,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                         (sym.get("properties") or {}).get(
                             "PlacementIntent", "") or "",
                     )
-                sym_fp = sym.get("footprint") or ""
-                if sym_fp:
-                    if ref in seen_fp and seen_fp[ref] != sym_fp:
-                        conflicting_fp_refs.add(ref)
-                    seen_fp.setdefault(ref, sym_fp)
+                # The reader merges multi-unit blocks to one row and records
+                # any footprint disagreement between units on that row.
+                if sym.get("footprint_conflict"):
+                    conflicting_fp_refs.add(ref)
         except Exception as exc:
             metadata_available = False
             warnings.append({

@@ -284,6 +284,38 @@ class CLIExportOps(ExportOps):
             "message": result.stderr if result.returncode != 0 else "VRML exported",
         }
 
+    def render_board(
+        self, board_path: Path, output_path: Path, *,
+        side: str = "top", width: int = 1600, height: int = 900,
+        zoom: float | None = None, rotate: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the board to an image via kicad-cli pcb render (KiCad 9+).
+
+        --background is fixed to opaque: the PNG default is transparent,
+        which renders illegibly in dark-themed viewers. A zero exit with
+        stderr noise (e.g. missing board outline) is still a success.
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            "pcb", "render",
+            "--output", str(output_path),
+            "--side", side,
+            "--width", str(width),
+            "--height", str(height),
+            "--background", "opaque",
+        ]
+        if zoom is not None:
+            args += ["--zoom", str(zoom)]
+        if rotate is not None:
+            args += ["--rotate", rotate]
+        args.append(str(board_path))
+        result = self._run(args, timeout=EXPORT_3D_TIMEOUT)
+        return {
+            "success": result.returncode == 0,
+            "output_file": str(output_path) if result.returncode == 0 else None,
+            "message": result.stderr if result.returncode != 0 else "Board rendered",
+        }
+
 
 class CLIDRCOps(DRCOps):
     """DRC/ERC operations via kicad-cli."""

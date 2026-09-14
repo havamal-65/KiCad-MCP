@@ -442,6 +442,14 @@ class ExportOps(ABC):
         """Export 3D VRML model."""
         raise NotImplementedError("This backend does not support VRML export")
 
+    def render_board(
+        self, board_path: Path, output_path: Path, *,
+        side: str = "top", width: int = 1600, height: int = 900,
+        zoom: float | None = None, rotate: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the board to a PNG/JPEG image (3D top-down by default)."""
+        raise NotImplementedError("This backend does not support board rendering")
+
 
 class DRCOps(ABC):
     """Abstract interface for design rule checks."""

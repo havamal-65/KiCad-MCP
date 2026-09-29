@@ -26,6 +26,7 @@ class BackendCapability(Enum):
     NETLIST_GENERATE = auto()
     REAL_TIME_SYNC = auto()
     ZONE_REFILL = auto()
+    ZONE_CREATE = auto()
     BOARD_STACKUP = auto()
     BOARD_ROUTE = auto()
 
@@ -101,6 +102,26 @@ class BoardOps(ABC):
     def refill_zones(self, path: Path) -> dict[str, Any]:
         """Refill all copper zones (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support zone refill")
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        """Add a copper zone with the given absolute outline (mm)."""
+        raise NotImplementedError("This backend does not support zone creation")
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        """Delete one copper zone selected by name or uuid."""
+        raise NotImplementedError("This backend does not support zone deletion")
 
     def get_reference_texts(self, path: Path) -> dict[str, Any]:
         """Bulk-read every footprint's reference-designator field geometry
@@ -637,6 +658,9 @@ class BackendProtocol:
         raise NotImplementedError("This backend does not support library management")
 
     def get_zone_refill_ops(self) -> BoardOps | None:
+        return None
+
+    def get_zone_create_ops(self) -> BoardOps | None:
         return None
 
     def get_board_stackup_ops(self) -> BoardOps | None:

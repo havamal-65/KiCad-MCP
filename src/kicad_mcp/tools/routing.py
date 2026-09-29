@@ -1598,19 +1598,60 @@ def register_tools(
                 "max_passes or review placement."
             )
 
+        # Step 4b (spec-zones Z6, F-ECC2): refill zones between SES import and
+        # the post-route DRC — imported tracks invalidate pre-route fills, and
+        # stale fills otherwise count as DRC errors. Zoneless boards get no
+        # extra step.
+        refill_skipped_msg: str | None = None
+        try:
+            from kicad_mcp.backends.file_backend import parse_board_zones
+            from kicad_mcp.tools.board import _impl_refill_zones
+            has_zones = bool(parse_board_zones(p.read_text(encoding="utf-8")))
+        except Exception as zone_exc:
+            has_zones = False
+            logger.warning("autoroute: zone count check failed: %s", zone_exc)
+        if has_zones:
+            try:
+                refill_result = _impl_refill_zones(p, backend)
+            except Exception as refill_exc:
+                refill_result = {"status": "error", "message": str(refill_exc)}
+            if refill_result.get("status") in ("ok", "success"):
+                report["steps"].append({
+                    "step": "zone_refill",
+                    "status": "ok",
+                    "zones_filled": refill_result.get("zones_filled", 0),
+                })
+            else:
+                refill_skipped_msg = str(
+                    refill_result.get("message")
+                    or refill_result.get("reason") or "refill unavailable"
+                )
+                report["steps"].append({
+                    "step": "zone_refill",
+                    "status": "skipped",
+                    "message": refill_skipped_msg,
+                })
+
         # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking).
         try:
             drc_ops = backend.get_drc_ops()
             drc_result = drc_ops.run_drc(p, None)
             drc_passed = drc_result.get("passed", False)
             error_count = drc_result.get("error_count", 0)
-            report["steps"].append({
+            drc_step: dict[str, Any] = {
                 "step": "post_route_drc",
                 "status": "success",
                 "passed": drc_passed,
                 "error_count": error_count,
                 "warning_count": drc_result.get("warning_count", 0),
-            })
+            }
+            if refill_skipped_msg is not None:
+                drc_step["message"] = (
+                    drc_step.get("message", "")
+                    + " (zone fills may be stale; re-run run_drc after "
+                      "refill_zones)"
+                ).strip()
+            report["steps"].append(drc_step)
             if not drc_passed and report["status"] == "success":
                 report["status"] = "success_with_drc_errors"
                 report["message"] = (
@@ -1618,10 +1659,14 @@ def register_tools(
                     f"{error_count} error(s) — inspect board before fabrication."
                 )
         except Exception as drc_exc:
+            drc_msg = f"Post-route DRC skipped: {drc_exc}"
+            if refill_skipped_msg is not None:
+                drc_msg += (" (zone fills may be stale; re-run run_drc after "
+                            "refill_zones)")
             report["steps"].append({
                 "step": "post_route_drc",
                 "status": "unavailable",
-                "message": f"Post-route DRC skipped: {drc_exc}",
+                "message": drc_msg,
             })
 
         # Clean up temp files (dsn + every rung's SES)

@@ -469,3 +469,76 @@ def test_success_path_cleans_up_artifacts(unrouted_board, monkeypatch):
     assert report["status"] == "success"
     assert not (unrouted_board.parent / "freerouting_vc50.ses").exists()
     assert not (unrouted_board.parent / "freerouting.dsn").exists()
+
+
+# ---------------------------------------------------------------------------
+# Z6 (spec-zones, F-ECC2) — refill zones between SES import and post-route DRC
+# ---------------------------------------------------------------------------
+
+BOARD_WITH_ZONE = BOARD_WITH_ROUTES.replace(
+    "  (via (at 15 15) (size 0.8) (drill 0.4) (layers \"F.Cu\" \"B.Cu\") (net 1))",
+    "  (via (at 15 15) (size 0.8) (drill 0.4) (layers \"F.Cu\" \"B.Cu\") (net 1))\n"
+    "  (zone (net 1) (net_name \"GND\") (layer \"B.Cu\") (uuid \"z1\")\n"
+    "    (name \"gnd_pour\")\n"
+    "    (polygon (pts (xy 0 0) (xy 60 0) (xy 60 40)))\n"
+    "  )",
+)
+
+
+@pytest.fixture
+def zoned_board(tmp_path: Path) -> Path:
+    f = tmp_path / "board.kicad_pcb"
+    f.write_text(BOARD_WITH_ZONE, encoding="utf-8")
+    return f
+
+
+def test_autoroute_refills_before_drc(zoned_board, monkeypatch):
+    calls: list[Path] = []
+
+    def fake_refill(p, backend):
+        calls.append(p)
+        return {"status": "success", "via": "file", "zones_filled": 1}
+
+    monkeypatch.setattr("kicad_mcp.tools.board._impl_refill_zones", fake_refill)
+    report = _autoroute(zoned_board, monkeypatch,
+                        ses_by_via_cost={50: VALID_SES})
+
+    assert calls == [zoned_board]
+    steps = [s["step"] for s in report["steps"]]
+    assert "zone_refill" in steps and "post_route_drc" in steps
+    assert steps.index("zone_refill") < steps.index("post_route_drc")
+    refill = _step(report, "zone_refill")
+    assert refill["status"] == "ok" and refill["zones_filled"] == 1
+    drc = _step(report, "post_route_drc")
+    assert "stale" not in drc.get("message", "")
+
+
+def test_autoroute_refill_failure_notes_stale(zoned_board, monkeypatch):
+    monkeypatch.setattr(
+        "kicad_mcp.tools.board._impl_refill_zones",
+        lambda p, backend: {
+            "status": "unavailable", "error_code": "zone_refill_unavailable",
+            "reason": "KiCad closed and no bundled interpreter found: test",
+        },
+    )
+    report = _autoroute(zoned_board, monkeypatch,
+                        ses_by_via_cost={50: VALID_SES})
+
+    refill = _step(report, "zone_refill")
+    assert refill["status"] == "skipped"
+    assert "no bundled interpreter" in refill["message"]
+    drc = _step(report, "post_route_drc")
+    assert "zone fills may be stale; re-run run_drc after refill_zones" \
+        in drc["message"]
+
+
+def test_autoroute_zoneless_no_refill_step(routed_board, monkeypatch):
+    def boom(p, backend):
+        raise AssertionError("zoneless board must not trigger a refill")
+
+    monkeypatch.setattr("kicad_mcp.tools.board._impl_refill_zones", boom)
+    report = _autoroute(routed_board, monkeypatch,
+                        ses_by_via_cost={50: VALID_SES})
+
+    assert _step(report, "zone_refill") is None
+    assert report["status"] in ("success", "success_with_drc_errors")

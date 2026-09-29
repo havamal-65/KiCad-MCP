@@ -563,6 +563,7 @@ class TestIPCBackendSurface:
             BackendCapability.BOARD_READ,
             BackendCapability.BOARD_MODIFY,
             BackendCapability.ZONE_REFILL,
+            BackendCapability.ZONE_CREATE,
             BackendCapability.BOARD_STACKUP,
         }
 
@@ -1148,7 +1149,8 @@ class TestRefillZones:
 
     def test_no_zones_skips_refill(self, write_ops, write_board):
         result = write_ops.refill_zones(BOARD_PATH)
-        assert result == {"status": "ok", "zones_filled": 0}
+        assert result == {"status": "ok", "zones_filled": 0,
+                          "note": "board has no zones"}
         assert write_board.refill_calls == 0
 
 

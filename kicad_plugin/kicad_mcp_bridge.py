@@ -25,6 +25,8 @@ Write (all run on the wxPython main thread to avoid pcbnew GUI crashes):
   add_via            → add a through/blind/buried via
   assign_net         → assign a net to a specific pad
   refill_zones       → fill all copper zones
+  add_zone           → create a copper zone (outline in absolute mm)
+  delete_zone        → remove one copper zone by name or uuid
 
 Installation (Windows):
     Copy to %APPDATA%\\kicad\\9.0\\scripting\\plugins\\
@@ -51,7 +53,7 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.6.0-sync"
+_BRIDGE_VERSION = "2.7.0-zones"
 
 
 # ---------------------------------------------------------------------------
@@ -1307,8 +1309,124 @@ def _handle_refill_zones(path: str) -> dict[str, Any]:
         if zone_count > 0:
             filler = pcbnew.ZONE_FILLER(board)
             filler.Fill(zones)
+            # Save only when something was actually refilled — a zoneless
+            # no-op must not dirty the file mtime (spec-zones Z5).
+            _save_and_refresh(board)
+            return {"status": "ok", "zones_filled": zone_count}
+        return {"status": "ok", "zones_filled": 0, "note": "board has no zones"}
+    return _run_on_main_thread(_do)
+
+
+def _handle_add_zone(
+    path: str, net: str, layer: str, outline: list,
+    clearance_mm: float = 0.5, min_thickness_mm: float = 0.25,
+    pad_connection: str = "thermal", thermal_gap_mm: float = 0.5,
+    thermal_spoke_width_mm: float = 0.5, name: str = "",
+    refill: bool = True,
+) -> dict[str, Any]:
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+
+        layer_id = board.GetLayerID(layer)
+        if layer_id < 0:
+            return {"status": "error", "error_code": "invalid_layer",
+                    "message": "unknown layer '%s'" % layer}
+        netinfo = board.FindNet(net)
+        if netinfo is None or (net and netinfo.GetNetCode() <= 0):
+            return {
+                "status": "error",
+                "error_code": "net_not_found",
+                "message": "net '%s' not found on board; "
+                           "run sync_schematic_to_pcb first" % net,
+            }
+
+        connection_map = {
+            "thermal": pcbnew.ZONE_CONNECTION_THERMAL,
+            "solid": pcbnew.ZONE_CONNECTION_FULL,
+            "none": pcbnew.ZONE_CONNECTION_NONE,
+        }
+
+        zone = pcbnew.ZONE(board)
+        zone.SetLayer(layer_id)
+        zone.SetNetCode(netinfo.GetNetCode())
+        shape = zone.Outline()
+        shape.NewOutline()
+        for pt in outline:
+            shape.Append(pcbnew.VECTOR2I(_mm(pt["x"]), _mm(pt["y"])))
+        zone.SetLocalClearance(_mm(clearance_mm))
+        zone.SetMinThickness(_mm(min_thickness_mm))
+        zone.SetPadConnection(connection_map.get(
+            pad_connection, pcbnew.ZONE_CONNECTION_THERMAL))
+        zone.SetThermalReliefGap(_mm(thermal_gap_mm))
+        zone.SetThermalReliefSpokeWidth(_mm(thermal_spoke_width_mm))
+        if name:
+            zone.SetZoneName(name)
+        board.Add(zone)
+
+        filled = False
+        filled_area_mm2 = None
+        if refill:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+            filled = zone.IsFilled()
+            try:
+                # IU are nm, so area comes back in nm² → mm² is /1e12.
+                filled_area_mm2 = round(zone.GetFilledArea() / 1e12, 3)
+            except Exception:
+                filled_area_mm2 = None
         _save_and_refresh(board)
-        return {"status": "ok", "zones_filled": zone_count}
+        return {
+            "status": "success",
+            "zone_name": name,
+            "zone_uuid": zone.m_Uuid.AsString(),
+            "layer": layer,
+            "net": net,
+            "outline_points": len(outline),
+            "filled": filled,
+            "filled_area_mm2": filled_area_mm2,
+            "via": "bridge",
+            "warnings": [],
+        }
+    return _run_on_main_thread(_do)
+
+
+def _handle_delete_zone(path: str, name: str = "", uuid: str = "") -> dict[str, Any]:
+    def _do():
+        board = _get_open_board(path)
+        matches = []
+        for zone in board.Zones():
+            zone_uuid = zone.m_Uuid.AsString()
+            if (uuid and zone_uuid == uuid) or \
+                    (name and zone.GetZoneName() == name):
+                matches.append(zone)
+
+        selector = uuid or name
+        if not matches:
+            return {"status": "error", "error_code": "zone_not_found",
+                    "message": "no zone matching %s" % selector}
+        if len(matches) > 1:
+            return {"status": "error", "error_code": "zone_ambiguous",
+                    "message": "name '%s' matches %d zones; use uuid"
+                               % (name, len(matches))}
+
+        zone = matches[0]
+        if zone.GetIsRuleArea():
+            return {"status": "error", "error_code": "zone_is_rule_area",
+                    "message": "'%s' is a rule area; use the keep-out tools"
+                               % (zone.GetZoneName() or zone.m_Uuid.AsString())}
+
+        deleted_uuid = zone.m_Uuid.AsString()
+        deleted_name = zone.GetZoneName()
+        net_name = zone.GetNetname()
+        board.RemoveNative(zone)  # not Remove() — see remove_component (#14A)
+        _save_and_refresh(board)
+        return {
+            "status": "success",
+            "deleted": deleted_uuid,
+            "zone_name": deleted_name,
+            "net": net_name,
+            "via": "bridge",
+        }
     return _run_on_main_thread(_do)
 
 
@@ -1618,6 +1736,16 @@ _DISPATCH = {
         req.get("visible"),
     ),
     "refill_zones":       lambda req: _handle_refill_zones(req["path"]),
+    "add_zone":           lambda req: _handle_add_zone(
+        req["path"], req["net"], req["layer"], req["outline"],
+        req.get("clearance_mm", 0.5), req.get("min_thickness_mm", 0.25),
+        req.get("pad_connection", "thermal"), req.get("thermal_gap_mm", 0.5),
+        req.get("thermal_spoke_width_mm", 0.5), req.get("name", ""),
+        req.get("refill", True),
+    ),
+    "delete_zone":        lambda req: _handle_delete_zone(
+        req["path"], req.get("name", ""), req.get("uuid", ""),
+    ),
     "save_board":         lambda req: _handle_save_board(req["path"]),
     "clear_routes":       lambda req: _handle_clear_routes(
         req["path"], req.get("backup", True),
@@ -1646,6 +1774,7 @@ _MUTATING_METHODS = frozenset({
     "place_component", "place_components_bulk", "move_component",
     "remove_component", "add_track", "add_via", "assign_net",
     "set_footprint_value", "set_footprint_metadata", "refill_zones",
+    "add_zone", "delete_zone",
     "save_board", "clear_routes",
     "add_board_outline", "auto_place", "import_ses", "set_reference_text",
 })

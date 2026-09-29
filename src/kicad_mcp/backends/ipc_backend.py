@@ -49,10 +49,14 @@ if TYPE_CHECKING:
 try:
     import kipy.board_types as kbt
     from kipy.common_types import LibraryIdentifier
-    from kipy.geometry import Angle, Vector2
+    from kipy.geometry import Angle, PolygonWithHoles, PolyLine, PolyLineNode, Vector2
     from kipy.project_types import TextVariables
     from kipy.proto.board.board_pb2 import BoardStackupLayerType
-    from kipy.proto.board.board_types_pb2 import BoardLayer, ViaType
+    from kipy.proto.board.board_types_pb2 import (
+        BoardLayer,
+        ViaType,
+        ZoneConnectionStyle,
+    )
     from kipy.proto.common.types import MapMergeMode
     from kipy.proto.common.types import project_settings_pb2
     from kipy.util.board_layer import canonical_name, layer_from_canonical_name
@@ -66,6 +70,10 @@ except ImportError:  # REQ-IPC-8: missing client degrades, never crashes
     BoardStackupLayerType = None  # type: ignore[assignment,misc]
     BoardLayer = None  # type: ignore[assignment,misc]
     ViaType = None  # type: ignore[assignment,misc]
+    ZoneConnectionStyle = None  # type: ignore[assignment,misc]
+    PolygonWithHoles = None  # type: ignore[assignment,misc]
+    PolyLine = None  # type: ignore[assignment,misc]
+    PolyLineNode = None  # type: ignore[assignment,misc]
     MapMergeMode = None  # type: ignore[assignment,misc]
     project_settings_pb2 = None  # type: ignore[assignment]
     canonical_name = None  # type: ignore[assignment]
@@ -439,13 +447,133 @@ class IPCBoardOps(BoardOps):
     # -- Specialized ops (spec §3 rows 16–19, S2) --------------------------------
 
     def refill_zones(self, path: Path) -> dict[str, Any]:
-        """Spec §3 row 16 — ``board.refill_zones()`` (kipy blocks until done)."""
+        """Spec §3 row 16 — ``board.refill_zones()`` (kipy blocks until done).
+
+        Zoneless boards skip both refill and save — a no-op must not dirty
+        the file mtime (spec-zones Z5).
+        """
         board = self._board(path)
         zones = board.get_zones()
-        if zones:
-            board.refill_zones()
+        if not zones:
+            return {"status": "ok", "zones_filled": 0,
+                    "note": "board has no zones"}
+        board.refill_zones()
         self._save(path, board)
         return {"status": "ok", "zones_filled": len(zones)}
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        """Create a copper zone over IPC (spec-zones Z1, measured fact 4)."""
+        board = self._board(path)
+
+        net_obj = next((n for n in board.get_nets() if n.name == net), None)
+        if net_obj is None:
+            return {
+                "status": "error",
+                "error_code": "net_not_found",
+                "message": f"net '{net}' not found on board; "
+                           "run sync_schematic_to_pcb first",
+            }
+
+        connection_map = {
+            "thermal": ZoneConnectionStyle.ZCS_THERMAL,
+            "solid": ZoneConnectionStyle.ZCS_FULL,
+            "none": ZoneConnectionStyle.ZCS_NONE,
+        }
+
+        def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
+            zone = kbt.Zone()
+            zone.layers = [layer_from_canonical_name(layer)]
+            zone.net = net_obj
+            if name:
+                zone.name = name
+            poly = PolygonWithHoles()
+            for pt in outline:
+                poly.outline.append(
+                    PolyLineNode.from_xy(from_mm(pt["x"]), from_mm(pt["y"]))
+                )
+            zone.outline = poly
+            zone.clearance = from_mm(clearance_mm)
+            zone.min_thickness = from_mm(min_thickness_mm)
+            connection = zone.connection
+            if connection is not None:
+                connection.zone_connection = connection_map[pad_connection]
+                connection.thermal_spokes.gap = from_mm(thermal_gap_mm)
+                connection.thermal_spokes.width = from_mm(thermal_spoke_width_mm)
+            created = board_.create_items(zone)
+            if not created:
+                raise RuntimeError("IPC create_items returned no created zone")
+            item = created[0]
+            return {
+                "status": "success",
+                "zone_name": name,
+                "zone_uuid": getattr(getattr(item, "id", None), "value", ""),
+                "layer": layer,
+                "net": net,
+                "outline_points": len(outline),
+                "filled": False,
+                "filled_area_mm2": None,
+                "via": "ipc",
+                "warnings": [],
+            }
+
+        result = self._commit(board, mutate)
+        if refill:
+            board.refill_zones()
+            result["filled"] = True
+        self._save(path, board)
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        """Delete one copper zone over IPC (spec-zones Z3)."""
+        board = self._board(path)
+        matches = [
+            z for z in board.get_zones()
+            if (uuid and getattr(z.id, "value", "") == uuid)
+            or (name and z.name == name)
+        ]
+
+        selector = uuid or name
+        if not matches:
+            return {"status": "error", "error_code": "zone_not_found",
+                    "message": f"no zone matching {selector}"}
+        if len(matches) > 1:
+            return {"status": "error", "error_code": "zone_ambiguous",
+                    "message": f"name '{name}' matches {len(matches)} zones; "
+                               "use uuid"}
+
+        zone = matches[0]
+        if zone.is_rule_area():
+            return {"status": "error", "error_code": "zone_is_rule_area",
+                    "message": f"'{zone.name or getattr(zone.id, 'value', '')}'"
+                               " is a rule area; use the keep-out tools"}
+
+        deleted_uuid = getattr(zone.id, "value", "")
+        deleted_name = zone.name
+        net_name = zone.net.name if zone.net is not None else ""
+
+        def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
+            board_.remove_items([zone])
+            return {
+                "status": "success",
+                "deleted": deleted_uuid,
+                "zone_name": deleted_name,
+                "net": net_name,
+                "via": "ipc",
+            }
+
+        return self._write(path, mutate)
 
     def save_board(self, path: Path) -> dict[str, Any]:
         """Spec §3 row 19 — flush the live board to disk (bridge-first save)."""
@@ -726,11 +854,12 @@ class IPCBackend(KiCadBackend):
 
     @property
     def capabilities(self) -> set[BackendCapability]:
-        # REQ-IPC-7 — exactly the four live-board capability groups.
+        # REQ-IPC-7 — the live-board capability groups (+ ZONE_CREATE, RW-S2).
         return {
             BackendCapability.BOARD_READ,
             BackendCapability.BOARD_MODIFY,
             BackendCapability.ZONE_REFILL,
+            BackendCapability.ZONE_CREATE,
             BackendCapability.BOARD_STACKUP,
         }
 

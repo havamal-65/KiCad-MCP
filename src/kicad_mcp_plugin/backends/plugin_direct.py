@@ -470,6 +470,9 @@ class PluginDirectBackend(BackendProtocol):
     def get_zone_refill_ops(self) -> BoardOps | None:
         return self._resolve_live_ops(BackendCapability.ZONE_REFILL, write=True)
 
+    def get_zone_create_ops(self) -> BoardOps | None:
+        return self._resolve_live_ops(BackendCapability.ZONE_CREATE, write=True)
+
     def get_board_stackup_ops(self) -> BoardOps | None:
         return self._resolve_live_ops(BackendCapability.BOARD_STACKUP, write=False)
 
@@ -645,12 +648,14 @@ class PluginDirectBackend(BackendProtocol):
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
     })
     _PLUGIN_CAPS = frozenset({
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
         BackendCapability.BOARD_ROUTE,
     })
@@ -707,6 +712,7 @@ class PluginDirectBackend(BackendProtocol):
                 "BOARD_READ": "ipc→plugin→file",
                 "BOARD_MODIFY": "ipc→plugin→file",
                 "ZONE_REFILL": "ipc→plugin→file",
+                "ZONE_CREATE": "ipc→plugin→file",
                 "BOARD_STACKUP": "ipc→plugin→file",
                 "SCHEMATIC_READ": "file",
                 "SCHEMATIC_MODIFY": "file",

@@ -1,4 +1,4 @@
-"""PCB board tools - 12 tools."""
+"""PCB board tools - 15 tools."""
 
 from __future__ import annotations
 
@@ -417,6 +417,34 @@ def _plan_silk_tidy(records: list[dict[str, Any]], violations: list[dict[str, An
 
     return {"relocated": relocated, "hidden": hidden, "skipped": skipped,
             "implicated": sorted(implicated)}
+
+
+# ── spec-zones Z5/Z6 — refill body shared by the tool and autoroute ──────────
+
+def _impl_refill_zones(path: Path, backend: BackendProtocol) -> dict[str, Any]:
+    """The Z5 refill body: router-resolved ops, structured refusals.
+
+    Module-level (same pattern as routing's ``_impl_clear_routes``) so the
+    ``autoroute`` closure can refill between SES import and post-route DRC
+    (Z6) — tools cannot call each other's closures.
+    """
+    from kicad_mcp.models.errors import SafeRefuseError
+
+    try:
+        ops = backend.get_zone_refill_ops()
+        if ops is None:
+            return {
+                "status": "unavailable",
+                "reason": "refill_zones requires KiCad running with IPC",
+            }
+        return ops.refill_zones(path)
+    except SafeRefuseError as exc:
+        return {
+            "status": "error",
+            "error_code": "kicad_running_no_live_path",
+            "message": str(exc),
+            "remedy": exc.remedy,
+        }
 
 
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
@@ -905,7 +933,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """Refill all copper pour zones on a PCB board.
 
         Recalculates copper fill for all zones after component placement or
-        routing changes. Requires KiCad to be running (IPC backend).
+        routing changes. Serves live-first (IPC/bridge with KiCad open); with
+        KiCad closed the fill runs out-of-process via KiCad's own bundled
+        Python. A zoneless board is a successful no-op that does not touch
+        the file.
 
         Args:
             path: Path to the .kicad_pcb file.
@@ -914,14 +945,229 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON with refill status.
         """
         board_path = validate_kicad_path(path, ".kicad_pcb")
-        ops = backend.get_zone_refill_ops()
-        if ops is None:
+        result = _impl_refill_zones(board_path, backend)
+        if result.get("status") in ("ok", "success"):
+            change_log.record("refill_zones", {"path": path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def add_zone(
+        path: str,
+        net: str,
+        layer: str = "F.Cu",
+        outline: list[dict[str, float]] | None = None,
+        follow_board_outline: bool = False,
+        outline_margin_mm: float = 0.5,
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> str:
+        """Add a copper pour zone to a PCB board (e.g. a GND plane).
+
+        The zone outline is either an explicit polygon (absolute board
+        coordinates in mm) or, with follow_board_outline, a rectangle derived
+        from the Edge.Cuts bounding box inset by outline_margin_mm on all
+        sides (a deterministic bbox rule — not a polygon trace of the
+        outline). The net must already exist on the board — sync the
+        schematic first.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+            net: Net to pour (e.g. "GND"); must already exist on the board.
+            layer: Copper layer name (e.g. "F.Cu", "B.Cu").
+            outline: [{"x": mm, "y": mm}, ...] polygon points (≥ 3), absolute
+                board coordinates. Exactly one of outline /
+                follow_board_outline.
+            follow_board_outline: Derive the outline from Edge.Cuts instead.
+            outline_margin_mm: Inset from the board bbox when following.
+            clearance_mm: Zone clearance to other copper.
+            min_thickness_mm: Minimum fill sliver width.
+            pad_connection: "thermal", "solid", or "none".
+            thermal_gap_mm: Thermal relief gap.
+            thermal_spoke_width_mm: Thermal relief spoke width.
+            name: Optional zone name.
+            refill: Fill the zone after creation (default True).
+
+        Returns:
+            JSON with the created zone (uuid, fill state, serving path).
+        """
+        from kicad_mcp.backends.file_backend import (
+            BoardOpenInKiCadError,
+            _edge_cuts_bbox,
+        )
+        from kicad_mcp.models.errors import SafeRefuseError
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+
+        if pad_connection not in ("thermal", "solid", "none"):
             return json.dumps({
-                "status": "unavailable",
-                "reason": "refill_zones requires KiCad running with IPC",
+                "status": "error",
+                "error_code": "invalid_pad_connection",
+                "message": "pad_connection must be one of: thermal, solid, none",
+            }, indent=2)
+        if outline is not None and follow_board_outline:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_conflict",
+                "message": "provide either outline or follow_board_outline, "
+                           "not both",
+            }, indent=2)
+        if outline is None and not follow_board_outline:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_conflict",
+                "message": "provide outline points or set follow_board_outline",
+            }, indent=2)
+        if outline is not None and len(outline) < 3:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_invalid",
+                "message": "zone outline needs at least 3 points",
+            }, indent=2)
+
+        if follow_board_outline:
+            bbox = _edge_cuts_bbox(board_path.read_text(encoding="utf-8"))
+            if bbox is None:
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "no_board_outline",
+                    "message": "board has no Edge.Cuts geometry to follow; "
+                               "add a board outline first or pass outline "
+                               "points explicitly",
+                }, indent=2)
+            min_x, min_y, max_x, max_y = bbox
+            m = outline_margin_mm
+            outline = [
+                {"x": round(min_x + m, 4), "y": round(min_y + m, 4)},
+                {"x": round(max_x - m, 4), "y": round(min_y + m, 4)},
+                {"x": round(max_x - m, 4), "y": round(max_y - m, 4)},
+                {"x": round(min_x + m, 4), "y": round(max_y - m, 4)},
+            ]
+        # The guards above force exactly one source, so outline is set here.
+        assert outline is not None
+
+        try:
+            ops = backend.get_zone_create_ops()
+            if ops is None:
+                return json.dumps({
+                    "status": "unavailable",
+                    "reason": "no backend can create zones in this session",
+                }, indent=2)
+            result = ops.add_zone(
+                board_path, net, layer, outline,
+                clearance_mm=clearance_mm,
+                min_thickness_mm=min_thickness_mm,
+                pad_connection=pad_connection,
+                thermal_gap_mm=thermal_gap_mm,
+                thermal_spoke_width_mm=thermal_spoke_width_mm,
+                name=name,
+                refill=refill,
+            )
+        except SafeRefuseError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "kicad_running_no_live_path",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
+
+        if result.get("status") == "success":
+            change_log.record("add_zone", {
+                "path": path, "net": net, "layer": layer,
+                "zone_uuid": result.get("zone_uuid"),
             })
-        result = ops.refill_zones(board_path)
-        change_log.record("refill_zones", {"path": path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def list_zones(path: str) -> str:
+        """List every zone on a PCB board, including rule (keep-out) areas.
+
+        Reads the saved .kicad_pcb file directly — a deliberate deviation
+        from the live-first convention so the answer is always file truth:
+        unsaved KiCad edits are not visible; save in KiCad first.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+
+        Returns:
+            JSON with zones (name, net, layers, is_rule_area, filled,
+            outline_points, uuid) and zone_count.
+        """
+        from kicad_mcp.backends.file_backend import parse_board_zones
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+        zones = parse_board_zones(board_path.read_text(encoding="utf-8"))
+        return json.dumps({
+            "status": "success",
+            "zones": zones,
+            "zone_count": len(zones),
+            "source": "file",
+        }, indent=2)
+
+    @mcp.tool()
+    def delete_zone(path: str, name: str = "", uuid: str = "") -> str:
+        """Delete one copper zone from a PCB board, by name or uuid.
+
+        Exactly one selector must be given. Rule (keep-out) areas are
+        refused — use the keep-out tools for those. Get names/uuids from
+        list_zones.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+            name: Zone name to delete (must match exactly one zone).
+            uuid: Zone uuid to delete.
+
+        Returns:
+            JSON with the deleted zone or a structured error.
+        """
+        from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
+        from kicad_mcp.models.errors import SafeRefuseError
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+
+        if bool(name) == bool(uuid):
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_selector_invalid",
+                "message": "provide exactly one of name or uuid",
+            }, indent=2)
+
+        try:
+            ops = backend.get_zone_create_ops()
+            if ops is None:
+                return json.dumps({
+                    "status": "unavailable",
+                    "reason": "no backend can delete zones in this session",
+                }, indent=2)
+            result = ops.delete_zone(board_path, name=name, uuid=uuid)
+        except SafeRefuseError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "kicad_running_no_live_path",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
+
+        if result.get("status") == "success":
+            change_log.record("delete_zone", {
+                "path": path, "deleted": result.get("deleted"),
+            })
         return json.dumps(result, indent=2)
 
     @mcp.tool()

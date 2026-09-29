@@ -378,6 +378,34 @@ class PluginBoardOps(BoardOps):
         result: dict[str, Any] = self._call("refill_zones", path)
         return result
 
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_zone", path, net=net, layer=layer, outline=outline,
+            clearance_mm=clearance_mm, min_thickness_mm=min_thickness_mm,
+            pad_connection=pad_connection, thermal_gap_mm=thermal_gap_mm,
+            thermal_spoke_width_mm=thermal_spoke_width_mm, name=name,
+            refill=refill,
+        )
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "delete_zone", path, name=name, uuid=uuid,
+        )
+        return result
+
     def save_board(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("save_board", path)
         return result
@@ -543,6 +571,7 @@ class PluginBackend(KiCadBackend):
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
         BackendCapability.BOARD_ROUTE,
     }

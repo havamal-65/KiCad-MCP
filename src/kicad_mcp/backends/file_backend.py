@@ -758,6 +758,117 @@ def _file_uses_net_codes(content: str) -> bool:
     return re.search(r'(?m)^[ \t]*\(net\s+\d+\s+"', preamble) is not None
 
 
+# ── zone helpers (spec-zones Z1/Z2/Z3) ───────────────────────────────────────
+
+def _top_level_zone_spans(content: str) -> list[tuple[int, int]]:
+    """(start, end) index pairs of every top-level ``(zone …)`` block.
+
+    Zones embedded inside footprint blocks belong to the footprint, not the
+    board — they are excluded here so Z2/Z3 never touch them.
+    """
+    fp_spans: list[tuple[int, int]] = []
+    for fm in re.finditer(r"\(footprint[\s(]", content):
+        fp_end = _walk_balanced_parens(content, fm.start())
+        if fp_end is not None:
+            fp_spans.append((fm.start(), fp_end))
+
+    spans: list[tuple[int, int]] = []
+    for zm in re.finditer(r"\(zone[\s(]", content):
+        if any(s < zm.start() < e for s, e in fp_spans):
+            continue
+        z_end = _walk_balanced_parens(content, zm.start())
+        if z_end is not None:
+            spans.append((zm.start(), z_end))
+    return spans
+
+
+def _zone_node_summary(node: list[Any]) -> dict[str, Any]:
+    """Z2 inventory row from one parsed ``(zone …)`` node."""
+    def kids(tag: str) -> list[list[Any]]:
+        return [c for c in node if isinstance(c, list) and c and c[0] == tag]
+
+    name = ""
+    for c in kids("name"):
+        if len(c) >= 2:
+            name = str(c[1])
+    uuid_val = ""
+    for c in kids("uuid"):
+        if len(c) >= 2:
+            uuid_val = str(c[1])
+
+    # Coded files: (net N) + (net_name "X"); name-only files: (net "X").
+    net = ""
+    for c in kids("net_name"):
+        if len(c) >= 2:
+            net = str(c[1])
+    if not net:
+        for c in kids("net"):
+            strings = [e for e in c[1:] if isinstance(e, str)]
+            if strings:
+                net = strings[-1]
+
+    layers: list[str] = []
+    for c in kids("layer") + kids("layers"):
+        layers.extend(str(e) for e in c[1:] if isinstance(e, (str, int, float)))
+
+    outline_points = 0
+    for poly in kids("polygon")[:1]:
+        for pts in (c for c in poly if isinstance(c, list) and c and c[0] == "pts"):
+            outline_points = sum(
+                1 for c in pts if isinstance(c, list) and c and c[0] == "xy"
+            )
+
+    return {
+        "name": name,
+        "net": net,
+        "layers": layers,
+        "is_rule_area": bool(kids("keepout")),
+        "filled": bool(kids("filled_polygon")),
+        "outline_points": outline_points,
+        "uuid": uuid_val,
+    }
+
+
+def parse_board_zones(content: str) -> list[dict[str, Any]]:
+    """All top-level zones of a board file as Z2 inventory rows."""
+    zones: list[dict[str, Any]] = []
+    for start, end in _top_level_zone_spans(content):
+        node = parse_sexp_content(content[start:end + 1])
+        if isinstance(node, list) and node and node[0] == "zone":
+            zones.append(_zone_node_summary(node))
+    return zones
+
+
+def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
+    """(min_x, min_y, max_x, max_y) of the Edge.Cuts graphics, or None.
+
+    Deterministic bbox rule (spec Z1): collect every coordinate pair of every
+    ``gr_*`` element on Edge.Cuts; circles expand their center by the radius.
+    """
+    coord_re = re.compile(r"\((?:xy|start|end|mid|center)\s+(-?[\d.]+)\s+(-?[\d.]+)\)")
+    xs: list[float] = []
+    ys: list[float] = []
+    for gm in re.finditer(r"\(gr_(line|rect|arc|circle|poly)\b", content):
+        g_end = _walk_balanced_parens(content, gm.start())
+        if g_end is None:
+            continue
+        block = content[gm.start():g_end + 1]
+        if '(layer "Edge.Cuts")' not in block:
+            continue
+        pts = [(float(m.group(1)), float(m.group(2)))
+               for m in coord_re.finditer(block)]
+        if gm.group(1) == "circle" and len(pts) >= 2:
+            (cx, cy), (ex, ey) = pts[0], pts[1]
+            radius = ((ex - cx) ** 2 + (ey - cy) ** 2) ** 0.5
+            pts = [(cx - radius, cy - radius), (cx + radius, cy + radius)]
+        for x, y in pts:
+            xs.append(x)
+            ys.append(y)
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 class FileBoardOps(BoardOps):
     """Read-only board operations via direct file parsing."""
 
@@ -1097,6 +1208,212 @@ class FileBoardOps(BoardOps):
             "net": net,
             "via_type": via_type,
             "uuid": via_uuid,
+        }
+
+    @staticmethod
+    def _lookup_net(content: str, net: str) -> tuple[bool, int | None]:
+        """Whether *net* already exists on the board (lookup only, never
+        creates). Returns (found, net_id-or-None-for-name-only-files)."""
+        if _file_uses_net_codes(content):
+            first_fp = content.find("(footprint ")
+            preamble = content[:first_fp] if first_fp != -1 else content
+            m = re.search(
+                rf'(?m)^[ \t]*\(net\s+(\d+)\s+"{re.escape(net)}"\)\s*$', preamble
+            )
+            if m:
+                return True, int(m.group(1))
+            return False, None
+        found = re.search(rf'\(net\s+"{re.escape(net)}"\)', content) is not None
+        return found, None
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        """Write a ``(zone …)`` block in the file's own net convention.
+
+        Grammar measured 2026-09-13 against both bundled pcbnew writers:
+        KiCad ≤9 emits ``(net N) (net_name "X") … (filled_areas_thickness
+        no)``; KiCad 10 emits name-only ``(net "X")`` and drops
+        ``filled_areas_thickness``. The zone is written unfilled; when
+        *refill* is set, the Z4 subprocess fill runs afterwards.
+        """
+        _refuse_if_open_in_kicad(path)
+        import uuid as _uuid
+
+        content = path.read_text(encoding="utf-8")
+        found, net_id = self._lookup_net(content, net)
+        if not found:
+            return {
+                "status": "error",
+                "error_code": "net_not_found",
+                "message": f"net '{net}' not found on board; "
+                           "run sync_schematic_to_pcb first",
+            }
+
+        zone_uuid = str(_uuid.uuid4())
+        coded = _file_uses_net_codes(content)
+        # connect_pads mode token: thermal is KiCad's default (no token),
+        # solid = yes, none = no. Validated at the tool layer.
+        mode_token = {"thermal": "", "solid": " yes", "none": " no"}[pad_connection]
+
+        lines = ["\t(zone"]
+        if coded:
+            lines.append(f"\t\t(net {net_id})")
+            lines.append(f'\t\t(net_name "{net}")')
+        else:
+            lines.append(f'\t\t(net "{net}")')
+        lines.append(f'\t\t(layer "{layer}")')
+        lines.append(f'\t\t(uuid "{zone_uuid}")')
+        if name:
+            lines.append(f'\t\t(name "{name}")')
+        lines.append("\t\t(hatch edge 0.5)")
+        lines.append(f"\t\t(connect_pads{mode_token}")
+        lines.append(f"\t\t\t(clearance {clearance_mm})")
+        lines.append("\t\t)")
+        lines.append(f"\t\t(min_thickness {min_thickness_mm})")
+        if coded:
+            lines.append("\t\t(filled_areas_thickness no)")
+        lines.append("\t\t(fill")
+        lines.append(f"\t\t\t(thermal_gap {thermal_gap_mm})")
+        lines.append(f"\t\t\t(thermal_bridge_width {thermal_spoke_width_mm})")
+        lines.append("\t\t)")
+        lines.append("\t\t(polygon")
+        lines.append("\t\t\t(pts")
+        lines.append("\t\t\t\t" + " ".join(
+            f"(xy {pt['x']} {pt['y']})" for pt in outline
+        ))
+        lines.append("\t\t\t)")
+        lines.append("\t\t)")
+        lines.append("\t)")
+        zone_sexp = "\n".join(lines) + "\n"
+
+        last_paren = content.rfind(")")
+        if last_paren < 0:
+            raise ValueError(f"malformed board file: {path}")
+        content = content[:last_paren] + zone_sexp + content[last_paren:]
+        path.write_text(content, encoding="utf-8")
+
+        filled = False
+        filled_area_mm2: float | None = None
+        warnings: list[str] = []
+        if refill:
+            from kicad_mcp.utils.zone_fill_subprocess import fill_zones_subprocess
+            fill_result = fill_zones_subprocess(path)
+            filled = bool(fill_result.get("filled"))
+            warnings.extend(fill_result.get("warnings", []))
+            if not filled:
+                warnings.append(
+                    "zone written unfilled; open the board in KiCad or run "
+                    "refill_zones to fill"
+                    + (f" ({fill_result['reason']})" if fill_result.get("reason")
+                       else "")
+                )
+        else:
+            warnings.append(
+                "zone written unfilled; open the board in KiCad or run "
+                "refill_zones to fill"
+            )
+
+        return {
+            "status": "success",
+            "zone_name": name,
+            "zone_uuid": zone_uuid,
+            "layer": layer,
+            "net": net,
+            "outline_points": len(outline),
+            "filled": filled,
+            "filled_area_mm2": filled_area_mm2,
+            "via": "file",
+            "warnings": warnings,
+        }
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        """Remove one top-level zone selected by name or uuid (Z3).
+
+        Selector validation happens at the tool layer; this expects exactly
+        one of *name* / *uuid* to be non-empty. Rule areas are refused so the
+        keep-out tools stay the only path that touches them.
+        """
+        _refuse_if_open_in_kicad(path)
+        content = path.read_text(encoding="utf-8")
+
+        matches: list[tuple[int, int, dict[str, Any]]] = []
+        for start, end in _top_level_zone_spans(content):
+            node = parse_sexp_content(content[start:end + 1])
+            if not (isinstance(node, list) and node and node[0] == "zone"):
+                continue
+            summary = _zone_node_summary(node)
+            if (uuid and summary["uuid"] == uuid) or \
+                    (name and summary["name"] == name):
+                matches.append((start, end, summary))
+
+        selector = uuid or name
+        if not matches:
+            return {
+                "status": "error",
+                "error_code": "zone_not_found",
+                "message": f"no zone matching {selector}",
+            }
+        if len(matches) > 1:
+            return {
+                "status": "error",
+                "error_code": "zone_ambiguous",
+                "message": f"name '{name}' matches {len(matches)} zones; use uuid",
+            }
+
+        start, end, summary = matches[0]
+        if summary["is_rule_area"]:
+            return {
+                "status": "error",
+                "error_code": "zone_is_rule_area",
+                "message": f"'{summary['name'] or summary['uuid']}' is a rule "
+                           "area; use the keep-out tools",
+            }
+
+        content = remove_sexp_block(content, start, end)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "status": "success",
+            "deleted": summary["uuid"],
+            "zone_name": summary["name"],
+            "net": summary["net"],
+            "via": "file",
+        }
+
+    def refill_zones(self, path: Path) -> dict[str, Any]:
+        """File-side refill via the Z4 subprocess helper (KiCad closed)."""
+        _refuse_if_open_in_kicad(path)
+        content = path.read_text(encoding="utf-8")
+        if not _top_level_zone_spans(content):
+            return {"status": "success", "via": "file", "zones_filled": 0,
+                    "note": "board has no zones"}
+
+        from kicad_mcp.utils.zone_fill_subprocess import fill_zones_subprocess
+        fill_result = fill_zones_subprocess(path)
+        if fill_result.get("filled"):
+            result: dict[str, Any] = {
+                "status": "success", "via": "file",
+                "zones_filled": int(fill_result.get("zones_filled", 0)),
+            }
+            if fill_result.get("warnings"):
+                result["warnings"] = fill_result["warnings"]
+            return result
+        reason = fill_result.get("reason", "")
+        return {
+            "status": "unavailable",
+            "error_code": "zone_refill_unavailable",
+            "reason": "KiCad closed and no bundled interpreter found"
+                      + (f": {reason}" if reason else ""),
         }
 
     def assign_net(

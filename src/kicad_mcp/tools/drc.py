@@ -392,14 +392,16 @@ def _parse_placed_courtyards(
     """Parse every real footprint's courtyard bounding box from board text.
 
     Returns ``(courtyards, no_courtyard)`` where ``courtyards`` maps each real
-    ref (non-``#``) that carries an ``F.CrtYd``/``B.CrtYd`` rectangle to its
-    board-frame ``{xmin, ymin, xmax, ymax}`` (rotation applied), and
-    ``no_courtyard`` lists real refs that have no courtyard geometry. Shared by
+    ref (non-``#``) that carries ``F.CrtYd``/``B.CrtYd`` geometry (rect, line,
+    poly, circle, arc, or Bézier — via ``courtyard_points``) to its board-frame
+    ``{xmin, ymin, xmax, ymax}`` (rotation applied), and ``no_courtyard`` lists
+    real refs that have no courtyard geometry. Shared by
     ``check_courtyard_overlaps`` (overlap detection) and ``verify_board_size``
     (§6.5 area/dimension sizing).
     """
     import math as _math
 
+    from kicad_mcp.utils.courtyard_geometry import courtyard_points
     from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
 
     courtyards: dict[str, dict[str, float]] = {}
@@ -408,7 +410,6 @@ def _parse_placed_courtyards(
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
     ref_pat = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
     fp_ref_pat = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
-    coord_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
 
     i = 0
     n = len(content)
@@ -441,30 +442,9 @@ def _parse_placed_courtyards(
             origin_y = float(at_m.group(2)) if at_m else 0.0
             rotation_deg = float(at_m.group(3)) if (at_m and at_m.group(3)) else 0.0
 
-            cyd_xs: list[float] = []
-            cyd_ys: list[float] = []
-
-            bi = 0
-            bn = len(block)
-            while bi < bn:
-                if block[bi] != "(":
-                    bi += 1
-                    continue
-                bj = bi + 1
-                while bj < bn and block[bj] not in (" ", "\t", "\n", "(", ")"):
-                    bj += 1
-                sub_token = block[bi + 1 : bj]
-                if sub_token in ("fp_rect", "fp_line"):
-                    sub_end = _walk_balanced_parens(block, bi)
-                    if sub_end is not None:
-                        sub_block = block[bi : sub_end + 1]
-                        if '"F.CrtYd"' in sub_block or '"B.CrtYd"' in sub_block:
-                            for m in coord_pat.finditer(sub_block):
-                                cyd_xs.append(float(m.group(1)))
-                                cyd_ys.append(float(m.group(2)))
-                        bi = sub_end + 1
-                        continue
-                bi += 1
+            cyd_points = courtyard_points(block)
+            cyd_xs = [p[0] for p in cyd_points]
+            cyd_ys = [p[1] for p in cyd_points]
 
             if cyd_xs and cyd_ys:
                 if abs(rotation_deg) > 0.01:
@@ -502,7 +482,7 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
     import math as _math
 
     content = pcb_path.read_text(encoding="utf-8")
-    courtyards, _ = _parse_placed_courtyards(content)
+    courtyards, no_courtyard = _parse_placed_courtyards(content)
 
     overlaps: list[dict[str, Any]] = []
     refs = sorted(courtyards.keys())
@@ -527,6 +507,8 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
         "overlap_count": len(overlaps),
         "footprints_checked": len(courtyards),
         "overlaps": overlaps,
+        "no_courtyard": no_courtyard,
+        "no_courtyard_count": len(no_courtyard),
     }
 
 
@@ -1464,6 +1446,10 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
       ceiling) and decap distance over ``GATE_DECAP_MAX_MM`` are **advisory**
       violations: reported, but the gate still passes unless
       ``GATE_PROMOTE_ADVISORY`` promotes them to blocking (REQ-CFG-002).
+    - Footprints with no courtyard geometry are an **advisory**
+      ``no_courtyard`` violation (RW-S3 G3): they are invisible to the
+      overlap/out-of-outline/keep-out figures, so the gate names them rather
+      than staying silently blind.
 
     Side effect: the result is recorded to the board's sidecar validation cache
     (same mechanism as ``validate_connector_orientations``), which is what lets
@@ -1547,6 +1533,23 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
             "severity": "advisory",
             "decap_max_mm": float(decap_max),
             "target_mm": decap_target,
+        })
+
+    # Footprints with no courtyard geometry at all are invisible to every
+    # legality figure above — surface them so the gate is never silently
+    # blind (RW-S3 G3). Advisory: absent geometry is a library property, not
+    # a placement defect.
+    no_cyd = metric.get("no_courtyard") or []
+    if no_cyd:
+        violations.append({
+            "type": "no_courtyard",
+            "severity": "advisory",
+            "refs": list(no_cyd),
+            "message": (
+                f"{len(no_cyd)} footprint(s) have no courtyard geometry and "
+                "are invisible to overlap/legality checks: "
+                f"{', '.join(no_cyd)}"
+            ),
         })
 
     promote = get_bool("GATE_PROMOTE_ADVISORY")

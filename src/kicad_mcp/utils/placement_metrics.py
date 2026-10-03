@@ -309,7 +309,12 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
         run_check_courtyard_overlaps,
     )
 
-    overlap_count = run_check_courtyard_overlaps(path)["overlap_count"]
+    overlap_check = run_check_courtyard_overlaps(path)
+    overlap_count = overlap_check["overlap_count"]
+    # RW-S3 G3: refs with no courtyard geometry ride along in the bundle so
+    # validate_placement_quality can surface them (they are invisible to the
+    # overlap / out-of-outline / keep-out figures below).
+    no_courtyard: list[str] = overlap_check["no_courtyard"]
 
     out_of_outline_count: int | None
     edge_overhang_exemptions: list[dict[str, str]] = []
@@ -375,6 +380,8 @@ def placement_metric(board_path: str | Path) -> dict[str, Any]:
         "orientation_consistency": orientation_consistency,
         "signal_net_count": signal_net_count,
         "scored_parts": scored_parts,
+        "no_courtyard": no_courtyard,
+        "no_courtyard_count": len(no_courtyard),
     }
     if edge_overhang_exemptions:
         bundle["edge_overhang_exemptions"] = edge_overhang_exemptions

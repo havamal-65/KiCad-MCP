@@ -290,3 +290,27 @@ def test_set_footprint_metadata_adds_cluster_id(tmp_path: Path):
         board, "R1", fields={"ClusterId": "rf_block"})
     content = board.read_text(encoding="utf-8")
     assert '(property "ClusterId" "rf_block")' in content
+
+
+def test_auto_place_engine_sees_circle_courtyard(tmp_path: Path):
+    """RW-S3 G4: a circle-only courtyard (Valve-style) reaches the engine as
+    its exact center±r bbox instead of None, so auto_place spaces such parts
+    by their real footprint extent."""
+    from kicad_mcp.utils.placement_engine import read_part_records
+
+    board = tmp_path / "circle_cyd.kicad_pcb"
+    board.write_text(_board(
+        {"ref": "V1", "at_x": 30, "at_y": 30},
+        {"ref": "V2", "at_x": 60, "at_y": 30},
+    ).replace(
+        '(property "Footprint" "Test:Square5" (at 0 0) (layer "F.Fab") (hide yes))',
+        '(fp_circle (center 0 0) (end 10.25 0) (layer "F.CrtYd") '
+        "(stroke (width 0.05) (type default)) (fill no))",
+    ), encoding="utf-8")
+
+    records = {
+        r["ref"]: r
+        for r in read_part_records(board.read_text(encoding="utf-8"))
+    }
+    assert records["V1"]["courtyard"] == (-10.25, -10.25, 10.25, 10.25)
+    assert records["V2"]["courtyard"] == (-10.25, -10.25, 10.25, 10.25)

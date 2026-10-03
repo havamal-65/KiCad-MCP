@@ -47,6 +47,7 @@ from kicad_mcp.utils.placement_config import (
     get_tunable,
     is_clock_net,
 )
+from kicad_mcp.utils.courtyard_geometry import courtyard_points
 from kicad_mcp.utils.placement_metrics import build_part_graph
 from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
 
@@ -140,45 +141,20 @@ _PAD_NAME_PAT = re.compile(r'\(pad\s+(?:"([^"]*)"|([^\s()]+))')
 _NET_PAT = re.compile(r'\(net\s+(?:(\d+)\s+)?"([^"]*)"\)')
 _CLUSTERID_PAT = re.compile(r'\(property\s+"ClusterId"\s+"([^"]*)"')
 _PATH_PAT = re.compile(r'\(path\s+"([^"]*)"')
-_START_PAT = re.compile(r"\(start\s+([-\d.]+)\s+([-\d.]+)\)")
-_END_PAT = re.compile(r"\(end\s+([-\d.]+)\s+([-\d.]+)\)")
 
 
 def _parse_courtyard_box(block: str) -> tuple[float, float, float, float] | None:
-    """Local courtyard box from an fp_rect / fp_line on F./B.CrtYd, or None."""
-    xs: list[float] = []
-    ys: list[float] = []
-    i = 0
-    n = len(block)
-    while i < n:
-        if block[i] != "(":
-            i += 1
-            continue
-        j = i + 1
-        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
-            j += 1
-        token = block[i + 1 : j]
-        if token in ("fp_rect", "fp_line", "fp_poly"):
-            end_idx = _walk_balanced_parens(block, i)
-            if end_idx is None:
-                i += 1
-                continue
-            sub = block[i : end_idx + 1]
-            if '"F.CrtYd"' in sub or '"B.CrtYd"' in sub:
-                for m in _START_PAT.finditer(sub):
-                    xs.append(float(m.group(1)))
-                    ys.append(float(m.group(2)))
-                for m in _END_PAT.finditer(sub):
-                    xs.append(float(m.group(1)))
-                    ys.append(float(m.group(2)))
-                for m in re.finditer(r"\(xy\s+([-\d.]+)\s+([-\d.]+)\)", sub):
-                    xs.append(float(m.group(1)))
-                    ys.append(float(m.group(2)))
-            i = end_idx + 1
-            continue
-        i += 1
-    if not xs or not ys:
+    """Local courtyard box from the block's F./B.CrtYd graphics, or None.
+
+    Delegates to :func:`courtyard_points` (RW-S3 G4) so every shape the gate
+    parser sees — rect, line, poly, circle, arc, Bézier — is visible to
+    auto_place too.
+    """
+    points = courtyard_points(block)
+    if not points:
         return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
     return (min(xs), min(ys), max(xs), max(ys))
 
 

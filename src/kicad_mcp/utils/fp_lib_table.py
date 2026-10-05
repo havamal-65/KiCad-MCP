@@ -7,8 +7,10 @@ one in the user config dir and an optional per-project one next to the
 any environment variable).
 
 The grammar is shared with ``sym-lib-table``; ``parse_lib_table`` handles
-both, but symbol-table resolution keeps its existing code path in
-``file_backend`` for now.
+both, and ``get_symbol_library_map`` resolves symbol libraries the same way
+``get_footprint_library_map`` resolves footprints (RW-S4 §3 / F-REC3).
+``FileSchematicOps``' own project-symbol resolver keeps its separate
+KIR2-S5-verified code path.
 """
 
 from __future__ import annotations
@@ -30,12 +32,17 @@ _parse_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
 
 def get_global_fp_lib_table_path() -> Path | None:
     """Path to the user's global fp-lib-table, or None when absent."""
+    return _global_table_path("fp-lib-table")
+
+
+def _global_table_path(filename: str) -> Path | None:
+    """Path to a global lib table in the KiCad settings dir, or None."""
     from kicad_mcp.utils.kicad_paths import get_kicad_user_dir
 
     user_dir = get_kicad_user_dir()
     if user_dir is None:
         return None
-    table = user_dir / "fp-lib-table"
+    table = user_dir / filename
     return table if table.is_file() else None
 
 
@@ -97,6 +104,17 @@ def _default_var_value(var: str) -> str | None:
 
         for base in get_system_library_paths():
             if base.name == "footprints":
+                return str(base)
+        return None
+
+    # ${KICAD9_SYMBOL_DIR} → the system symbols dir — every stock entry in a
+    # global sym-lib-table uses it, so without this default they would all
+    # drop to the glob fallback (RW-S4 §3, amendment-logged).
+    if re.fullmatch(r"KICAD\d*_SYMBOL_DIR", var):
+        from kicad_mcp.utils.kicad_paths import get_system_library_paths
+
+        for base in get_system_library_paths():
+            if base.name == "symbols":
                 return str(base)
         return None
 
@@ -197,6 +215,46 @@ def get_footprint_library_map(project_dir: str | Path | None = None) -> dict[str
                 continue
             resolved = resolve_lib_uri(uri, proj)
             if resolved is not None and resolved.is_dir():
+                mapping[name] = resolved
+
+    return mapping
+
+
+def get_symbol_library_map(project_dir: str | Path | None = None) -> dict[str, Path]:
+    """Map symbol-library nickname -> existing ``.kicad_sym`` file.
+
+    Symmetric to :func:`get_footprint_library_map` (RW-S4 §3 / F-REC3).
+    Merge order, later wins: stock install glob (nickname = file stem),
+    global sym-lib-table, project sym-lib-table (``${KIPRJMOD}``/
+    ``${PROJ_DIR}`` URIs resolved against *project_dir*). ``(disabled)``
+    entries are skipped by ``parse_lib_table``; entries whose URI cannot be
+    resolved or whose file does not exist are dropped.
+    """
+    from kicad_mcp.utils.kicad_paths import find_symbol_libraries
+
+    proj = Path(project_dir) if project_dir is not None else None
+
+    mapping: dict[str, Path] = {}
+    for lib_path in find_symbol_libraries():
+        mapping.setdefault(lib_path.stem, lib_path)
+
+    tables: list[Path] = []
+    global_table = _global_table_path("sym-lib-table")
+    if global_table is not None:
+        tables.append(global_table)
+    if proj is not None:
+        project_table = proj / "sym-lib-table"
+        if project_table.is_file():
+            tables.append(project_table)
+
+    for table_path in tables:
+        for entry in parse_lib_table(table_path):
+            name = entry.get("name", "")
+            uri = entry.get("uri", "")
+            if not name or not uri:
+                continue
+            resolved = resolve_lib_uri(uri, proj)
+            if resolved is not None and resolved.is_file():
                 mapping[name] = resolved
 
     return mapping

@@ -167,15 +167,96 @@ def _point_on_segment(
 # ---------------------------------------------------------------------------
 
 class BoardOpenInKiCadError(RuntimeError):
-    """A .kicad_pcb write was refused because KiCad has the board open."""
+    """A file-side write was refused because KiCad has the file open.
+
+    Raised for schematic files too (RW-S4 §9); the name predates the
+    schematic guard and is kept so existing callers' excepts stay valid.
+    The remedy sentence is chosen by the target's suffix.
+    """
 
     def __init__(self, path: Path, lock_file: Path) -> None:
+        if path.suffix == ".kicad_sch":
+            remedy = (
+                "Schematic edits are file-based; close the schematic in "
+                "eeschema and retry."
+            )
+        else:
+            remedy = (
+                "Board edits must go through the live path while KiCad is "
+                "open; close the board in KiCad, or if this lock is stale "
+                "from a crash, delete it."
+            )
         super().__init__(
-            f"'{path.name}' is open in KiCad (lock file {lock_file.name} present). "
-            "Board edits must go through the live path while KiCad is open; close "
-            "the board in KiCad, or if this lock is stale from a crash, delete it."
+            f"'{path.name}' is open in KiCad (lock file present). Close it "
+            f"in KiCad first, or if KiCad is not actually editing it, delete "
+            f"the stale lock file {lock_file}. {remedy}"
         )
         self.lock_file = lock_file
+        self.lock_holder = _read_lock_holder(lock_file)
+
+
+def _read_lock_holder(lock_file: Path) -> dict[str, str] | None:
+    """Best-effort ``{hostname, username}`` from a KiCad ``.lck`` file.
+
+    KiCad writes the lock as a small JSON object; surface who holds it so
+    a refusal names the editing host. ``None`` on any read/parse failure —
+    the holder is advisory, never load-bearing.
+    """
+    import json
+    try:
+        data = json.loads(lock_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    holder = {
+        key: str(data[key]) for key in ("hostname", "username") if key in data
+    }
+    return holder or None
+
+
+# ---------------------------------------------------------------------------
+# Cross-version symbol-cache grammar fidelity (RW-S4 §11)
+# ---------------------------------------------------------------------------
+
+# Symbol-grammar tokens KiCad 10 writes that KiCad 9's parser refuses inside
+# a lib_symbols entry. Derived 2026-10-04 by diffing the full s-expression
+# token vocabulary of all 10.0 vs 9.0 stock .kicad_sym libraries ("bezier"
+# is K9-valid — K9's own parser error message lists it).
+_KICAD10_ONLY_SYMBOL_TOKENS = (
+    "in_pos_files",
+    "duplicate_pin_numbers_are_jumpers",
+    "body_styles",
+    "unit_name",
+)
+
+
+def _strip_kicad10_symbol_tokens(block: str) -> str:
+    """Downgrade a symbol block to KiCad 9 grammar before caching it.
+
+    MCP-authored schematics are stamped KiCad 9 format; a symbol copied
+    verbatim from a KiCad 10 library makes the whole file unloadable in
+    KiCad 9 (dual-install machines resolve stock libs newest-first).
+    Removes each balanced K10-only node plus its preceding whitespace run;
+    a node whose parens cannot be balanced returns the block untouched
+    rather than risk corrupting it.
+    """
+    from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
+
+    for token in _KICAD10_ONLY_SYMBOL_TOKENS:
+        pattern = re.compile(rf"\(\s*{token}[\s()]")
+        while True:
+            m = pattern.search(block)
+            if m is None:
+                break
+            end = _walk_balanced_parens(block, m.start())
+            if end is None:
+                return block
+            start = m.start()
+            while start > 0 and block[start - 1] in " \t\r\n":
+                start -= 1
+            block = block[:start] + block[end + 1:]
+    return block
 
 
 def _refuse_if_open_in_kicad(path: Path) -> None:
@@ -3044,6 +3125,12 @@ class FileSchematicOps(SchematicOps):
                 insertion = "\n" + "\n".join(sub_sym_blocks)
                 block = block[:-1] + insertion + "\n)"
 
+        # RW-S4 §11: downgrade K10-only grammar before caching into the
+        # K9-stamped document — same normative move as the extends inlining
+        # above. Applied to the final assembled block so inlined parent
+        # sub-symbols are covered too.
+        block = _strip_kicad10_symbol_tokens(block)
+
         # Rename: replace the top-level symbol name and all sub-symbol references
         # Top-level: (symbol "R" -> (symbol "Device:R"
         escaped_sym = re.escape(sym_name)
@@ -3100,6 +3187,7 @@ class FileSchematicOps(SchematicOps):
     def create_schematic(
         self, path: Path, title: str = "", revision: str = "",
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
         sch_uuid = str(_uuid.uuid4())
 
@@ -3155,6 +3243,7 @@ class FileSchematicOps(SchematicOps):
         separate components and number independently — preserving the classic
         many-"R?" placeholder flow.
         """
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
 
         # Locate the lib_symbols block so we can skip it
@@ -3449,6 +3538,7 @@ class FileSchematicOps(SchematicOps):
         properties: dict[str, str] | None = None,
         unit: int = 1,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
@@ -3489,6 +3579,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         wire_uuid = str(uuid.uuid4())
         wire_sexp = (
@@ -3513,6 +3604,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, text: str, x: float, y: float,
         label_type: str = "net_label",
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         label_uuid = str(uuid.uuid4())
         tag = label_type if label_type != "net_label" else "label"
@@ -3536,6 +3628,7 @@ class FileSchematicOps(SchematicOps):
         }
 
     def add_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         nc_uuid = str(uuid.uuid4())
         nc_sexp = (
@@ -3586,6 +3679,7 @@ class FileSchematicOps(SchematicOps):
     def add_power_symbol(
         self, path: Path, name: str, x: float, y: float, rotation: float = 0.0,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
@@ -3625,6 +3719,7 @@ class FileSchematicOps(SchematicOps):
         }
 
     def add_junction(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid
         jn_uuid = str(uuid.uuid4())
         jn_sexp = (
@@ -3650,6 +3745,7 @@ class FileSchematicOps(SchematicOps):
     def add_components_bulk(
         self, path: Path, components: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         # Within-batch duplicate guard, keyed on (reference, unit) so one
@@ -3773,6 +3869,7 @@ class FileSchematicOps(SchematicOps):
     def add_power_symbols_bulk(
         self, path: Path, symbols: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         content = path.read_text(encoding="utf-8")
@@ -4014,6 +4111,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, pins: list[str], net: str,
         stub_length: float = 2.54,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         from kicad_mcp.utils.kicad_version import lookup_pin_rename
@@ -4230,6 +4328,7 @@ class FileSchematicOps(SchematicOps):
     def add_no_connects_bulk(
         self, path: Path, points: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         import uuid as _uuid
 
         content = path.read_text(encoding="utf-8")
@@ -4265,6 +4364,7 @@ class FileSchematicOps(SchematicOps):
     def move_components_bulk(
         self, path: Path, moves: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
 
         moved: list[dict[str, Any]] = []
@@ -4392,6 +4492,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None, unit: int = 1,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         start, end = self._locate_unit_block(content, path, reference, int(unit))
         block = content[start:end + 1]
@@ -4415,6 +4516,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, reference: str,
         property_name: str, property_value: str,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_symbol_block_by_reference(content, reference)
         if location is None:
@@ -4465,6 +4567,7 @@ class FileSchematicOps(SchematicOps):
     def remove_component(
         self, path: Path, reference: str, unit: int | None = None,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         blocks = self._find_symbol_blocks_by_reference(content, reference)
         if not blocks:
@@ -4497,6 +4600,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_wire_block_by_endpoints(content, start_x, start_y, end_x, end_y)
         if location is None:
@@ -4524,6 +4628,7 @@ class FileSchematicOps(SchematicOps):
         }
 
     def remove_no_connect(self, path: Path, x: float, y: float) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         location = find_no_connect_block_by_position(content, x, y)
         if location is None:
@@ -4564,6 +4669,7 @@ class FileSchematicOps(SchematicOps):
     def remove_label(
         self, path: Path, x: float, y: float, text: str | None = None,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         start, end = self._locate_label(content, path, x, y, text)
 
@@ -4587,6 +4693,7 @@ class FileSchematicOps(SchematicOps):
         self, path: Path, x: float, y: float, new_text: str,
         old_text: str | None = None,
     ) -> dict[str, Any]:
+        _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
         start, end = self._locate_label(content, path, x, y, old_text)
 
@@ -5459,9 +5566,14 @@ class FileLibraryOps(LibraryOps):
     """
 
     def __init__(self, project_dir: str | Path | None = None) -> None:
-        from kicad_mcp.utils.fp_lib_table import get_footprint_library_map
-        from kicad_mcp.utils.kicad_paths import find_symbol_libraries
-        self._symbol_libs = find_symbol_libraries()
+        from kicad_mcp.utils.fp_lib_table import (
+            get_footprint_library_map,
+            get_symbol_library_map,
+        )
+        # RW-S4 §3 (F-REC3): symbols resolve through the sym-lib-table map
+        # (project table > global table > stock install), like footprints.
+        self._symbol_map = get_symbol_library_map(project_dir)
+        self._symbol_libs = sorted(set(self._symbol_map.values()))
         self._footprint_map = get_footprint_library_map(project_dir)
         self._footprint_libs = sorted(set(self._footprint_map.values()))
 
@@ -5516,49 +5628,54 @@ class FileLibraryOps(LibraryOps):
             return {"error": f"Invalid lib_id format: {lib_id}. Expected 'Library:Symbol'"}
         lib_name, sym_name = parts
 
-        for lib_path in self._symbol_libs:
-            if lib_path.stem == lib_name:
-                tree = parse_sexp_file(lib_path)
-                for node in tree:
-                    if (isinstance(node, list) and len(node) >= 2
-                            and node[0] == "symbol" and node[1] == sym_name):
-                        result = _parse_symbol_detail(node, lib_name)
-                        unit_source = node
-                        # If no pins found, the symbol may use (extends "Parent").
-                        # Walk the extends chain to inherit pins from the parent.
-                        if result.get("pin_count", 0) == 0:
-                            for child in node[1:]:
-                                if (isinstance(child, list) and len(child) >= 2
-                                        and child[0] == "extends"):
-                                    parent_name = child[1]
-                                    result["extends"] = parent_name
-                                    for parent_node in tree:
-                                        if (isinstance(parent_node, list)
-                                                and len(parent_node) >= 2
-                                                and parent_node[0] == "symbol"
-                                                and parent_node[1] == parent_name):
-                                            parent_detail = _parse_symbol_detail(
-                                                parent_node, lib_name,
-                                            )
-                                            result["pins"] = parent_detail.get("pins", [])
-                                            result["pin_count"] = len(result["pins"])
-                                            unit_source = parent_node
-                                            break
-                                    break
-                        # Multi-unit structure (RW-S1 C5): unit 0 = pins
-                        # common to all units; numbers as strings, matching
-                        # existing pin payloads.
-                        unit_pins, unit_count = _lib_symbol_unit_info(unit_source)
-                        result["unit_count"] = unit_count
-                        result["unit_pins"] = {
-                            str(u): [
-                                str(p.get("number", p.get("name", "")))
-                                for p in unit_pins[u]
-                                if p.get("number", p.get("name", ""))
-                            ]
-                            for u in sorted(unit_pins)
-                        }
-                        return result
+        # Nickname beats stem: a sym-lib-table entry may name a library
+        # differently from its file stem (RW-S4 §3).
+        by_nickname = self._symbol_map.get(lib_name)
+        candidates = [by_nickname] if by_nickname is not None else [
+            p for p in self._symbol_libs if p.stem == lib_name
+        ]
+        for lib_path in candidates:
+            tree = parse_sexp_file(lib_path)
+            for node in tree:
+                if (isinstance(node, list) and len(node) >= 2
+                        and node[0] == "symbol" and node[1] == sym_name):
+                    result = _parse_symbol_detail(node, lib_name)
+                    unit_source = node
+                    # If no pins found, the symbol may use (extends "Parent").
+                    # Walk the extends chain to inherit pins from the parent.
+                    if result.get("pin_count", 0) == 0:
+                        for child in node[1:]:
+                            if (isinstance(child, list) and len(child) >= 2
+                                    and child[0] == "extends"):
+                                parent_name = child[1]
+                                result["extends"] = parent_name
+                                for parent_node in tree:
+                                    if (isinstance(parent_node, list)
+                                            and len(parent_node) >= 2
+                                            and parent_node[0] == "symbol"
+                                            and parent_node[1] == parent_name):
+                                        parent_detail = _parse_symbol_detail(
+                                            parent_node, lib_name,
+                                        )
+                                        result["pins"] = parent_detail.get("pins", [])
+                                        result["pin_count"] = len(result["pins"])
+                                        unit_source = parent_node
+                                        break
+                                break
+                    # Multi-unit structure (RW-S1 C5): unit 0 = pins
+                    # common to all units; numbers as strings, matching
+                    # existing pin payloads.
+                    unit_pins, unit_count = _lib_symbol_unit_info(unit_source)
+                    result["unit_count"] = unit_count
+                    result["unit_pins"] = {
+                        str(u): [
+                            str(p.get("number", p.get("name", "")))
+                            for p in unit_pins[u]
+                            if p.get("number", p.get("name", ""))
+                        ]
+                        for u in sorted(unit_pins)
+                    }
+                    return result
         return {"error": f"Symbol not found: {lib_id}"}
 
     def get_footprint_info(self, lib_id: str) -> dict[str, Any]:

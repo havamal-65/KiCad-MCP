@@ -97,11 +97,12 @@ def run_validate_symbol_footprint_pairs(sch_path: Path) -> dict[str, Any]:
     LIMIT = 20
 
     symbols = _collect_all_real_symbols(sch_path)
-    lib_ops = FileLibraryOps()
-    # Resolve footprints with the project dir so project-local .pretty libraries
-    # (registered in the project fp-lib-table, S1) resolve — otherwise they'd be
-    # mis-reported as unresolvable and falsely block sync.
+    # Resolve footprints AND symbols with the project dir so project-local
+    # libraries (registered in the project fp-lib-table / sym-lib-table)
+    # resolve — otherwise they'd be mis-reported as unresolvable and falsely
+    # block sync (RW-S4 §3 / F-REC3).
     project_dir = sch_path.parent
+    lib_ops = FileLibraryOps(project_dir=project_dir)
 
     seen_refs: set[str] = set()
     checked = 0
@@ -528,6 +529,11 @@ _EDGE_NAME_TOKENS: tuple[str, ...] = (
     "Connector_RJ",
     "Connector_HDMI",
     "Connector_Coaxial",
+    # RW-S4 §6 (aqs #18 follow-up): wire-entry terminal blocks mate at the
+    # board edge too — covers TerminalBlock_Altech/Phoenix/MetzConnect and
+    # plain TerminalBlock libs, plus Phoenix connector libs without the word.
+    "TerminalBlock",
+    "Connector_Phoenix",
 )
 
 

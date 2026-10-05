@@ -26,6 +26,7 @@ def _run(**overrides):
     """
     kicad_running = overrides.get("kicad_running", True)
     bridge_pong = overrides.get("bridge_pong", True)
+    bridge_version = overrides.get("bridge_version", "2.7.0-zones")
     bridge_error = overrides.get("bridge_error", None)
     active_board = overrides.get("active_board", "/board.kicad_pcb")
     cli_path = overrides.get("cli_path", "/usr/bin/kicad-cli")
@@ -38,12 +39,16 @@ def _run(**overrides):
         if bridge_error:
             raise bridge_error
         if method == "ping":
-            return {"pong": bridge_pong}
-        if method == "get_info":
-            return {"version": "2.0.0"}
+            # Real bridge ping payload shape: bridge_version, never a
+            # separate "version" field and no get_info method (RW-S4 §7 —
+            # the old stub invented both, masking the method-name drift).
+            payload = {"pong": bridge_pong}
+            if bridge_version is not None:
+                payload["bridge_version"] = bridge_version
+            return payload
         if method == "get_active_project":
             return {"board_path": active_board}
-        return {}
+        raise RuntimeError(f"Unknown method: '{method}'")
 
     class FakeIPCConn:
         def ping(self):
@@ -156,8 +161,73 @@ def test_bridge_not_reachable():
     assert result["ready_for_pcb"] is False
     statuses = {item["item"]: item["status"] for item in result["checklist"]}
     assert statuses["bridge_reachable"] == "FAIL"
+    # RW-S4 §7: the version item mirrors bridge_reachable when down.
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "FAIL"
+    assert "Skipped" in items["bridge_version_ok"]["detail"]
     assert any("bridge" in action.lower() or "PCB editor" in action
                for action in result["required_actions"])
+
+
+# ---------------------------------------------------------------------------
+# RW-S4 §7 — bridge_version_ok reports the REAL version (from the ping
+# payload; the old get_info method never existed in the bridge dispatch)
+# ---------------------------------------------------------------------------
+
+def test_bridge_version_from_ping_payload():
+    # The stub serves the real ping payload shape and raises on any other
+    # method (get_active_project aside) — so a get_info regression would
+    # surface as an exception-detail here, not a silent PASS.
+    result = _run(bridge_version="9.9.9-test")
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "PASS"
+    assert items["bridge_version_ok"]["detail"] == "Bridge version: 9.9.9-test."
+
+
+def test_bridge_version_missing_warns():
+    """A reachable bridge whose ping payload has no bridge_version (pre-2.x)."""
+    result = _run(bridge_version=None)
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "WARN"
+    assert "reported no version" in items["bridge_version_ok"]["detail"]
+    # Non-blocking: everything else is up.
+    assert result["ready_for_pcb"] is True
+
+
+def test_bridge_version_socket_fallback_warns(monkeypatch):
+    """plugin_backend unavailable → bridge reached by raw socket; the version
+    stays unknown by design and the item says which case this is."""
+    import types
+
+    from kicad_mcp.backends import plugin_backend
+
+    monkeypatch.delattr(plugin_backend, "_tcp_call")
+
+    class FakeSock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("kicad_mcp.utils.platform_helper.is_kicad_running", return_value=True), \
+         patch("kicad_mcp.utils.platform_helper.find_kicad_cli", return_value=None), \
+         patch("socket.create_connection", return_value=FakeSock()), \
+         patch("kicad_mcp.backends.ipc_connection.IPCConnection") as ipc_cls, \
+         patch("kicad_mcp.backends.ipc_connection.ipc_enabled", return_value=True), \
+         patch("kicad_mcp.utils.startup_state.recent_launch", return_value=False), \
+         patch("kicad_mcp.backends.ipc_connection.connection_remedy",
+               return_value="Enable the IPC API server."):
+        ipc_cls.return_value.ping.return_value = True
+        ipc_cls.return_value.board.return_value = types.SimpleNamespace(
+            name="b.kicad_pcb")
+        from kicad_mcp.tools.project import run_startup_checklist
+        result = run_startup_checklist()
+
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_reachable"]["status"] == "PASS"
+    assert items["bridge_version_ok"]["status"] == "WARN"
+    assert "plugin_backend unavailable" in items["bridge_version_ok"]["detail"]
 
 
 # ---------------------------------------------------------------------------

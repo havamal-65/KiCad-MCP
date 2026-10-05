@@ -124,6 +124,25 @@ def upgrade_project_files(files: ProjectFiles, cli: Path) -> dict[str, Any]:
             "files": [],
         }
 
+    # RW-S4 §9: refuse while KiCad holds any target open — the in-place CLI
+    # upgrade below bypasses the per-operation write guards.
+    from kicad_mcp.backends.file_backend import (  # local: avoid cycle
+        BoardOpenInKiCadError,
+        _refuse_if_open_in_kicad,
+    )
+    for path, _subcmd, _minimum, _before in stale:
+        try:
+            _refuse_if_open_in_kicad(path)
+        except BoardOpenInKiCadError as exc:
+            return {
+                "status": "error",
+                "error_code": "schematic_open_in_kicad",
+                "lock_file": str(exc.lock_file),
+                "lock_holder": exc.lock_holder,
+                "message": str(exc),
+                "files": [],
+            }
+
     reports: list[dict[str, Any]] = []
     backups: list[tuple[Path, Path]] = []
     for path, subcmd, minimum, before in stale:

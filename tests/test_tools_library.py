@@ -270,3 +270,143 @@ def test_get_symbol_info_unit_count_and_pins(tmp_path: Path):
     assert "error" not in info
     assert info["unit_count"] == 1
     assert info["unit_pins"] == {"0": ["1", "2"]}
+
+
+# ---------------------------------------------------------------------------
+# RW-S4 §3 (F-REC3) — project-aware SYMBOL resolution
+# ---------------------------------------------------------------------------
+
+FIXTURE_SYM = """\
+(kicad_symbol_lib (version 20231120) (generator "test")
+  (symbol "AQ_SENSOR"
+    (property "Reference" "U" (at 0 0 0))
+    (property "Value" "AQ_SENSOR" (at 0 0 0))
+    (symbol "AQ_SENSOR_1_1"
+      (pin input line (at -5 0 0) (length 2) (name "IN" (effects)) (number "1" (effects)))
+      (pin output line (at 5 0 180) (length 2) (name "OUT" (effects)) (number "2" (effects)))
+    )
+  )
+)
+"""
+
+
+def _make_project_with_symbol_lib(tmp_path: Path, disabled: bool = False) -> Path:
+    project = tmp_path / "symproj"
+    project.mkdir(exist_ok=True)
+    (project / "aq_symbols.kicad_sym").write_text(FIXTURE_SYM, encoding="utf-8")
+    disabled_clause = "(disabled)" if disabled else ""
+    (project / "sym-lib-table").write_text(
+        "(sym_lib_table\n"
+        '  (lib (name AirQuality_Sym)(type KiCad)'
+        f'(uri "${{KIPRJMOD}}/aq_symbols.kicad_sym")(options "")(descr ""){disabled_clause})\n'
+        ")",
+        encoding="utf-8",
+    )
+    return project
+
+
+@pytest.fixture()
+def _no_global_sym_table():
+    with patch(
+        "kicad_mcp.utils.fp_lib_table._global_table_path", return_value=None
+    ):
+        yield
+
+
+def test_get_symbol_info_project_local_lib(
+    tmp_path: Path, _no_system_libs, _no_global_sym_table,
+):
+    project = _make_project_with_symbol_lib(tmp_path)
+    tools = _get_tools(MagicMock(), tmp_path)
+
+    result = json.loads(
+        tools["get_symbol_info"]("AirQuality_Sym:AQ_SENSOR", project_dir=str(project))
+    )
+    assert result["status"] == "success"
+    assert result["pin_count"] == 2
+
+
+def test_get_symbol_info_no_project_dir_unchanged(tmp_path: Path):
+    """Empty project_dir keeps the existing backend.get_library_ops() path."""
+    backend_stub = MagicMock()
+    backend_stub.get_library_ops.return_value.get_symbol_info.return_value = {
+        "name": "R", "pin_count": 2,
+    }
+    tools = _get_tools(backend_stub, tmp_path)
+
+    result = json.loads(tools["get_symbol_info"]("Device:R"))
+    assert result["status"] == "success"
+    backend_stub.get_library_ops.assert_called_once()
+
+
+def test_get_symbol_info_nickname_beats_stem(
+    tmp_path: Path, _no_system_libs, _no_global_sym_table,
+):
+    """A table nickname shadowing another lib's stem wins resolution."""
+    from kicad_mcp.backends.file_backend import FileLibraryOps
+
+    project = tmp_path / "nick"
+    project.mkdir()
+    # The nicknamed table entry points at the real symbol file...
+    (project / "real.kicad_sym").write_text(FIXTURE_SYM, encoding="utf-8")
+    # ...while a stock-visible file whose STEM equals the nickname is empty.
+    decoy = tmp_path / "AirQuality_Sym.kicad_sym"
+    decoy.write_text('(kicad_symbol_lib (version 20231120) (generator "t"))\n',
+                     encoding="utf-8")
+    (project / "sym-lib-table").write_text(
+        "(sym_lib_table\n"
+        '  (lib (name AirQuality_Sym)(type KiCad)'
+        '(uri "${KIPRJMOD}/real.kicad_sym")(options "")(descr ""))\n'
+        ")",
+        encoding="utf-8",
+    )
+    with patch(
+        "kicad_mcp.utils.kicad_paths.find_symbol_libraries", return_value=[decoy]
+    ):
+        ops = FileLibraryOps(project_dir=project)
+    result = ops.get_symbol_info("AirQuality_Sym:AQ_SENSOR")
+    assert result.get("pin_count") == 2, result
+
+
+def test_symbol_map_disabled_entry_skipped(
+    tmp_path: Path, _no_system_libs, _no_global_sym_table,
+):
+    from kicad_mcp.utils.fp_lib_table import get_symbol_library_map
+
+    project = _make_project_with_symbol_lib(tmp_path, disabled=True)
+    mapping = get_symbol_library_map(project)
+    assert "AirQuality_Sym" not in mapping
+
+
+def test_pair_validator_resolves_project_symbol(
+    tmp_path: Path, _no_system_libs, _no_global_sym_table,
+):
+    """F-REC3 regression: run_validate_symbol_footprint_pairs resolves a
+    project-local symbol instead of reporting it unresolvable."""
+    from kicad_mcp.tools.drc import run_validate_symbol_footprint_pairs
+
+    project = _make_project_with_symbol_lib(tmp_path)
+    lib = project / "AirQuality.pretty"
+    lib.mkdir()
+    (lib / "R_Test.kicad_mod").write_text(FIXTURE_MOD, encoding="utf-8")
+    (project / "fp-lib-table").write_text(
+        "(fp_lib_table\n"
+        '  (lib (name AirQuality_Project)(type KiCad)'
+        '(uri "${KIPRJMOD}/AirQuality.pretty")(options "")(descr ""))\n'
+        ")",
+        encoding="utf-8",
+    )
+    sch = project / "p.kicad_sch"
+    sch.write_text(
+        '(kicad_sch (version 20231120) (generator "test") (uuid "aaaa")\n'
+        '  (symbol (lib_id "AirQuality_Sym:AQ_SENSOR") (at 50 50 0) (unit 1)\n'
+        '    (uuid "bbbb")\n'
+        '    (property "Reference" "U1" (at 0 0 0))\n'
+        '    (property "Value" "AQ_SENSOR" (at 0 0 0))\n'
+        '    (property "Footprint" "AirQuality_Project:R_Test" (at 0 0 0))\n'
+        "  )\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    result = run_validate_symbol_footprint_pairs(sch)
+    assert result["unresolvable"] == [], result

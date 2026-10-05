@@ -19,9 +19,12 @@ from kicad_mcp.models.errors import (
 # AC8 batch could not move_component the scratch board's own refs).
 REFERENCE_PATTERN = re.compile(r"^#?[A-Za-z][A-Za-z0-9_]*\d[A-Za-z0-9_]*$")
 
-# Net name: alphanumeric, underscores, hyphens, slashes, dots, plus signs
-# Allows hierarchical nets like /sheet1/VCC and differential pairs like USB_D+
-NET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-/\.+~]+$")
+# Net name: alphanumeric, underscores, hyphens, slashes, dots, plus signs,
+# parens/brackets/braces and interior spaces. Allows hierarchical nets like
+# /sheet1/VCC, differential pairs like USB_D+, KiCad's own auto-generated
+# Net-(X1-Pad2) names, buses like BUS[3], and N{X} (each individually
+# measured legal against kicad-cli 10.0.4 netlists — RW-S4 §2 / F-REC2).
+NET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-/\.+~(){}\[\] ]+$")
 
 # KiCad file extensions
 KICAD_PROJECT_EXT = ".kicad_pro"
@@ -65,10 +68,13 @@ def validate_net_name(name: str) -> str:
     """
     if not name:
         raise InvalidNetNameError("Net name cannot be empty")
+    if name != name.strip():
+        # KiCad-legal, but always a caller bug in our API (RW-S4 §2).
+        raise InvalidNetNameError("Net name cannot start or end with whitespace")
     if not NET_NAME_PATTERN.match(name):
         raise InvalidNetNameError(
             f"Invalid net name: '{name}'. "
-            "Allowed characters: alphanumeric, _, -, /, ., +, ~"
+            "Allowed characters: alphanumeric, _, -, /, ., +, ~, (), [], {}, space"
         )
     return name
 

@@ -9,6 +9,7 @@ from typing import Any, cast
 from fastmcp import FastMCP
 
 from kicad_mcp.backends.base import BackendProtocol, BoardOps
+from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -43,6 +44,18 @@ def _format_validator_refusal_message(sf: dict[str, Any]) -> str:
         f"{summary}. Run validate_symbol_footprint_pairs to see all issues, then "
         f"fix the symbol's Footprint field or pick a different footprint."
     )
+
+
+def _schematic_write_refusal(exc: BoardOpenInKiCadError) -> str:
+    """Structured refusal for a schematic write while KiCad holds the file
+    open (RW-S4 §9); mirrors routing.py's board_open_in_kicad shape."""
+    return json.dumps({
+        "status": "error",
+        "error_code": "schematic_open_in_kicad",
+        "lock_file": str(exc.lock_file),
+        "lock_holder": exc.lock_holder,
+        "message": str(exc),
+    }, indent=2)
 
 
 def suggest_footprint_candidates(
@@ -276,6 +289,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.create_schematic(p, title=title, revision=revision)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -337,6 +352,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 footprint=footprint, properties=properties,
                 unit=unit,
             )
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -372,7 +389,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_wire(p, start_x, start_y, end_x, end_y)
+        try:
+            result = ops.add_wire(p, start_x, start_y, end_x, end_y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_wire",
             {"path": path, "start": [start_x, start_y], "end": [end_x, end_y]},
@@ -412,7 +432,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_label(p, text, x, y, label_type)
+        try:
+            result = ops.add_label(p, text, x, y, label_type)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_label",
             {"path": path, "text": text, "x": x, "y": y, "label_type": label_type},
@@ -443,6 +466,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 backup_path=str(backup) if backup else None,
             )
             return json.dumps({"status": "success", **result}, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "info",
@@ -567,7 +592,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_no_connect(p, x, y)
+        try:
+            result = ops.add_no_connect(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_no_connect",
             {"path": path, "x": x, "y": y},
@@ -603,7 +631,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_power_symbol(p, name, x, y, rotation)
+        try:
+            result = ops.add_power_symbol(p, name, x, y, rotation)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_power_symbol",
             {"path": path, "name": name, "x": x, "y": y, "rotation": rotation},
@@ -653,6 +684,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_components_bulk(p, components)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -694,6 +727,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_power_symbols_bulk(p, symbols)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -767,6 +802,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.connect_pins_bulk(p, pins, net, stub_length=stub_length)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -803,6 +840,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_no_connects_bulk(p, points)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -856,6 +895,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.move_components_bulk(p, moves)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -949,12 +990,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             sch_p = validate_kicad_path(path, ".kicad_sch")
             try:
                 result = _remove_schematic_component(sch_p, reference, unit)
+            except BoardOpenInKiCadError as exc:
+                return _schematic_write_refusal(exc)
             except ValueError as exc:
                 return json.dumps({"status": "error", "message": str(exc)})
             return json.dumps({"status": "success", **result}, indent=2)
 
         if scope == "pcb":
-            from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
             pcb_p = validate_kicad_path(path, ".kicad_pcb")
             try:
                 result = _remove_board_component(pcb_p, reference)
@@ -978,6 +1020,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         errors = 0
         try:
             sides["schematic"] = _remove_schematic_component(sch_p, reference)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             sides["schematic"] = {"error": str(exc)}
             errors += 1
@@ -1019,6 +1063,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_wire(p, start_x, start_y, end_x, end_y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1050,6 +1096,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_no_connect(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1086,6 +1134,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_label(p, x, y, text=text)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1125,6 +1175,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.set_label_text(p, x, y, new_text, old_text=old_text)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1172,6 +1224,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.move_component(p, reference, x, y, rotation=rotation, unit=unit)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1211,6 +1265,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.update_component_property(p, reference, property_name, property_value)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -2007,7 +2063,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_junction(p, x, y)
+        try:
+            result = ops.add_junction(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_junction",
             {"path": path, "x": x, "y": y},

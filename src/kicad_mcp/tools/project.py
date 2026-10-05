@@ -100,11 +100,17 @@ def run_startup_checklist() -> dict[str, Any]:
 
     bridge_ok = False
     bridge_detail = ""
+    # RW-S4 §7: the ping payload already carries bridge_version — read it
+    # here (zero extra round-trips). The socket fallback below leaves it
+    # empty by design (plugin_backend unavailable = no payload to read).
+    version = ""
     if _tcp_call is not None:
         try:
             result = _tcp_call("ping", ping_timeout)
             bridge_ok = isinstance(result, dict) and result.get("pong") is True
             bridge_detail = "Bridge responded to ping." if bridge_ok else "Bridge ping check returned unexpected value."
+            if isinstance(result, dict):
+                version = str(result.get("bridge_version", "") or "")
         except Exception as exc:
             bridge_detail = f"Bridge not reachable: {exc}"
     else:
@@ -138,25 +144,29 @@ def run_startup_checklist() -> dict[str, Any]:
         )
 
     # ── 4. Bridge version check ──────────────────────────────────────────────
-    bridge_version_detail = ""
-    if bridge_ok and _tcp_call is not None:
-        try:
-            info = _tcp_call("get_info", ping_timeout)
-            if isinstance(info, dict):
-                version = info.get("version", "")
-                bridge_version_detail = f"Bridge version: {version or 'unknown'}."
-            else:
-                bridge_version_detail = "Bridge reachable; version field not returned."
-        except Exception as exc:
-            bridge_version_detail = f"Version check skipped: {exc}"
+    # RW-S4 §7: the version comes from the ping payload above (the old
+    # get_info method never existed in the bridge dispatch, so this item
+    # was always "PASS, version check skipped" — never a real version).
+    if bridge_ok and version:
+        bridge_version_status = "PASS"
+        bridge_version_detail = f"Bridge version: {version}."
+    elif bridge_ok and _tcp_call is not None:
+        bridge_version_status = "WARN"
+        bridge_version_detail = (
+            "Bridge reachable but reported no version (pre-2.x bridge?)."
+        )
     elif bridge_ok:
-        bridge_version_detail = "Bridge reachable; version not checked (plugin_backend unavailable)."
+        bridge_version_status = "WARN"
+        bridge_version_detail = (
+            "Bridge reachable; version unknown (plugin_backend unavailable)."
+        )
     else:
+        bridge_version_status = bridge_status  # mirrors bridge_reachable when down
         bridge_version_detail = "Skipped (bridge not reachable)."
 
     checklist.append({
         "item": "bridge_version_ok",
-        "status": "PASS" if bridge_ok else bridge_status,  # mirrors bridge_reachable when down
+        "status": bridge_version_status,
         "detail": bridge_version_detail,
     })
 
@@ -270,7 +280,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
              vs still-loading vs no board (WARN when down: the bridge may serve)
           3. bridge_reachable — kicad_mcp_bridge answers (WARN when the IPC API
              already serves the open board; FAIL when NO live path is up)
-          4. bridge_version_ok — bridge version info (mirrors bridge_reachable when down)
+          4. bridge_version_ok — the real bridge version from the ping payload
+             (WARN when reachable but version unknown; mirrors bridge_reachable when down)
           5. pcb_editor_open  — a board is READY (loaded, not still-loading) on a
              live path (FAIL blocks PCB ops)
           6. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)

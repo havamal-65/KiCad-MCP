@@ -1001,11 +1001,38 @@ class TestSaveRouting:
         assert calls[0][1]["path"] == str(BOARD_PATH)
 
 
+def _coherent_disk_text(tracks: int = 1, vias: int = 1) -> str:
+    """File text that coheres with ``write_board`` for the F-DV11 write guard:
+    U1 at (0, 0) and matching track/via/zone counts — clear_routes is a write
+    path, so a disk file that disagrees with the live board is refused."""
+    lines = [
+        "(kicad_pcb",
+        "\t(version 20241229)",
+        '\t(generator "pre-clear-state")',
+        '\t(footprint "Lib:FP"',
+        "\t\t(at 0 0)",
+        '\t\t(property "Reference" "U1"',
+        "\t\t\t(at 0 0 0)",
+        "\t\t)",
+        "\t)",
+    ]
+    lines.extend(
+        '\t(segment (start 1 2) (end 3 2) (width 0.25) (layer "F.Cu") (net 1))'
+        for _ in range(tracks)
+    )
+    lines.extend(
+        '\t(via (at 5 6) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 1))'
+        for _ in range(vias)
+    )
+    lines.append(")")
+    return "\n".join(lines) + "\n"
+
+
 class TestClearRoutes:
     @pytest.fixture
     def disk_board(self, tmp_path):
         board_file = tmp_path / "test_board.kicad_pcb"
-        board_file.write_text("(kicad_pcb pre-clear-state)", encoding="utf-8")
+        board_file.write_text(_coherent_disk_text(), encoding="utf-8")
         return board_file
 
     def test_removes_tracks_and_vias_with_backup(self, write_ops, write_board, disk_board):
@@ -1015,7 +1042,7 @@ class TestClearRoutes:
         assert result["vias_removed"] == 1
         backup = Path(result["backup_path"])
         assert backup.name == "test_board.clear_routes_backup.kicad_pcb"
-        assert backup.read_text(encoding="utf-8") == "(kicad_pcb pre-clear-state)"
+        assert backup.read_text(encoding="utf-8") == _coherent_disk_text()
         assert len(write_board.removed[0]) == 2  # 1 track + 1 via in one call
         assert write_board.save_count == 2  # pre-backup flush + post-commit save
 
@@ -1028,6 +1055,7 @@ class TestClearRoutes:
     def test_empty_board_no_remove_call(self, write_ops, write_board, disk_board):
         write_board.tracks = []
         write_board.vias = []
+        disk_board.write_text(_coherent_disk_text(tracks=0, vias=0), encoding="utf-8")
         result = write_ops.clear_routes(disk_board, backup=False)
         assert result["tracks_removed"] == 0
         assert result["vias_removed"] == 0

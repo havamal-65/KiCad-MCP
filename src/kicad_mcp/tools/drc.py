@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
 
@@ -387,6 +387,18 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
     return result
 
 
+class _CourtyardPrims(NamedTuple):
+    """Exact-testable courtyard primitives in board coordinates (F-DV5).
+
+    ``circles`` holds ``(cx, cy, r)`` with the center rotated exactly by the
+    footprint rotation; ``rest`` is the bbox of every non-circle courtyard
+    point (``None`` for circle-only courtyards).
+    """
+
+    circles: list[tuple[float, float, float]]
+    rest: tuple[float, float, float, float] | None
+
+
 def _parse_placed_courtyards(
     content: str,
 ) -> tuple[dict[str, dict[str, float]], list[str]]:
@@ -394,19 +406,31 @@ def _parse_placed_courtyards(
 
     Returns ``(courtyards, no_courtyard)`` where ``courtyards`` maps each real
     ref (non-``#``) that carries ``F.CrtYd``/``B.CrtYd`` geometry (rect, line,
-    poly, circle, arc, or Bézier — via ``courtyard_points``) to its board-frame
-    ``{xmin, ymin, xmax, ymax}`` (rotation applied), and ``no_courtyard`` lists
-    real refs that have no courtyard geometry. Shared by
+    poly, circle, arc, or Bézier — via ``courtyard_primitives``) to its
+    board-frame ``{xmin, ymin, xmax, ymax}`` (rotation applied; a circle's
+    bbox comes from its rotated center ± r), and ``no_courtyard`` lists real
+    refs that have no courtyard geometry. Shared by
     ``check_courtyard_overlaps`` (overlap detection) and ``verify_board_size``
     (§6.5 area/dimension sizing).
     """
+    courtyards, no_courtyard, _prims = _parse_courtyards_with_primitives(content)
+    return courtyards, no_courtyard
+
+
+def _parse_courtyards_with_primitives(
+    content: str,
+) -> tuple[dict[str, dict[str, float]], list[str], dict[str, _CourtyardPrims]]:
+    """Single walk behind ``_parse_placed_courtyards`` that also returns the
+    per-ref exact primitives the overlap gate refines candidate pairs with
+    (spec-courtyard-exact-overlap X2)."""
     import math as _math
 
-    from kicad_mcp.utils.courtyard_geometry import courtyard_points
+    from kicad_mcp.utils.courtyard_geometry import courtyard_primitives
     from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
 
     courtyards: dict[str, dict[str, float]] = {}
     no_courtyard: list[str] = []
+    primitives: dict[str, _CourtyardPrims] = {}
 
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
     ref_pat = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
@@ -443,27 +467,50 @@ def _parse_placed_courtyards(
             origin_y = float(at_m.group(2)) if at_m else 0.0
             rotation_deg = float(at_m.group(3)) if (at_m and at_m.group(3)) else 0.0
 
-            cyd_points = courtyard_points(block)
-            cyd_xs = [p[0] for p in cyd_points]
-            cyd_ys = [p[1] for p in cyd_points]
+            circles, rest_points = courtyard_primitives(block)
 
-            if cyd_xs and cyd_ys:
+            if circles or rest_points:
                 if abs(rotation_deg) > 0.01:
                     # KiCad convention: (x,y) -> (x*c + y*s, -x*s + y*c)
                     # (positive rotation = CCW on screen = CW in y-down file
-                    # coords; see tests/test_rotation_convention.py).
+                    # coords; see tests/test_rotation_convention.py). Circle
+                    # centers rotate exactly; radii are rotation-invariant.
                     rad = _math.radians(rotation_deg)
                     cos_r, sin_r = _math.cos(rad), _math.sin(rad)
-                    cyd_xs, cyd_ys = (
-                        [x * cos_r + y * sin_r for x, y in zip(cyd_xs, cyd_ys)],
-                        [-x * sin_r + y * cos_r for x, y in zip(cyd_xs, cyd_ys)],
+                    rest_points = [
+                        (x * cos_r + y * sin_r, -x * sin_r + y * cos_r)
+                        for x, y in rest_points
+                    ]
+                    circles = [
+                        (cx * cos_r + cy * sin_r, -cx * sin_r + cy * cos_r, r)
+                        for cx, cy, r in circles
+                    ]
+                board_circles = [
+                    (origin_x + cx, origin_y + cy, r) for cx, cy, r in circles
+                ]
+                rest_box: tuple[float, float, float, float] | None = None
+                if rest_points:
+                    rest_box = (
+                        origin_x + min(p[0] for p in rest_points),
+                        origin_y + min(p[1] for p in rest_points),
+                        origin_x + max(p[0] for p in rest_points),
+                        origin_y + max(p[1] for p in rest_points),
                     )
+                # Overall bbox: union of the rest box and each circle's exact
+                # center±r box (fixes the pre-F-DV5 understatement from
+                # rotating a circle's corner points at non-axis angles).
+                xs = [v for cx, cy, r in board_circles for v in (cx - r, cx + r)]
+                ys = [v for cx, cy, r in board_circles for v in (cy - r, cy + r)]
+                if rest_box is not None:
+                    xs.extend((rest_box[0], rest_box[2]))
+                    ys.extend((rest_box[1], rest_box[3]))
                 courtyards[ref] = {
-                    "xmin": origin_x + min(cyd_xs),
-                    "ymin": origin_y + min(cyd_ys),
-                    "xmax": origin_x + max(cyd_xs),
-                    "ymax": origin_y + max(cyd_ys),
+                    "xmin": min(xs),
+                    "ymin": min(ys),
+                    "xmax": max(xs),
+                    "ymax": max(ys),
                 }
+                primitives[ref] = _CourtyardPrims(board_circles, rest_box)
             else:
                 no_courtyard.append(ref)
 
@@ -471,19 +518,61 @@ def _parse_placed_courtyards(
             continue
         i += 1
 
-    return courtyards, no_courtyard
+    return courtyards, no_courtyard, primitives
+
+
+def _circle_box_intersect(
+    circle: tuple[float, float, float],
+    box: tuple[float, float, float, float],
+) -> bool:
+    """Exact (strict) circle-vs-axis-aligned-box intersection."""
+    import math as _math
+
+    cx, cy, r = circle
+    qx = min(max(cx, box[0]), box[2])
+    qy = min(max(cy, box[1]), box[3])
+    return _math.hypot(cx - qx, cy - qy) < r
+
+
+def _primitives_intersect(a: _CourtyardPrims, b: _CourtyardPrims) -> bool:
+    """Exact pair test over courtyard primitives (spec X3): any circle or
+    rest-box of one footprint strictly intersecting any of the other's.
+    Strict inequalities keep the bbox test's tangency semantics (touching is
+    not an overlap)."""
+    import math as _math
+
+    for ca in a.circles:
+        for cb in b.circles:
+            if _math.hypot(ca[0] - cb[0], ca[1] - cb[1]) < ca[2] + cb[2]:
+                return True
+        if b.rest is not None and _circle_box_intersect(ca, b.rest):
+            return True
+    if a.rest is not None:
+        for cb in b.circles:
+            if _circle_box_intersect(cb, a.rest):
+                return True
+        if b.rest is not None:
+            if (
+                min(a.rest[2], b.rest[2]) > max(a.rest[0], b.rest[0])
+                and min(a.rest[3], b.rest[3]) > max(a.rest[1], b.rest[1])
+            ):
+                return True
+    return False
 
 
 def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
     """File-based courtyard overlap check — extracted for use by pcb_pipeline.
 
     Returns the same structure as the check_courtyard_overlaps MCP tool
-    (without the JSON serialisation step).
+    (without the JSON serialisation step). The overall-bbox interval test is
+    a prefilter; candidate pairs are confirmed with exact primitive tests
+    (circle-circle / circle-box / box-box) so circular courtyards no longer
+    false-positive from bbox squaring (F-DV5, spec-courtyard-exact-overlap).
     """
     import math as _math
 
     content = pcb_path.read_text(encoding="utf-8")
-    courtyards, no_courtyard = _parse_placed_courtyards(content)
+    courtyards, no_courtyard, primitives = _parse_courtyards_with_primitives(content)
 
     overlaps: list[dict[str, Any]] = []
     refs = sorted(courtyards.keys())
@@ -494,6 +583,14 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
             overlap_x = min(a["xmax"], b["xmax"]) - max(a["xmin"], b["xmin"])
             overlap_y = min(a["ymax"], b["ymax"]) - max(a["ymin"], b["ymin"])
             if overlap_x > 0 and overlap_y > 0:
+                prim_a = primitives.get(ra)
+                prim_b = primitives.get(rb)
+                if (
+                    prim_a is not None
+                    and prim_b is not None
+                    and not _primitives_intersect(prim_a, prim_b)
+                ):
+                    continue  # bbox phantom — exact shapes clear each other
                 suggested_move = _math.sqrt(overlap_x ** 2 + overlap_y ** 2)
                 overlaps.append({
                     "ref_a": ra,
@@ -534,6 +631,11 @@ _EDGE_NAME_TOKENS: tuple[str, ...] = (
     # plain TerminalBlock libs, plus Phoenix connector libs without the word.
     "TerminalBlock",
     "Connector_Phoenix",
+    # F-DV6 (DV build 2026-10-05): the two tokens above live in the STOCK
+    # library prefix, which project-local re-homing replaces (the ecc83 demo
+    # ships its AK300s as "Footprints:Altech_AK300_…"). Manufacturer-series
+    # tokens live in the footprint NAME and survive re-homing.
+    "Altech_AK",
 )
 
 

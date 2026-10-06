@@ -40,7 +40,11 @@ from kicad_mcp.backends.base import (
 from kicad_mcp.backends.cli_backend import CLIBackend
 from kicad_mcp.backends.file_backend import FileBackend
 from kicad_mcp.backends.ipc_backend import IPCBackend
-from kicad_mcp.backends.ipc_connection import IPCUnavailableError, connection_remedy
+from kicad_mcp.backends.ipc_connection import (
+    IPCStaleBoardError,
+    IPCUnavailableError,
+    connection_remedy,
+)
 from kicad_mcp.backends.plugin_backend import (
     BridgeTemporarilyUnavailableError,
     PluginBoardOps,
@@ -87,6 +91,13 @@ class _LiveBoardOps(BoardOps):
     def _call(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         try:
             result = getattr(self._ipc_ops, method)(*args, **kwargs)
+        except IPCStaleBoardError:
+            # F-DV11: NEVER retry a stale-board refusal on the bridge — it
+            # holds the SAME stale live board, and its mtime baseline stays
+            # current whenever this process's saves went through it, so the
+            # bridge-side guard cannot fire and the write would clobber the
+            # newer file.
+            raise
         except (NotImplementedError, AttributeError, IPCUnavailableError) as exc:
             bridge = self._bridge_supplier()  # raises if the bridge is down too
             logger.debug("op %s fell through IPC → bridge (%s)", method, exc)
@@ -214,6 +225,35 @@ class _LiveBoardOps(BoardOps):
 
     def refill_zones(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("refill_zones", path)
+        return result
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_zone", path, net, layer, outline,
+            clearance_mm=clearance_mm,
+            min_thickness_mm=min_thickness_mm,
+            pad_connection=pad_connection,
+            thermal_gap_mm=thermal_gap_mm,
+            thermal_spoke_width_mm=thermal_spoke_width_mm,
+            name=name,
+            refill=refill,
+        )
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("delete_zone", path, name=name, uuid=uuid)
         return result
 
     def save_board(self, path: Path) -> dict[str, Any]:

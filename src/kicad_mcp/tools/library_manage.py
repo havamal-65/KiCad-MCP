@@ -157,19 +157,29 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
     @mcp.tool()
     def import_footprint(
         source_lib: str, footprint_name: str, target_lib_path: str,
+        overwrite: bool = False,
     ) -> str:
         """Copy a .kicad_mod footprint file from one .pretty directory to another.
+
+        ${KIPRJMOD}-relative 3D model assets the footprint references are
+        copied into the target project alongside it (source/target project
+        dir = the .pretty directory's parent), so renders and STEP exports
+        keep their 3D bodies.
 
         Args:
             source_lib: Path to the source .pretty directory.
             footprint_name: Name of the footprint to import (without .kicad_mod extension).
             target_lib_path: Path to the target .pretty directory.
+            overwrite: Replace an existing footprint of the same name instead
+                of refusing (re-import after a library update).
 
         Returns:
-            JSON confirming the import.
+            JSON confirming the import, with model_assets_copied and any
+            dangling-model warnings.
         """
         ops = backend.get_library_manage_ops()
-        result = ops.import_footprint(source_lib, footprint_name, target_lib_path)
+        result = ops.import_footprint(
+            source_lib, footprint_name, target_lib_path, overwrite=overwrite)
         change_log.record(
             "import_footprint",
             {"source_lib": source_lib, "footprint_name": footprint_name, "target_lib_path": target_lib_path},

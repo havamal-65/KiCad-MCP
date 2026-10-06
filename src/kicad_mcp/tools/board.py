@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.backends.placement_guard import DuplicateRefError
 from kicad_mcp.logging_config import get_logger
+from kicad_mcp.models.errors import ValidationError
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
 from kicad_mcp.utils.validation import (
@@ -428,6 +429,7 @@ def _impl_refill_zones(path: Path, backend: BackendProtocol) -> dict[str, Any]:
     ``autoroute`` closure can refill between SES import and post-route DRC
     (Z6) — tools cannot call each other's closures.
     """
+    from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
     from kicad_mcp.models.errors import SafeRefuseError
 
     try:
@@ -438,6 +440,13 @@ def _impl_refill_zones(path: Path, backend: BackendProtocol) -> dict[str, Any]:
                 "reason": "refill_zones requires KiCad running with IPC",
             }
         return ops.refill_zones(path)
+    except IPCStaleBoardError as exc:
+        return {
+            "status": "error",
+            "error_code": "stale_board",
+            "message": str(exc),
+            "remedy": exc.remedy,
+        }
     except SafeRefuseError as exc:
         return {
             "status": "error",
@@ -999,6 +1008,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             BoardOpenInKiCadError,
             _edge_cuts_bbox,
         )
+        from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
         from kicad_mcp.models.errors import SafeRefuseError
 
         board_path = validate_kicad_path(path, ".kicad_pcb")
@@ -1067,6 +1077,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 name=name,
                 refill=refill,
             )
+        except IPCStaleBoardError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "stale_board",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
         except SafeRefuseError as exc:
             return json.dumps({
                 "status": "error",
@@ -1131,6 +1148,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON with the deleted zone or a structured error.
         """
         from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
+        from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
         from kicad_mcp.models.errors import SafeRefuseError
 
         board_path = validate_kicad_path(path, ".kicad_pcb")
@@ -1150,6 +1168,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     "reason": "no backend can delete zones in this session",
                 }, indent=2)
             result = ops.delete_zone(board_path, name=name, uuid=uuid)
+        except IPCStaleBoardError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "stale_board",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
         except SafeRefuseError as exc:
             return json.dumps({
                 "status": "error",
@@ -1198,11 +1223,15 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         preset: str = "class2",
         differential_pairs: list[dict[str, Any]] | None = None,
         length_matching: list[dict[str, Any]] | None = None,
+        netclass_values: dict[str, float] | None = None,
+        rule_values: dict[str, float] | None = None,
     ) -> str:
-        """Write IPC-2221 design rules into a board's setup section.
+        """Write design rules into the sibling .kicad_pro project file.
 
-        Encodes manufacturing-enforceable design constraints so DRC catches
-        real violations rather than using KiCad's permissive defaults.
+        Encodes manufacturing-enforceable design constraints so DRC and the
+        router use real limits rather than KiCad's permissive defaults. Only
+        the ``.kicad_pro`` (and, for length matching, the ``.kicad_dru``) is
+        written — the ``.kicad_pcb`` file is not modified.
 
         Preset "class2" applies IPC-2221 Class 2 / IPC-7351 Level B values:
           min_clearance   0.20 mm  (IPC-2221 Table 6-1, ≤30 V)
@@ -1210,11 +1239,30 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
           via_min_drill   0.30 mm  (IPC-2221 / common fab minimum)
           via_min_size    0.60 mm  (annular ring ≥ 0.15 mm → pad ≥ 0.60 mm)
           via_min_annulus 0.15 mm  (IPC-2221)
-          hole_clearance  0.25 mm  (IPC-2221)
+          hole_clearance  0.22 mm  (IPC-2221)
           courtyard_offset 0.25 mm (IPC-7351 Level B)
 
         Preset "fab_jlcpcb" applies JLCPCB 2-layer standard design rules
-        (tighter than IPC-2221 Class 2 in some parameters).
+        (tighter than IPC-2221 Class 2 in some parameters). Preset ``""``
+        skips the preset entirely (values-only call).
+
+        Explicit values (F-DV4): ``netclass_values`` sets Default-netclass
+        values directly and wins over the preset, e.g.::
+
+            netclass_values={"clearance_mm": 0.4, "track_width_mm": 0.8,
+                             "via_diameter_mm": 1.2, "via_drill_mm": 0.6}
+
+        Allowed keys: clearance_mm, track_width_mm, via_diameter_mm,
+        via_drill_mm, microvia_diameter_mm, microvia_drill_mm,
+        diff_pair_width_mm, diff_pair_gap_mm, diff_pair_via_gap_mm (all > 0).
+        Diff-pair classes created in the same call inherit the overridden
+        Default. ``rule_values`` sets DRC minimums
+        (board.design_settings.rules) directly: min_clearance_mm,
+        min_track_width_mm, min_via_diameter_mm, min_via_annular_width_mm,
+        min_through_hole_diameter_mm, min_hole_clearance_mm,
+        min_copper_edge_clearance_mm, min_hole_to_hole_mm (all >= 0).
+        A Default value below an effective minimum is reported in a
+        non-blocking ``warnings`` list, not refused.
 
         Differential pairs (§6.4): pass ``differential_pairs`` to declare named
         netclasses with controlled width/gap and assign their nets, e.g.::
@@ -1238,15 +1286,21 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Args:
             path: Path to .kicad_pcb file.
-            preset: Rule preset — "class2" (default) or "fab_jlcpcb".
+            preset: Rule preset — "class2" (default), "fab_jlcpcb", or ""
+                to skip the preset.
             differential_pairs: Optional diff-pair declarations (see above).
             length_matching: Optional length-match groups (see above).
+            netclass_values: Optional explicit Default-netclass values.
+            rule_values: Optional explicit DRC minimums.
 
         Returns:
-            JSON with applied preset name and rule values, plus
-            ``differential_pairs_applied`` / ``length_matching_applied`` when
-            supplied. On invalid input, ``{"status": "error", ...}`` and
-            nothing is written.
+            JSON with applied preset name and rule values (no
+            ``rules_applied`` key when preset is ""), plus
+            ``differential_pairs_applied`` / ``length_matching_applied`` /
+            ``netclass_values_applied`` / ``rule_values_applied`` when
+            supplied, ``pro_backup_path``, and ``warnings`` when any Default
+            value sits below an effective minimum. On invalid input,
+            ``{"status": "error", ...}`` and nothing is written.
         """
         # ── Validation (REQ-API-003) — before any write ──────────────────────
         try:
@@ -1283,17 +1337,41 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     raise ValueError(
                         f"{lm.get('group')}: tolerance_mm must be >= 0 when given"
                     )
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            for key, value in (netclass_values or {}).items():
+                if key not in FileBoardOps._NETCLASS_VALUE_KEYS:
+                    raise ValueError(
+                        f"netclass_values: unknown key '{key}' (allowed: "
+                        f"{sorted(FileBoardOps._NETCLASS_VALUE_KEYS)})"
+                    )
+                if value <= 0:
+                    raise ValueError(f"netclass_values: {key} must be > 0")
+            for key, value in (rule_values or {}).items():
+                if key not in FileBoardOps._RULE_VALUE_KEYS:
+                    raise ValueError(
+                        f"rule_values: unknown key '{key}' (allowed: "
+                        f"{sorted(FileBoardOps._RULE_VALUE_KEYS)})"
+                    )
+                if value < 0:
+                    raise ValueError(f"rule_values: {key} must be >= 0")
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)}, indent=2)
 
         p = validate_kicad_path(path, ".kicad_pcb")
         backup = create_backup(p)
-        from kicad_mcp.backends.file_backend import FileBoardOps
-        result = FileBoardOps().set_board_design_rules(
-            p, preset,
-            differential_pairs=differential_pairs,
-            length_matching=length_matching,
-        )
+        # Backend failures (unknown preset, missing .kicad_pro, effective
+        # via_drill >= via_diameter) return the same structured error shape
+        # instead of escaping as raw exceptions (spec N4).
+        try:
+            result = FileBoardOps().set_board_design_rules(
+                p, preset,
+                differential_pairs=differential_pairs,
+                length_matching=length_matching,
+                netclass_values=netclass_values,
+                rule_values=rule_values,
+            )
+        except (ValueError, FileNotFoundError, ValidationError) as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, indent=2)
         change_log.record(
             "set_board_design_rules",
             {
@@ -1301,6 +1379,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 "preset": preset,
                 "differential_pairs": differential_pairs,
                 "length_matching": length_matching,
+                "netclass_values": netclass_values,
+                "rule_values": rule_values,
             },
             file_modified=path,
             backup_path=str(backup) if backup else None,

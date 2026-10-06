@@ -560,8 +560,14 @@ class LibraryManageOps(ABC):
     @abstractmethod
     def import_footprint(
         self, source_lib: str, footprint_name: str, target_lib_path: str,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
-        """Copy a .kicad_mod file from a source .pretty dir to a target .pretty dir."""
+        """Copy a .kicad_mod file from a source .pretty dir to a target .pretty dir.
+
+        ``${KIPRJMOD}``-relative 3D model assets referenced by the footprint
+        are carried into the target project (F-DV8); ``overwrite`` replaces
+        an existing target footprint instead of refusing.
+        """
 
     @abstractmethod
     def register_project_library(

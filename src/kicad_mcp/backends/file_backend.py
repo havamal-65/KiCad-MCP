@@ -1684,10 +1684,42 @@ class FileBoardOps(BoardOps):
         },
     }
 
+    # Allowed explicit-value keys (tool input, mm-suffixed) → .kicad_pro keys.
+    _NETCLASS_VALUE_KEYS: dict[str, str] = {
+        "clearance_mm": "clearance",
+        "track_width_mm": "track_width",
+        "via_diameter_mm": "via_diameter",
+        "via_drill_mm": "via_drill",
+        "microvia_diameter_mm": "microvia_diameter",
+        "microvia_drill_mm": "microvia_drill",
+        "diff_pair_width_mm": "diff_pair_width",
+        "diff_pair_gap_mm": "diff_pair_gap",
+        "diff_pair_via_gap_mm": "diff_pair_via_gap",
+    }
+    _RULE_VALUE_KEYS: dict[str, str] = {
+        "min_clearance_mm": "min_clearance",
+        "min_track_width_mm": "min_track_width",
+        "min_via_diameter_mm": "min_via_diameter",
+        "min_via_annular_width_mm": "min_via_annular_width",
+        "min_through_hole_diameter_mm": "min_through_hole_diameter",
+        "min_hole_clearance_mm": "min_hole_clearance",
+        "min_copper_edge_clearance_mm": "min_copper_edge_clearance",
+        "min_hole_to_hole_mm": "min_hole_to_hole",
+    }
+    # Default-netclass key ↔ the rules minimum it must not fall below.
+    _NETCLASS_MINIMUM_PAIRS: tuple[tuple[str, str], ...] = (
+        ("clearance", "min_clearance"),
+        ("track_width", "min_track_width"),
+        ("via_diameter", "min_via_diameter"),
+        ("via_drill", "min_through_hole_diameter"),
+    )
+
     def set_board_design_rules(
         self, path: Path, preset: str = "class2",
         differential_pairs: list[dict[str, Any]] | None = None,
         length_matching: list[dict[str, Any]] | None = None,
+        netclass_values: dict[str, float] | None = None,
+        rule_values: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         """Write design rules into the project's Default netclass.
 
@@ -1708,24 +1740,40 @@ class FileBoardOps(BoardOps):
         Args:
             path: Path to .kicad_pcb file (the sibling .kicad_pro is derived
                   from this path automatically).
-            preset: One of "class2" (IPC-2221 Class 2) or "fab_jlcpcb".
+            preset: One of "class2" (IPC-2221 Class 2) or "fab_jlcpcb", or
+                ``""`` to skip the preset entirely (values-only call).
             differential_pairs: Optional list of
                 ``{name, nets|net_pattern, width_mm, gap_mm, via_gap_mm?}``.
             length_matching: Optional list of
                 ``{group, nets?, target_mm, tolerance_mm?}`` → ``.kicad_dru``.
+            netclass_values: Optional explicit Default-netclass values
+                (``*_mm`` keys per ``_NETCLASS_VALUE_KEYS``); explicit wins
+                over the preset, and diff-pair classes created in the same
+                call seed from the overridden Default.
+            rule_values: Optional explicit DRC minimums (``*_mm`` keys per
+                ``_RULE_VALUE_KEYS``) → ``board.design_settings.rules``.
 
         Returns:
-            Dict with applied preset name and rule values, plus
-            ``differential_pairs_applied`` / ``length_matching_applied`` when
-            those parameters are provided.
+            Dict with applied preset name and rule values (preset ``""`` →
+            no ``rules_applied`` key), plus ``differential_pairs_applied`` /
+            ``length_matching_applied`` / ``netclass_values_applied`` /
+            ``rule_values_applied`` when those parameters are provided, a
+            ``pro_backup_path``, and ``warnings`` when any effective Default
+            value sits below its effective rules minimum.
         """
         import json
 
-        rules = self._DESIGN_RULE_PRESETS.get(preset)
-        if rules is None:
-            raise ValueError(
-                f"Unknown preset '{preset}'. Valid presets: {list(self._DESIGN_RULE_PRESETS)}"
-            )
+        from kicad_mcp.utils.change_log import create_backup
+
+        rules: dict[str, float] | None
+        if preset == "":
+            rules = None
+        else:
+            rules = self._DESIGN_RULE_PRESETS.get(preset)
+            if rules is None:
+                raise ValueError(
+                    f"Unknown preset '{preset}'. Valid presets: {list(self._DESIGN_RULE_PRESETS)}"
+                )
 
         pro_path = path.with_suffix(".kicad_pro")
         if not pro_path.exists():
@@ -1734,6 +1782,7 @@ class FileBoardOps(BoardOps):
                 "Create the project first with create_project."
             )
 
+        pro_backup = create_backup(pro_path)
         pro = json.loads(pro_path.read_text(encoding="utf-8"))
 
         # Ensure the net_settings.classes list exists
@@ -1760,22 +1809,57 @@ class FileBoardOps(BoardOps):
             classes.append(default_cls)
 
         # Apply preset values to Default netclass (controls router behaviour)
-        default_cls["clearance"]    = rules.get("min_clearance", 0.20)
-        default_cls["track_width"]  = rules.get("trace_min", 0.25)
-        default_cls["via_diameter"] = rules.get("via_min_size", 0.60)
-        default_cls["via_drill"]    = rules.get("via_min_drill", 0.30)
+        if rules is not None:
+            default_cls["clearance"]    = rules.get("min_clearance", 0.20)
+            default_cls["track_width"]  = rules.get("trace_min", 0.25)
+            default_cls["via_diameter"] = rules.get("via_min_size", 0.60)
+            default_cls["via_drill"]    = rules.get("via_min_drill", 0.30)
+
+        # Explicit Default-netclass values win over the preset. Applied before
+        # the diff-pair seed capture below so named classes created in the same
+        # call inherit the override (KiCad's own "seed from Default" semantics).
+        netclass_applied: dict[str, float] = {}
+        if netclass_values:
+            for key, value in netclass_values.items():
+                pro_key = self._NETCLASS_VALUE_KEYS[key]
+                default_cls[pro_key] = value
+                netclass_applied[pro_key] = value
+            drill = default_cls.get("via_drill")
+            diameter = default_cls.get("via_diameter")
+            if drill is not None and diameter is not None and drill >= diameter:
+                raise ValueError(
+                    f"netclass_values: effective via_drill ({drill} mm) must "
+                    f"be < via_diameter ({diameter} mm)"
+                )
 
         # Also update board DRC minimum rules stored in the project file so
         # KiCad picks up the same constraints when the project is opened.
         design_settings = pro.setdefault("board", {}).setdefault("design_settings", {})
         drc_rules = design_settings.setdefault("rules", {})
-        drc_rules["min_clearance"]          = rules.get("min_clearance", 0.20)
-        drc_rules["min_track_width"]        = rules.get("trace_min", 0.25)
-        drc_rules["min_via_diameter"]       = rules.get("via_min_size", 0.60)
-        drc_rules["min_via_annular_width"]  = rules.get("via_min_annulus", 0.15)
-        drc_rules["min_through_hole_diameter"] = rules.get("via_min_drill", 0.30)
-        drc_rules["min_hole_clearance"]         = rules.get("hole_clearance", 0.22)
-        drc_rules["min_copper_edge_clearance"]  = rules.get("copper_edge_clearance", 0.50)
+        if rules is not None:
+            drc_rules["min_clearance"]          = rules.get("min_clearance", 0.20)
+            drc_rules["min_track_width"]        = rules.get("trace_min", 0.25)
+            drc_rules["min_via_diameter"]       = rules.get("via_min_size", 0.60)
+            drc_rules["min_via_annular_width"]  = rules.get("via_min_annulus", 0.15)
+            drc_rules["min_through_hole_diameter"] = rules.get("via_min_drill", 0.30)
+            drc_rules["min_hole_clearance"]         = rules.get("hole_clearance", 0.22)
+            drc_rules["min_copper_edge_clearance"]  = rules.get("copper_edge_clearance", 0.50)
+
+        rule_applied: dict[str, float] = {}
+        if rule_values:
+            for key, value in rule_values.items():
+                pro_key = self._RULE_VALUE_KEYS[key]
+                drc_rules[pro_key] = value
+                rule_applied[pro_key] = value
+
+        # Non-blocking consistency check: Default values below the effective
+        # DRC minimums get reported, not refused (spec N3).
+        warnings: list[str] = []
+        for cls_key, min_key in self._NETCLASS_MINIMUM_PAIRS:
+            cls_val = default_cls.get(cls_key)
+            min_val = drc_rules.get(min_key)
+            if cls_val is not None and min_val is not None and cls_val < min_val:
+                warnings.append(f"{cls_key} {cls_val} is below {min_key} {min_val}")
 
         # §6.4 — upsert named differential-pair netclasses + assign their nets.
         diff_applied: list[dict[str, Any]] = []
@@ -1806,10 +1890,17 @@ class FileBoardOps(BoardOps):
             encoding="utf-8",
         )
 
-        result: dict[str, Any] = {
-            "preset": preset,
-            "rules_applied": rules,
-        }
+        result: dict[str, Any] = {"preset": preset}
+        if rules is not None:
+            result["rules_applied"] = rules
+        if pro_backup is not None:
+            result["pro_backup_path"] = str(pro_backup)
+        if netclass_applied:
+            result["netclass_values_applied"] = netclass_applied
+        if rule_applied:
+            result["rule_values_applied"] = rule_applied
+        if warnings:
+            result["warnings"] = warnings
         if differential_pairs:
             result["differential_pairs_applied"] = diff_applied
 
@@ -5961,6 +6052,7 @@ class FileLibraryManageOps(LibraryManageOps):
 
     def import_footprint(
         self, source_lib: str, footprint_name: str, target_lib_path: str,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         src_dir = Path(source_lib)
         tgt_dir = Path(target_lib_path)
@@ -5978,19 +6070,62 @@ class FileLibraryManageOps(LibraryManageOps):
             )
 
         tgt_file = tgt_dir / f"{footprint_name}.kicad_mod"
-        if tgt_file.exists():
+        overwritten = tgt_file.exists()
+        if overwritten and not overwrite:
             raise LibraryImportError(
                 f"Footprint '{footprint_name}' already exists in {target_lib_path}",
                 details={"footprint_name": footprint_name, "target_lib_path": target_lib_path},
             )
 
         shutil.copy2(str(src_file), str(tgt_file))
-        return {
+        assets_copied, asset_warnings = self._carry_kiprjmod_model_assets(
+            tgt_file, src_dir.parent, tgt_dir.parent
+        )
+        result: dict[str, Any] = {
             "footprint_name": footprint_name,
             "source_lib": source_lib,
             "target_lib_path": target_lib_path,
             "copied_file": str(tgt_file),
+            "model_assets_copied": assets_copied,
         }
+        if overwritten:
+            result["overwritten"] = True
+        if asset_warnings:
+            result["warnings"] = asset_warnings
+        return result
+
+    @staticmethod
+    def _carry_kiprjmod_model_assets(
+        mod_file: Path, source_project_dir: Path, target_project_dir: Path,
+    ) -> tuple[list[str], list[str]]:
+        """Copy ``${KIPRJMOD}``-relative 3D model assets a footprint references.
+
+        A project-local ``.pretty`` resolves ``${KIPRJMOD}`` to its parent
+        directory, so a bare ``.kicad_mod`` copy leaves the model path
+        dangling in the target project (F-DV8). Global vars like
+        ``${KICAD*_3DMODEL_DIR}`` resolve everywhere and are left alone.
+        """
+        copied: list[str] = []
+        warnings: list[str] = []
+        content = mod_file.read_text(encoding="utf-8")
+        for model_path in re.findall(r'\(model\s+"([^"]+)"', content):
+            if not model_path.startswith("${KIPRJMOD}"):
+                continue
+            rel = model_path[len("${KIPRJMOD}"):].lstrip("/\\")
+            src_asset = source_project_dir / rel
+            tgt_asset = target_project_dir / rel
+            if tgt_asset.exists():
+                continue
+            if not src_asset.exists():
+                warnings.append(
+                    f"model reference '{model_path}' not found in source "
+                    f"project ({src_asset}) — left dangling"
+                )
+                continue
+            tgt_asset.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src_asset), str(tgt_asset))
+            copied.append(str(tgt_asset))
+        return copied, warnings
 
     def register_project_library(
         self, project_path: str, library_name: str,

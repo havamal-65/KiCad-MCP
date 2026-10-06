@@ -6,6 +6,9 @@ courtyard. Shared by the gate parser (``tools/drc._parse_placed_courtyards``)
 and the auto_place engine (``utils/placement_engine._parse_courtyard_box``) so
 circle/poly/arc/curve courtyards are visible to both (spec-courtyard-geometry
 G1; the pre-RW-S3 parsers read only ``fp_rect``/``fp_line`` — F-ECC1).
+``courtyard_primitives`` returns the same geometry split into circles and
+non-circle points so the overlap gate can test circles exactly
+(spec-courtyard-exact-overlap, F-DV5).
 
 Point contributions per shape:
 
@@ -121,6 +124,63 @@ def _arc_points(sub: str) -> list[tuple[float, float]]:
         if _ccw_delta(a_from, angle) <= span:
             points.append(extreme)
     return points
+
+
+def courtyard_primitives(
+    block: str, layers: tuple[str, ...] = ("F.CrtYd", "B.CrtYd"),
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float]]]:
+    """Harvest courtyard geometry split into exact-testable primitives.
+
+    Returns ``(circles, rest_points)``, footprint-local: ``circles`` holds one
+    ``(cx, cy, r)`` per ``fp_circle`` on ``layers`` (``r = dist(center, end)``),
+    and ``rest_points`` the point-cloud contributions of every non-circle
+    shape, exactly as ``courtyard_points`` collects them. The exact overlap
+    gate (spec-courtyard-exact-overlap X1, F-DV5) tests circles as circles
+    instead of squaring them into their bbox.
+    """
+    needles = tuple(f'"{layer}"' for layer in layers)
+    circles: list[tuple[float, float, float]] = []
+    rest: list[tuple[float, float]] = []
+    i = 0
+    n = len(block)
+    while i < n:
+        if block[i] != "(":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and block[j] not in (" ", "\t", "\n", "(", ")"):
+            j += 1
+        token = block[i + 1 : j]
+        if token in _SHAPE_TOKENS:
+            end_idx = _walk_balanced_parens(block, i)
+            if end_idx is None:
+                i += 1
+                continue
+            sub = block[i : end_idx + 1]
+            if any(needle in sub for needle in needles):
+                if token == "fp_circle":
+                    center_m = _CENTER_PAT.search(sub)
+                    end_m = _END_PAT.search(sub)
+                    if center_m and end_m:
+                        cx = float(center_m.group(1))
+                        cy = float(center_m.group(2))
+                        r = math.hypot(
+                            float(end_m.group(1)) - cx,
+                            float(end_m.group(2)) - cy,
+                        )
+                        circles.append((cx, cy, r))
+                elif token in ("fp_rect", "fp_line"):
+                    for m in _START_END_PAT.finditer(sub):
+                        rest.append((float(m.group(1)), float(m.group(2))))
+                elif token in ("fp_poly", "fp_curve"):
+                    for m in _XY_PAT.finditer(sub):
+                        rest.append((float(m.group(1)), float(m.group(2))))
+                else:  # fp_arc
+                    rest.extend(_arc_points(sub))
+            i = end_idx + 1
+            continue
+        i += 1
+    return circles, rest
 
 
 def courtyard_points(

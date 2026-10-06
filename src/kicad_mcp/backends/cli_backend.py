@@ -373,13 +373,21 @@ class CLIDRCOps(DRCOps):
             "violations": [],
             "error_count": 0,
             "warning_count": 0,
+            "unconnected_count": 0,
         }
 
         if output.exists():
             try:
                 report = json.loads(output.read_text(encoding="utf-8"))
                 violations = report.get("violations", [])
-                for v in violations:
+                # F-DV7 (DV build 2026-10-05): kicad-cli reports missing
+                # connections in a SEPARATE top-level "unconnected_items"
+                # array, not under "violations" — ignoring it declared a
+                # completely unrouted board DRC-clean. They are DRC
+                # violations (type "unconnected_items", severity per the
+                # board's rule_severities) and count like any other.
+                unconnected = report.get("unconnected_items", [])
+                for v in violations + unconnected:
                     severity = v.get("severity", "error")
                     if severity == "error":
                         drc_result["error_count"] += 1
@@ -387,10 +395,11 @@ class CLIDRCOps(DRCOps):
                         drc_result["warning_count"] += 1
                     drc_result["violations"].append({
                         "severity": severity,
-                        "type": v.get("type", ""),
+                        "type": v.get("type", "unconnected_items"),
                         "description": v.get("description", ""),
                         "items": v.get("items", []),
                     })
+                drc_result["unconnected_count"] = len(unconnected)
                 drc_result["passed"] = drc_result["error_count"] == 0
             except (json.JSONDecodeError, OSError) as e:
                 logger.error("Failed to parse DRC report: %s", e)

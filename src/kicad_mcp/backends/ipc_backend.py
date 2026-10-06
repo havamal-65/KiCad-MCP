@@ -27,13 +27,18 @@ surface stays in millimeters, rounded to 4 decimals like the bridge.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from kicad_mcp.backends.base import BackendCapability, BoardOps, KiCadBackend
-from kicad_mcp.backends.ipc_connection import IPCConnection, IPCUnavailableError
+from kicad_mcp.backends.ipc_connection import (
+    IPCConnection,
+    IPCStaleBoardError,
+    IPCUnavailableError,
+)
 from kicad_mcp.backends.placement_guard import (
     check_placement,
     idempotent_success,
@@ -91,6 +96,95 @@ def _mm4(value_nm: int) -> float:
     return round(to_mm(value_nm), 4)
 
 
+_FOOTPRINT_AT_RE = re.compile(
+    r'\(footprint\s+"[^"]+".*?\(at\s+([\d.eE+-]+)\s+([\d.eE+-]+)[\s)]'
+    r'.*?\(property\s+"Reference"\s+"([^"]+)"',
+    re.S,
+)
+_COHERENCE_TOL_NM = 1000  # 1 µm — well under any real placement delta
+
+
+def _coherence_mismatch(board: Any, path: Path) -> str | None:
+    """Compare the live board against the ``.kicad_pcb`` on disk (F-DV11).
+
+    Returns a human-readable description of the first disagreement, or None
+    when live and file agree. Checked: footprint reference set + positions
+    (1 µm tolerance), track count (segments + arcs), via count, zone count.
+    A missing/unreadable file is not a mismatch (new board being created).
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    file_fps = {
+        ref: (round(float(x) * 1e6), round(float(y) * 1e6))
+        for x, y, ref in _FOOTPRINT_AT_RE.findall(text)
+    }
+    live_fps = {
+        fp.reference_field.text.value: (fp.position.x, fp.position.y)
+        for fp in board.get_footprints()
+    }
+    if set(file_fps) != set(live_fps):
+        only_file = sorted(set(file_fps) - set(live_fps))
+        only_live = sorted(set(live_fps) - set(file_fps))
+        return (
+            f"footprint sets differ (file-only: {only_file or '-'}, "
+            f"live-only: {only_live or '-'})"
+        )
+    for ref, (fx, fy) in file_fps.items():
+        lx, ly = live_fps[ref]
+        if abs(fx - lx) > _COHERENCE_TOL_NM or abs(fy - ly) > _COHERENCE_TOL_NM:
+            return (
+                f"footprint {ref} at ({lx / 1e6:.4f}, {ly / 1e6:.4f}) live vs "
+                f"({fx / 1e6:.4f}, {fy / 1e6:.4f}) in the file"
+            )
+
+    file_tracks = len(re.findall(r"^\t\(segment\b", text, re.M)) + len(
+        re.findall(r"^\t\(arc\b", text, re.M))
+    live_tracks = len(board.get_tracks())
+    if file_tracks != live_tracks:
+        return f"track count {live_tracks} live vs {file_tracks} in the file"
+
+    file_vias = len(re.findall(r"^\t\(via\b", text, re.M))
+    live_vias = len(board.get_vias())
+    if file_vias != live_vias:
+        return f"via count {live_vias} live vs {file_vias} in the file"
+
+    file_zones = len(re.findall(r"^\t\(zone\b", text, re.M))
+    live_zones = len(board.get_zones())
+    if file_zones != live_zones:
+        return f"zone count {live_zones} live vs {file_zones} in the file"
+    return None
+
+
+def _apply_zone_connection(
+    zone: Any, pad_connection: str, thermal_gap_nm: int, thermal_spoke_width_nm: int,
+) -> None:
+    """Write pad-connection + thermal settings onto a kipy Zone (F-DV10).
+
+    kipy's ``ZoneConnectionSettings.thermal_spokes`` getter constructs its
+    wrapper with the positional ``proto`` argument, which CopyFrom()s a
+    DETACHED copy — setting ``.gap``/``.width`` on it silently mutates a
+    throwaway (the zone file then stores thermal_gap 0). Bind our own
+    ``ThermalSpokeSettings`` to the live proto via ``proto_ref`` so the
+    writes reach the zone. ``zone_connection`` itself writes through because
+    ``Zone.connection`` is already a proto_ref wrapper.
+    """
+    connection_map = {
+        "thermal": ZoneConnectionStyle.ZCS_THERMAL,
+        "solid": ZoneConnectionStyle.ZCS_FULL,
+        "none": ZoneConnectionStyle.ZCS_NONE,
+    }
+    connection = zone.connection
+    if connection is None:
+        return
+    connection.zone_connection = connection_map[pad_connection]
+    spokes = kbt.ThermalSpokeSettings(proto_ref=connection._proto.thermal_spokes)
+    spokes.gap = thermal_gap_nm
+    spokes.width = thermal_spoke_width_nm
+
+
 def _save_board(board: Board) -> None:
     # kipy 0.5.0 ships py.typed but leaves Board.save() unannotated
     board.save()  # type: ignore[no-untyped-call]
@@ -122,13 +216,20 @@ class IPCBoardOps(BoardOps):
 
     # -- Board resolution ------------------------------------------------------
 
-    def _board(self, path: Path) -> Board:
+    def _board(self, path: Path, *, check_coherence: bool = False) -> Board:
         """Resolve the open board and verify it is the one ``path`` names.
 
         IPC has no "open board" call (C1b) — it serves whatever document KiCad
         already has open. ``Board.name`` is the bare filename (live-verified),
         so the match is by filename; a mismatch raises with the canonical
         "does not match open board" phrase the recovery guidance keys on.
+
+        ``check_coherence=True`` (every write path, F-DV11) additionally
+        verifies the live board agrees with the file on disk and refuses with
+        ``IPCStaleBoardError`` otherwise: committing + saving against a stale
+        live board silently overwrites newer file-side state (file-side tools
+        like autoroute and the placement engine write the .kicad_pcb that the
+        GUI never reloads in place).
         """
         board = self._conn.board()
         if os.path.normcase(Path(path).name) != os.path.normcase(board.name):
@@ -138,6 +239,16 @@ class IPCBoardOps(BoardOps):
                 remedy="Call open_kicad with the correct .kicad_pcb path and wait "
                        "for the board to load, then retry.",
             )
+        if check_coherence:
+            mismatch = _coherence_mismatch(board, path)
+            if mismatch is not None:
+                raise IPCStaleBoardError(
+                    f"Board write refused (stale_board): the board KiCad holds "
+                    f"in memory disagrees with {Path(path).name} on disk — "
+                    f"{mismatch}. Writing now would overwrite the newer state.",
+                    remedy="Close and reopen the board in KiCad's PCB editor "
+                           "so the live board matches the file, then retry.",
+                )
         return board
 
     # -- Transactional write pattern (REQ-IPC-4, REQ-IPC-6) --------------------
@@ -169,7 +280,7 @@ class IPCBoardOps(BoardOps):
         architecture has file-based tools (courtyard, orientation, quality)
         reading the .kicad_pcb, so every live write must land on disk too.
         """
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         result = self._commit(board, mutate)
         self._save(path, board)
         return result
@@ -259,7 +370,7 @@ class IPCBoardOps(BoardOps):
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         fp = self._find_footprint(board, reference)
 
         def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
@@ -327,7 +438,7 @@ class IPCBoardOps(BoardOps):
     def assign_net(
         self, path: Path, reference: str, pad: str, net: str,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         fp = self._find_footprint(board, reference)
         existing_net = self._find_net(board, net)
 
@@ -386,7 +497,7 @@ class IPCBoardOps(BoardOps):
         self, path: Path, x: float, y: float,
         width: float, height: float, line_width: float = 0.05,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         # Idempotency (bridge parity): existing Edge.Cuts shapes are replaced,
         # atomically in the same commit as the new outline.
         stale_edges = [s for s in board.get_shapes()
@@ -413,7 +524,7 @@ class IPCBoardOps(BoardOps):
         return result
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         backup_path: str | None = None
         if backup:
             # Flush live state first so the backup matches the pre-clear board
@@ -452,7 +563,7 @@ class IPCBoardOps(BoardOps):
         Zoneless boards skip both refill and save — a no-op must not dirty
         the file mtime (spec-zones Z5).
         """
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         zones = board.get_zones()
         if not zones:
             return {"status": "ok", "zones_filled": 0,
@@ -473,7 +584,7 @@ class IPCBoardOps(BoardOps):
         refill: bool = True,
     ) -> dict[str, Any]:
         """Create a copper zone over IPC (spec-zones Z1, measured fact 4)."""
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
 
         net_obj = next((n for n in board.get_nets() if n.name == net), None)
         if net_obj is None:
@@ -483,12 +594,6 @@ class IPCBoardOps(BoardOps):
                 "message": f"net '{net}' not found on board; "
                            "run sync_schematic_to_pcb first",
             }
-
-        connection_map = {
-            "thermal": ZoneConnectionStyle.ZCS_THERMAL,
-            "solid": ZoneConnectionStyle.ZCS_FULL,
-            "none": ZoneConnectionStyle.ZCS_NONE,
-        }
 
         def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
             zone = kbt.Zone()
@@ -504,11 +609,9 @@ class IPCBoardOps(BoardOps):
             zone.outline = poly
             zone.clearance = from_mm(clearance_mm)
             zone.min_thickness = from_mm(min_thickness_mm)
-            connection = zone.connection
-            if connection is not None:
-                connection.zone_connection = connection_map[pad_connection]
-                connection.thermal_spokes.gap = from_mm(thermal_gap_mm)
-                connection.thermal_spokes.width = from_mm(thermal_spoke_width_mm)
+            _apply_zone_connection(
+                zone, pad_connection,
+                from_mm(thermal_gap_mm), from_mm(thermal_spoke_width_mm))
             created = board_.create_items(zone)
             if not created:
                 raise RuntimeError("IPC create_items returned no created zone")
@@ -537,7 +640,7 @@ class IPCBoardOps(BoardOps):
         self, path: Path, name: str = "", uuid: str = "",
     ) -> dict[str, Any]:
         """Delete one copper zone over IPC (spec-zones Z3)."""
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         matches = [
             z for z in board.get_zones()
             if (uuid and getattr(z.id, "value", "") == uuid)
@@ -577,7 +680,7 @@ class IPCBoardOps(BoardOps):
 
     def save_board(self, path: Path) -> dict[str, Any]:
         """Spec §3 row 19 — flush the live board to disk (bridge-first save)."""
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         self._save(path, board)
         return {"success": True, "path": str(path)}
 
@@ -594,7 +697,7 @@ class IPCBoardOps(BoardOps):
         pcbnew's back (#14C hazard). Net-less vias count as tracks for parity
         with the SWIG path (``board.GetTracks()`` includes vias).
         """
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         doomed_zones = (
             [z for z in board.get_zones() if z.is_rule_area()]
             if remove_keepouts else []
@@ -638,7 +741,7 @@ class IPCBoardOps(BoardOps):
         from kicad_mcp.backends.file_backend import build_engine_parts
         from kicad_mcp.utils import placement_engine as engine
 
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         self._save(path, board)  # live board -> disk, so the plan is current
 
         parts = build_engine_parts(path, path.parent)

@@ -211,3 +211,37 @@ def test_backwards_terminal_block_still_counts(tmp_path: Path):
     metric = placement_metric(board)
     assert metric["out_of_outline_count"] == 1, metric
     assert "edge_overhang_exemptions" not in metric
+
+# ---------------------------------------------------------------------------
+# F-DV6 (DV build, spec-edge-tokens-rehoming) — project-local re-homing strips
+# the stock library prefix, so the TerminalBlock/Connector_Phoenix tokens never
+# fire on re-homed parts (the ecc83 demo ships its AK300s as
+# "Footprints:Altech_AK300_…"). The manufacturer-series token lives in the
+# footprint NAME and survives re-homing.
+# ---------------------------------------------------------------------------
+
+_REHOMED_AK300_LIB_ID = "Footprints:Altech_AK300_1x02_P5.00mm_45-Degree"
+
+
+def test_altech_token_admits_rehomed_ak300():
+    from kicad_mcp.tools.drc import _name_matches_edge_connector
+
+    assert _name_matches_edge_connector(_REHOMED_AK300_LIB_ID) == "Altech_AK"
+    # Stock lib id keeps matching its original token (list order preserved).
+    assert _name_matches_edge_connector(_AK300_LIB_ID) == "TerminalBlock"
+
+
+def test_rehomed_south_edge_terminal_block_exempted(tmp_path: Path):
+    """The ecc83 P4 case: a re-homed AK300 overhanging only the south edge is
+    legal mating overhang — the gate passes."""
+    fp = dict(_AK300_SOUTH)
+    fp["lib_id"] = _REHOMED_AK300_LIB_ID
+    board = _write(tmp_path, _board(fp))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 0, metric
+    exemptions = metric.get("edge_overhang_exemptions", [])
+    assert [e["reference"] for e in exemptions] == [fp["ref"]]
+    assert "south" in exemptions[0]["evidence"]
+
+    gate = run_validate_placement_quality(board)
+    assert gate["passed"] is True, gate

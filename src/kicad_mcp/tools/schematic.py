@@ -174,22 +174,50 @@ def _attempt_footprint_swap(
         }
 
     removed = mutate_ops.remove_component(pcb_p, ref)
-    mutate_ops.place_component(
-        pcb_p, ref, new_fp,
-        removed["position"]["x"], removed["position"]["y"],
-        layer=removed.get("layer") or "F.Cu",
-        rotation=removed.get("rotation", 0.0),
-    )
+    try:
+        mutate_ops.place_component(
+            pcb_p, ref, new_fp,
+            removed["position"]["x"], removed["position"]["y"],
+            layer=removed.get("layer") or "F.Cu",
+            rotation=removed.get("rotation", 0.0),
+        )
 
-    unmatched_pads: list[dict[str, str]] = []
-    for pad_name, net in sorted(old_pad_nets.items()):
-        if new_pad_names and pad_name not in new_pad_names:
-            unmatched_pads.append({"pad": pad_name, "net": net})
-            continue
-        try:
-            mutate_ops.assign_net(pcb_p, ref, pad_name, net)
-        except ValueError:
-            unmatched_pads.append({"pad": pad_name, "net": net})
+        unmatched_pads: list[dict[str, str]] = []
+        for pad_name, net in sorted(old_pad_nets.items()):
+            if new_pad_names and pad_name not in new_pad_names:
+                unmatched_pads.append({"pad": pad_name, "net": net})
+                continue
+            try:
+                mutate_ops.assign_net(pcb_p, ref, pad_name, net)
+            except ValueError:
+                unmatched_pads.append({"pad": pad_name, "net": net})
+    except Exception as exc:
+        # SW-1 C4: a failure after a successful file-side remove would
+        # otherwise delete the part from the board — restore the captured
+        # block verbatim. Bridge-leg exceptions propagate exactly as before
+        # (OQ2 carve-out: no raw_block there).
+        raw_block = removed.get("raw_block")
+        if via == "file" and raw_block:
+            try:
+                file_ops.restore_footprint_block(pcb_p, raw_block)
+            except Exception as restore_exc:  # noqa: BLE001 — reported, never raised
+                return {
+                    "applied": False,
+                    "reason": (
+                        f"swap failed: {exc}; ROLLBACK FAILED: {restore_exc}"
+                        f" — restore {ref} from the sync backup"
+                    ),
+                    "restored": False,
+                }
+            return {
+                "applied": False,
+                "reason": (
+                    f"swap failed: {exc}; original footprint restored "
+                    f"(rollback)"
+                ),
+                "restored": True,
+            }
+        raise
 
     return {
         "applied": True,
@@ -316,6 +344,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         footprint: str = "",
         properties: dict[str, str] | None = None,
         unit: int = 1,
+        in_bom: bool = True,
+        on_board: bool = True,
+        dnp: bool = False,
+        exclude_from_sim: bool = False,
     ) -> str:
         """Add a component symbol to the schematic.
 
@@ -336,6 +368,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                   dual op-amp is U1 unit 1 plus U1 unit 2. The same
                   (reference, unit) twice, a unit beyond the symbol's unit
                   count, or one reference across two lib_ids is refused.
+            in_bom: Symbol appears in the bill of materials (default True).
+            on_board: Symbol has a board footprint (default True).
+            dnp: Do-not-populate flag (default False).
+            exclude_from_sim: Ignored by the simulator (default False).
 
         Returns:
             JSON with placed component details and UUID.
@@ -351,6 +387,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 rotation=rotation, mirror=mirror,
                 footprint=footprint, properties=properties,
                 unit=unit,
+                in_bom=in_bom, on_board=on_board,
+                dnp=dnp, exclude_from_sim=exclude_from_sim,
             )
         except BoardOpenInKiCadError as exc:
             return _schematic_write_refusal(exc)
@@ -658,6 +696,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             properties (dict[str, str], optional)
             unit (int, default 1 — one batch may place several units of one
                   multi-unit reference, one entry per unit)
+            in_bom (bool, default true — symbol appears in the BOM)
+            on_board (bool, default true — symbol has a board footprint)
+            dnp (bool, default false — do-not-populate flag)
+            exclude_from_sim (bool, default false — ignored by the simulator)
 
         Reads the schematic file once, caches every unique lib_id once, builds
         all symbol blocks in memory, and writes once — collapsing N round-trips
@@ -1248,6 +1290,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Can modify Value, Footprint, Datasheet, MPN, or any custom property.
         If the property does not exist on the component, it will be added (hidden by default).
+        The symbol attribute flags (in_bom / on_board / dnp /
+        exclude_from_sim) are not properties — use set_symbol_attributes
+        for those.
 
         Args:
             path: Path to .kicad_sch file.
@@ -1273,6 +1318,65 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             "update_component_property",
             {"path": path, "reference": reference,
              "property": property_name, "value": property_value},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def set_symbol_attributes(
+        path: str,
+        reference: str,
+        in_bom: bool | None = None,
+        on_board: bool | None = None,
+        dnp: bool | None = None,
+        exclude_from_sim: bool | None = None,
+    ) -> str:
+        """Set the bare symbol attribute flags on a placed schematic symbol.
+
+        The four flags are bare s-expression tokens KiCad stores on every
+        placed symbol — not (property ...) clauses, so
+        update_component_property cannot reach them. Every unit block of the
+        reference is edited; omitted (None) flags stay as they are. At least
+        one flag must be passed.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the component (e.g. 'P5', 'U3').
+            in_bom: Symbol appears in the bill of materials.
+            on_board: Symbol has a board footprint.
+            dnp: Do-not-populate flag.
+            exclude_from_sim: Ignored by the simulator.
+
+        Returns:
+            JSON with reference, units_updated, and the final effective
+            attributes re-read from the edited file.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.set_symbol_attributes(
+                p, reference,
+                in_bom=in_bom, on_board=on_board,
+                dnp=dnp, exclude_from_sim=exclude_from_sim,
+            )
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        params: dict[str, Any] = {"path": path, "reference": reference}
+        for name, flag in (
+            ("in_bom", in_bom), ("on_board", on_board),
+            ("dnp", dnp), ("exclude_from_sim", exclude_from_sim),
+        ):
+            if flag is not None:
+                params[name] = flag
+        change_log.record(
+            "set_symbol_attributes",
+            params,
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -1900,6 +2004,15 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                             "new_footprint": sch_fp,
                             "reason": swap["reason"],
                         })
+                        # SW-1 C4: a failed rollback left the part deleted —
+                        # loud, structured warning. A successful rollback
+                        # stays a plain skip (the part is intact).
+                        if swap.get("restored") is False:
+                            warnings.append({
+                                "type": "swap_rollback_failed",
+                                "reference": ref,
+                                "message": swap["reason"],
+                            })
             if swaps_used_file_path:
                 warnings.append({
                     "type": "board_reload_required",

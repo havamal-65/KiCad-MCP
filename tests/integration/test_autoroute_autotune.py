@@ -1,10 +1,16 @@
-"""REQ-FR-6 (F3/S4, #22) — adaptive via-cost auto-tune on a real board.
+"""REQ-FR-6 (F3/S4, #22) + REQ-FR-3 — adaptive via-cost auto-tune on a real board.
 
 Runs the REAL via-cost ladder (each rung a live FreeRouting v2.2.4 run) on a
-cleared aqs_v2 DSN and asserts the selector picks a fully-routed result with
-fewer vias than FreeRouting's max-completeness default (via_costs=50). The
-2026-07-12 live anchor: vc=50→19 vias, vc=100→11, vc=200→3 (0 unrouted) — the
-ladder auto-selects vc=200.
+cleared aqs_v2 DSN and asserts the ladder OUTCOME through the production
+selector: the `autoroute` default `max_passes=10`, driven through the
+production via-cost ladder, fully routes aqs_v2, and the winner is the
+fewest-via fully-routed rung of whatever the router returned.
+
+This test is the suite's REQ-FR-3 anchor as well as the REQ-FR-6 one
+(2026-10-05, SW-3): the former ``test_autoroute_default10.py`` pinned the
+bare default-cost run — a single FreeRouting pass at the router's built-in
+default via cost, a call path the production ``autoroute`` never performs on
+v2.x — and was deleted when that heuristic outcome drifted.
 
 Skips cleanly when pcbnew, Java, or a v2.x (via-cost-capable) jar is
 unavailable. This is the v2.x path; v1.9.0 has no ladder.
@@ -87,10 +93,13 @@ def test_autoroute_autotune_selects_fewest_via_complete(tmp_path: Path):
 
     # The ladder must land a fully-routed result...
     assert complete is True, rungs
-    assert winner["unrouted"] == 0
-    # ...with fewer vias than the via_costs=50 max-completeness default.
-    baseline = next((r for r in rungs if r["via_costs"] == 50 and r["unrouted"] == 0), None)
-    if baseline is not None:
-        assert winner["vias"] < baseline["vias"], (winner, baseline)
-    # Auto-tune moved off the default toward a higher via cost.
-    assert winner["via_costs"] >= 100
+    assert winner["unrouted"] == 0, rungs
+    # Ladder order invariant: the rungs were tried in production ladder order
+    # (asserts our loop, not the router — drift-proof).
+    tried = [r["via_costs"] for r in rungs]
+    assert tried == [vc for vc in _VIA_COST_LADDER if vc in tried], tried
+    # Selector invariant: the winner is the fewest-via fully-routed rung of
+    # whatever the router returned — no pinned per-rung heuristic result.
+    complete_rungs = [r for r in rungs if r["unrouted"] == 0]
+    assert winner["vias"] == min(r["vias"] for r in complete_rungs), rungs
+    assert winner["via_costs"] in _VIA_COST_LADDER, rungs

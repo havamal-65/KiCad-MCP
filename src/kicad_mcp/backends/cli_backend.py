@@ -46,6 +46,27 @@ def _expected_outputs(output: Path, variant: str | list[str] | None) -> list[Pat
     return [Path(str(output).replace("${VARIANT}", v)) for v in names]
 
 
+def _valid_step_file(path: Path) -> bool:
+    """True iff *path* is a complete STEP file: exists, non-empty, first bytes
+    start with ``ISO-10303-21;`` and the last 64 bytes (right-stripped of ASCII
+    whitespace) end with ``END-ISO-10303-21;``. Both markers are mandated by
+    the ISO-10303-21 standard; the trailer check is what distinguishes a
+    complete write from a truncated one. Any read error → False."""
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(64)
+            if not head.startswith(b"ISO-10303-21;"):
+                return False
+            fh.seek(max(0, size - 64))
+            tail = fh.read(64)
+        return tail.rstrip().endswith(b"END-ISO-10303-21;")
+    except OSError:
+        return False
+
+
 def _variant_calls(
     output: Path, variant: str | list[str] | None,
 ) -> list[tuple[list[str], Path]]:
@@ -259,16 +280,60 @@ class CLIExportOps(ExportOps):
 
 
     def export_step(self, board_path: Path, output_path: Path) -> dict[str, Any]:
-        """Export 3D STEP model via kicad-cli pcb export step."""
+        """Export 3D STEP model via kicad-cli pcb export step.
+
+        F-DV13: kicad-cli exits nonzero when a footprint's only 3D model is a
+        VRML mesh, yet still writes a valid STEP containing everything else.
+        A nonzero exit whose output file was written by THIS run and passes
+        ``_valid_step_file`` is reported as structured partial success
+        (``success: False, partial: True``); any other nonzero exit keeps the
+        legacy bare-failure payload.
+        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Pre-run snapshot (stale-file guard): after a nonzero exit, the file
+        # counts as written by this run only if it did not exist before or its
+        # (st_size, st_mtime_ns) changed — a leftover STEP from an earlier
+        # successful export must not be misreported as this run's partial output.
+        try:
+            pre = output_path.stat()
+            pre_stat: tuple[int, int] | None = (pre.st_size, pre.st_mtime_ns)
+        except OSError:
+            pre_stat = None
         result = self._run(
             ["pcb", "export", "step", "--output", str(output_path), str(board_path)],
             timeout=EXPORT_3D_TIMEOUT,
         )
+        if result.returncode == 0:
+            return {
+                "success": True,
+                "output_file": str(output_path),
+                "message": "STEP exported",
+            }
+        try:
+            post = output_path.stat()
+            post_stat: tuple[int, int] | None = (post.st_size, post.st_mtime_ns)
+        except OSError:
+            post_stat = None
+        if (
+            post_stat is not None
+            and post_stat != pre_stat
+            and _valid_step_file(output_path)
+        ):
+            return {
+                "success": False,
+                "partial": True,
+                "output_file": str(output_path),
+                "file_size_bytes": post_stat[0],
+                "stderr": result.stderr,
+                "message": (
+                    f"STEP exported partially: kicad-cli exited {result.returncode} "
+                    "but wrote a valid STEP file; some 3D models are absent from it."
+                ),
+            }
         return {
-            "success": result.returncode == 0,
-            "output_file": str(output_path) if result.returncode == 0 else None,
-            "message": result.stderr if result.returncode != 0 else "STEP exported",
+            "success": False,
+            "output_file": None,
+            "message": result.stderr,
         }
 
     def export_vrml(self, board_path: Path, output_path: Path) -> dict[str, Any]:

@@ -274,6 +274,46 @@ def _refuse_if_open_in_kicad(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Symbol attribute flags (F-DV12) — the four bare s-expression tokens KiCad
+# stores on every placed schematic symbol. They are NOT (property ...)
+# clauses, so the property tools cannot reach them.
+# ---------------------------------------------------------------------------
+
+# KiCad defaults, matching variant_files._sch_base_attrs.
+_SYMBOL_ATTR_DEFAULTS: dict[str, bool] = {
+    "in_bom": True,
+    "on_board": True,
+    "dnp": False,
+    "exclude_from_sim": False,
+}
+
+
+def _require_bool(name: str, value: Any) -> bool:
+    """Strict bool validation for the symbol attribute flags.
+
+    No truthiness coercion — ``bool("no")`` is ``True`` and would silently
+    invert intent.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{name} must be a boolean (true/false), got {value!r}"
+        )
+    return value
+
+
+def _fill_symbol_attr_defaults(sym: dict[str, Any]) -> dict[str, Any]:
+    """Default-fill the four attribute keys on a read_schematic symbol row.
+
+    Every returned row always carries all four keys (spec C4); files from
+    other generators may omit the tokens, in which case the KiCad defaults
+    apply. Shared by the kicad-skip and sexp read paths so both agree.
+    """
+    for key, default in _SYMBOL_ATTR_DEFAULTS.items():
+        sym.setdefault(key, default)
+    return sym
+
+
+# ---------------------------------------------------------------------------
 # Footprint library helpers used by place_component
 # ---------------------------------------------------------------------------
 
@@ -920,8 +960,16 @@ def parse_board_zones(content: str) -> list[dict[str, Any]]:
     return zones
 
 
-def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
-    """(min_x, min_y, max_x, max_y) of the Edge.Cuts graphics, or None.
+def edge_cuts_graphics(
+    content: str,
+) -> tuple[int, bool, tuple[float, float, float, float] | None]:
+    """(count, has_arc, bbox) of board-level Edge.Cuts graphics.
+
+    count   — number of gr_line/gr_rect/gr_arc/gr_circle/gr_poly blocks
+              on Edge.Cuts (board-level only; fp_* shapes never match).
+    has_arc — True when any of them is a gr_arc.
+    bbox    — (min_x, min_y, max_x, max_y) in mm, or None when count == 0
+              or no coordinates were found.
 
     Deterministic bbox rule (spec Z1): collect every coordinate pair of every
     ``gr_*`` element on Edge.Cuts; circles expand their center by the radius.
@@ -929,6 +977,8 @@ def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
     coord_re = re.compile(r"\((?:xy|start|end|mid|center)\s+(-?[\d.]+)\s+(-?[\d.]+)\)")
     xs: list[float] = []
     ys: list[float] = []
+    count = 0
+    has_arc = False
     for gm in re.finditer(r"\(gr_(line|rect|arc|circle|poly)\b", content):
         g_end = _walk_balanced_parens(content, gm.start())
         if g_end is None:
@@ -936,6 +986,9 @@ def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
         block = content[gm.start():g_end + 1]
         if '(layer "Edge.Cuts")' not in block:
             continue
+        count += 1
+        if gm.group(1) == "arc":
+            has_arc = True
         pts = [(float(m.group(1)), float(m.group(2)))
                for m in coord_re.finditer(block)]
         if gm.group(1) == "circle" and len(pts) >= 2:
@@ -946,8 +999,13 @@ def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
             xs.append(x)
             ys.append(y)
     if not xs:
-        return None
-    return min(xs), min(ys), max(xs), max(ys)
+        return count, has_arc, None
+    return count, has_arc, (min(xs), min(ys), max(xs), max(ys))
+
+
+def _edge_cuts_bbox(content: str) -> tuple[float, float, float, float] | None:
+    """(min_x, min_y, max_x, max_y) of the Edge.Cuts graphics, or None."""
+    return edge_cuts_graphics(content)[2]
 
 
 class FileBoardOps(BoardOps):
@@ -957,6 +1015,12 @@ class FileBoardOps(BoardOps):
         # Footprint placement resolves lib_ids through the project fp-lib-table
         # when set (#2 footprint swaps pass the board's directory here).
         self._project_dir = project_dir
+
+    def _resolve_project_dir(self, path: Path) -> str | Path:
+        """Project dir for footprint-library resolution: the constructor's
+        project_dir when given, else the board file's own directory (the
+        KiCad project convention — fp-lib-table lives beside the board)."""
+        return self._project_dir if self._project_dir is not None else path.parent
 
     def read_board(self, path: Path) -> dict[str, Any]:
         info = self.get_board_info(path)
@@ -1119,13 +1183,18 @@ class FileBoardOps(BoardOps):
 
         fp_uuid = str(_uuid.uuid4())
 
-        kicad_mod = _load_kicad_mod(footprint, self._project_dir)
+        eff_dir = self._resolve_project_dir(path)
+        kicad_mod = _load_kicad_mod(footprint, eff_dir)
         if not kicad_mod:
             # A pad-less stub is a silent lie the rest of the pipeline builds
-            # on (nets can't assign, DRC can't see the part) — fail loudly.
+            # on (nets can't assign, DRC can't see the part) — fail loudly,
+            # naming the lookup attempted (SW-1 C3 / REQ-NS-4).
             raise ValueError(
-                f"footprint '{footprint}' not found in libraries — stub "
-                f"placement removed (KIR4 NS)"
+                f"footprint '{footprint}' not found — searched the "
+                f"fp-lib-table map for project '{eff_dir}' (project + global "
+                f"tables) and stock libraries; stub placement removed "
+                f"(KIR4 NS). Register the library or fix the schematic's "
+                f"Footprint field, then retry."
             )
         fp_sexp = _embed_kicad_mod_as_pcb_footprint(
             kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
@@ -1204,6 +1273,9 @@ class FileBoardOps(BoardOps):
         The payload (footprint lib_id, position, rotation, layer, locked,
         pad→net map) is what sync_schematic_to_pcb consumes to re-place a
         swapped footprint at the same location with the same nets.
+        ``raw_block`` carries the exact s-expression text removed, for the
+        file-mode swap rollback (SW-1 C4); consumers treat it as optional
+        (bridge/IPC payloads do not carry it).
         """
         _refuse_if_open_in_kicad(path)
         content = path.read_text(encoding="utf-8")
@@ -1211,10 +1283,27 @@ class FileBoardOps(BoardOps):
         if location is None:
             raise ValueError(f"Footprint with reference '{reference}' not found in {path}")
         start, end = location
-        state = _footprint_state_from_block(content[start:end + 1])
+        raw_block = content[start:end + 1]
+        state = _footprint_state_from_block(raw_block)
         content = remove_sexp_block(content, start, end)
         path.write_text(content, encoding="utf-8")
-        return {"reference": reference, "removed": True, **state}
+        return {"reference": reference, "removed": True,
+                "raw_block": raw_block, **state}
+
+    def restore_footprint_block(self, path: Path, raw_block: str) -> dict[str, Any]:
+        """Re-insert a footprint block captured by ``remove_component``.
+
+        Verbatim rollback for the file-mode footprint swap (SW-1 C4).
+        Verbatim re-insertion is net-safe: the block's ``(net …)`` clauses
+        reference net ids/names still present in the file.
+        """
+        _refuse_if_open_in_kicad(path)
+        content = path.read_text(encoding="utf-8")
+        last_paren = content.rfind(")")
+        if last_paren >= 0:
+            content = content[:last_paren] + raw_block + content[last_paren:]
+            path.write_text(content, encoding="utf-8")
+        return {"restored": True}
 
     def get_component_state(self, path: Path, reference: str) -> dict[str, Any]:
         """Capture a footprint's placement state without modifying the board."""
@@ -2236,7 +2325,7 @@ class FileBoardOps(BoardOps):
                 warnings.append(f"Skipping {ref or '?'}: no footprint assigned")
                 continue
 
-            kicad_mod = _load_kicad_mod(fp, self._project_dir)
+            kicad_mod = _load_kicad_mod(fp, self._resolve_project_dir(path))
             if kicad_mod is None:
                 warnings.append(f"{ref}: footprint '{fp}' not in libraries, using 5×5 mm default")
                 w, h = 5.0, 5.0
@@ -2353,7 +2442,7 @@ class FileBoardOps(BoardOps):
         """
         from kicad_mcp.utils import placement_engine as engine
 
-        parts = build_engine_parts(path, self._project_dir)
+        parts = build_engine_parts(path, self._resolve_project_dir(path))
         keepouts, part_sides = engine.read_board_keepouts(path)
         items, warnings, total_area = engine.compute_net_aware_plan(
             parts, board_x, board_y, board_width, board_height,
@@ -2639,13 +2728,18 @@ class FileBoardOps(BoardOps):
 
             try:
                 fp_uuid = str(_uuid.uuid4())
-                kicad_mod = _load_kicad_mod(footprint, self._project_dir)
+                eff_dir = self._resolve_project_dir(path)
+                kicad_mod = _load_kicad_mod(footprint, eff_dir)
                 if not kicad_mod:
                     # No silent pad-less stubs (KIR4 NS) — the except below
-                    # turns this into a per-item failed[] entry.
+                    # turns this into a per-item failed[] entry naming the
+                    # lookup attempted (SW-1 C3 / REQ-NS-4).
                     raise ValueError(
-                        f"footprint '{footprint}' not found in libraries — "
-                        f"stub placement removed (KIR4 NS)"
+                        f"footprint '{footprint}' not found — searched the "
+                        f"fp-lib-table map for project '{eff_dir}' (project "
+                        f"+ global tables) and stock libraries; stub "
+                        f"placement removed (KIR4 NS). Register the library "
+                        f"or fix the schematic's Footprint field, then retry."
                     )
                 fp_sexp = _embed_kicad_mod_as_pcb_footprint(
                     kicad_mod, footprint, reference, x, y, layer, rotation, fp_uuid
@@ -2856,6 +2950,16 @@ class FileSchematicOps(SchematicOps):
                     symbol_data["unit"] = int(float(raw))
                 except (TypeError, ValueError, IndexError):
                     pass
+            # Attribute flags (spec C4): kicad-skip exposes the bare tokens
+            # as attributes whose .value is already a Python bool. Anything
+            # else falls through to the shared default fill, keeping this
+            # path equivalent to the sexp parser.
+            for attr in _SYMBOL_ATTR_DEFAULTS:
+                attr_node = getattr(sym, attr, None)
+                attr_val = getattr(attr_node, "value", None)
+                if isinstance(attr_val, bool):
+                    symbol_data[attr] = attr_val
+            _fill_symbol_attr_defaults(symbol_data)
             symbols.append(symbol_data)
         symbols = self._merge_unit_rows(symbols)
 
@@ -3427,13 +3531,17 @@ class FileSchematicOps(SchematicOps):
         properties: dict[str, str] | None,
         symbol_uuid: str, sch_uuid: str,
         unit: int = 1,
+        in_bom: bool = True, on_board: bool = True,
+        dnp: bool = False, exclude_from_sim: bool = False,
     ) -> str:
         """Build the (symbol ...) s-expression block for a regular component.
 
         Pure formatting helper — does no file I/O, no library caching, no UUID
         generation. Caller supplies the symbol UUID and schematic UUID.
         ``unit`` lands in both the block header and the instances path entry
-        (RW-S1 measured fact 2).
+        (RW-S1 measured fact 2). The four attribute flags land in the single
+        attr line (F-DV12); the defaults reproduce today's output byte for
+        byte.
         """
         at_clause = f"(at {x} {y} {rotation})"
         mirror_clause = f"\n    (mirror {mirror})" if mirror in ("x", "y") else ""
@@ -3462,9 +3570,13 @@ class FileSchematicOps(SchematicOps):
                 )
                 offset += 2
 
+        ys = "yes" if exclude_from_sim else "no"
+        yb = "yes" if in_bom else "no"
+        yo = "yes" if on_board else "no"
+        yd = "yes" if dnp else "no"
         return (
             f'  (symbol (lib_id "{lib_id}") {at_clause}{mirror_clause} (unit {unit})\n'
-            f'    (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)\n'
+            f'    (exclude_from_sim {ys}) (in_bom {yb}) (on_board {yo}) (dnp {yd})\n'
             f'    (uuid "{symbol_uuid}")\n'
             f'{prop_lines}'
             f'    (instances\n'
@@ -3628,8 +3740,14 @@ class FileSchematicOps(SchematicOps):
         mirror: str | None = None, footprint: str = "",
         properties: dict[str, str] | None = None,
         unit: int = 1,
+        in_bom: bool = True, on_board: bool = True,
+        dnp: bool = False, exclude_from_sim: bool = False,
     ) -> dict[str, Any]:
         _refuse_if_open_in_kicad(path)
+        in_bom = _require_bool("in_bom", in_bom)
+        on_board = _require_bool("on_board", on_board)
+        dnp = _require_bool("dnp", dnp)
+        exclude_from_sim = _require_bool("exclude_from_sim", exclude_from_sim)
         import uuid
         symbol_uuid = str(uuid.uuid4())
 
@@ -3645,6 +3763,8 @@ class FileSchematicOps(SchematicOps):
             lib_id, reference, value, x, y, rotation,
             mirror, footprint, properties, symbol_uuid, sch_uuid,
             unit=int(unit),
+            in_bom=in_bom, on_board=on_board,
+            dnp=dnp, exclude_from_sim=exclude_from_sim,
         )
 
         insert_pos = self._find_insertion_point(content)
@@ -3664,6 +3784,13 @@ class FileSchematicOps(SchematicOps):
             result["footprint"] = footprint
         if mirror:
             result["mirror"] = mirror
+        # Echoed only when any flag differs from its default (spec C1) so the
+        # default-only payload stays byte-identical.
+        if (not in_bom or not on_board or dnp or exclude_from_sim):
+            result["in_bom"] = in_bom
+            result["on_board"] = on_board
+            result["dnp"] = dnp
+            result["exclude_from_sim"] = exclude_from_sim
         return result
 
     def add_wire(
@@ -3901,6 +4028,11 @@ class FileSchematicOps(SchematicOps):
                 footprint = c.get("footprint", "")
                 properties = c.get("properties")
                 unit = int(c.get("unit", 1))
+                in_bom = _require_bool("in_bom", c.get("in_bom", True))
+                on_board = _require_bool("on_board", c.get("on_board", True))
+                dnp = _require_bool("dnp", c.get("dnp", False))
+                exclude_from_sim = _require_bool(
+                    "exclude_from_sim", c.get("exclude_from_sim", False))
 
                 if not lib_id or not reference:
                     failed.append({
@@ -3933,6 +4065,8 @@ class FileSchematicOps(SchematicOps):
                     lib_id, reference, value, x, y, rotation,
                     mirror, footprint, properties, symbol_uuid, sch_uuid,
                     unit=unit,
+                    in_bom=in_bom, on_board=on_board,
+                    dnp=dnp, exclude_from_sim=exclude_from_sim,
                 ))
                 accepted.setdefault(
                     reference, {"lib_id": lib_id, "units": set()},
@@ -4653,6 +4787,97 @@ class FileSchematicOps(SchematicOps):
             "reference": reference,
             "property": property_name,
             "value": property_value,
+        }
+
+    @staticmethod
+    def _set_symbol_attrs_in_block(block: str, flags: dict[str, bool]) -> str:
+        """Apply attribute-flag edits to one placed (symbol ...) block.
+
+        Edits are restricted to the base scope — the block text before its
+        (instances section (variant blocks never carry the base tokens). An
+        existing token's value word flips in place; an absent token is
+        inserted on its own line immediately before the block's (uuid " line,
+        indented to match it — KiCad's canonical position in both the K9
+        single-line and K10 one-per-line layouts.
+        """
+        for token, value in flags.items():
+            word = "yes" if value else "no"
+            inst = block.find("(instances")
+            scope_end = inst if inst != -1 else len(block)
+            m = re.compile(rf"\({token}\s+(yes|no)\s*\)").search(
+                block, 0, scope_end)
+            if m is not None:
+                block = block[:m.start(1)] + word + block[m.end(1):]
+                continue
+            um = re.search(r'(?m)^([ \t]*)\(uuid\s+"', block[:scope_end])
+            if um is None:
+                continue  # unreachable per grammar: every placed symbol has a uuid line
+            insertion = f"{um.group(1)}({token} {word})\n"
+            block = block[:um.start()] + insertion + block[um.start():]
+        return block
+
+    def set_symbol_attributes(
+        self, path: Path, reference: str, *,
+        in_bom: bool | None = None,
+        on_board: bool | None = None,
+        dnp: bool | None = None,
+        exclude_from_sim: bool | None = None,
+    ) -> dict[str, Any]:
+        """Set the bare symbol attribute flags on a placed symbol (F-DV12).
+
+        The flags are bare s-expression tokens, not (property ...) clauses,
+        so update_component_property cannot reach them. Every unit block of
+        the reference is edited; the lib_symbols section is never touched.
+        ``None`` leaves a flag as it is. One read, all edits in memory, one
+        write.
+        """
+        _refuse_if_open_in_kicad(path)
+        requested = {
+            "in_bom": in_bom,
+            "on_board": on_board,
+            "dnp": dnp,
+            "exclude_from_sim": exclude_from_sim,
+        }
+        if all(value is None for value in requested.values()):
+            raise ValueError(
+                "set_symbol_attributes: nothing to set — pass at least one "
+                "of in_bom, on_board, dnp, exclude_from_sim"
+            )
+        flags = {
+            name: _require_bool(name, value)
+            for name, value in requested.items() if value is not None
+        }
+
+        content = path.read_text(encoding="utf-8")
+        blocks = self._find_symbol_blocks_by_reference(content, reference)
+        if not blocks:
+            raise ValueError(
+                f"Symbol with reference '{reference}' not found in {path}")
+
+        # Back-to-front so earlier block offsets stay valid through edits.
+        for blk in reversed(blocks):
+            start, end = blk["start"], blk["end"]
+            new_block = self._set_symbol_attrs_in_block(
+                content[start:end + 1], flags)
+            content = content[:start] + new_block + content[end + 1:]
+        path.write_text(content, encoding="utf-8")
+
+        # Final effective values, re-parsed from the edited first block with
+        # the KiCad defaults (variant_files._sch_base_attrs) — not merely the
+        # inputs.
+        first = self._find_symbol_blocks_by_reference(content, reference)[0]
+        block = content[first["start"]:first["end"] + 1]
+        inst = block.find("(instances")
+        scope = block[:inst if inst != -1 else len(block)]
+        attributes: dict[str, bool] = {}
+        for token, default in _SYMBOL_ATTR_DEFAULTS.items():
+            tm = re.search(rf"\({token}\s+(yes|no)\s*\)", scope)
+            attributes[token] = default if tm is None else tm.group(1) == "yes"
+
+        return {
+            "reference": reference,
+            "units_updated": [b["unit"] for b in blocks],
+            "attributes": attributes,
         }
 
     def remove_component(
@@ -6383,6 +6608,8 @@ def _parse_sch_symbol(node: list[Any]) -> dict[str, Any] | None:
                 sym["unit"] = int(float(child[1]))
             except (TypeError, ValueError):
                 pass
+        elif tag in _SYMBOL_ATTR_DEFAULTS:
+            sym[tag] = child[1] == "yes"
         elif tag == "property" and len(child) >= 3:
             name = child[1]
             value = child[2] if isinstance(child[2], str) else str(child[2])
@@ -6415,6 +6642,10 @@ def _parse_sch_symbol(node: list[Any]) -> dict[str, Any] | None:
                         break
     if properties:
         sym["properties"] = properties
+    if sym:
+        # Every symbol row always carries the four attr keys (spec C4),
+        # default-filled when the file omits a token.
+        _fill_symbol_attr_defaults(sym)
     return sym if sym else None
 
 

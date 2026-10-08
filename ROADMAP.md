@@ -1,6 +1,6 @@
 # KiCad MCP — Development Roadmap
 
-*Last updated: 2026-05-07 (clear_routes reworked to dispatch through the bridge — 2.5 and 3.4)*
+*Last updated: 2026-10-06 (Phase 6 marked shipped; technical-debt table refreshed)*
 
 ---
 
@@ -230,11 +230,138 @@ and `--dry-run`. Works on Windows, macOS, and Linux.
 
 ---
 
+## Phase 6 — Placement Intelligence (**Shipped** 2026-06-15; planned 2026-05-09)
+
+> **Status note (2026-10-06):** everything below shipped — the 6.1 connector
+> tools and autoroute gate, the 6.2 `/build-pcb` sub-gates (since extended
+> to 4a–4f with a placement-quality gate) and `auto_place` anchors, and the
+> 6.3 `PlacementIntent` / sheet-hierarchy clustering. All four completion
+> criteria below were discharged. The section is kept as the design record.
+
+**Motivation.** During the `bt_audio_v1` /build-pcb session (2026-05-09), two of three external connectors (J2 JST battery, J3 3.5mm audio jack) ended up facing the board interior after `auto_place` + `autoroute`. Root cause is not a single bug — it's a layered gap:
+
+1. **`sync_schematic_to_pcb` drops every footprint at origin with rotation 0°.** None of the schematic's structure (sheet hierarchy, symbol position, custom properties) carries forward.
+2. **`auto_place` is a pure position optimizer.** No notion of "this connector belongs at the south edge" or "this face points outward." The footprint library *already encodes* this (the J3 footprint has a `(fp_text user "PCB edge" ... layer "Dwgs.User")` annotation; horizontal connectors have silk gaps on their mating face). No MCP tool reads any of it.
+3. **No placement-quality gate exists.** `check_courtyard_overlaps` only proves the placement is non-colliding, not correct. The /build-pcb skill's Phase 4 lets the model move from `auto_place` straight to `autoroute` with every connector facing inward.
+4. **"Hard rules" in skill markdown are honor-system.** "NEVER autoroute when courtyard overlaps present" is a rule the model can violate without resistance — `autoroute` itself accepts any board state.
+
+The fix is a stack of three tiers, each useful on its own and ordered by leverage per effort.
+
+---
+
+### 6.1 Tier 1 — Connector orientation tooling
+
+Four new tools that turn "use your judgment" into "the tool tells you and the next tool refuses without it." None require schematic-format changes; all read footprint metadata that's already in the standard library.
+
+#### 6.1.1 `identify_edge_facing_connectors(path)` — detect which refs need edge placement
+Scans every footprint in a `.kicad_pcb`. For each, classifies whether it has an external mating face by reading:
+- `Dwgs.User` `"PCB edge"` annotations in the source `.kicad_mod` (definitive — placed by KiCad library maintainers)
+- Silk-gap geometry: a one-sided break in the silk rectangle indicates a receptacle aperture
+- Footprint name heuristics: `*Horizontal*`, `*_Receptacle_*`, `Connector_USB`, `Connector_Audio`, `Connector_JST`, `Connector_BarrelJack`
+- `attr` flag heuristics: `through_hole exclude_from_pos_files` is a strong signal for a hand-soldered cable connector
+
+Returns `[{ref, footprint, mating_face: "+y"|"-y"|"+x"|"-x", confidence: "high"|"medium", evidence: "..."}]`. The `mating_face` is in the *footprint's* local frame — the validator below applies the current `(at)` rotation to convert it to board frame.
+
+#### 6.1.2 `validate_connector_orientations(path)` — placement-quality gate
+For each ref returned by 6.1.1, compute the mating-face vector after the footprint's current rotation, then check whether that vector points toward the *closest* board edge (within an angular tolerance, e.g. ±30°). Returns:
+```json
+{
+  "passed": false,
+  "checked": 3,
+  "violations": [
+    {
+      "ref": "J2",
+      "current_face": "+y",
+      "current_face_in_board_frame": "+y",
+      "closest_edge": "south",
+      "suggested_rotation": 180.0,
+      "suggested_edge": "south"
+    }
+  ]
+}
+```
+This is the gate that closes the placement-quality hole. It's also the validator that 6.1.4 enforces.
+
+#### 6.1.3 `place_at_edge(path, reference, edge, offset_mm=2.0)` — outward-facing placement
+Computes correct rotation + position so the named ref's mating face points outward at the given edge (`"north"|"south"|"east"|"west"`), with `offset_mm` clearance from the courtyard to the edge. Replaces the manual rotation arithmetic the model currently does (and gets wrong). Internally calls `move_component` after computing target.
+
+#### 6.1.4 Tool-level enforcement on `autoroute`
+`autoroute` records a state-version hash of the .kicad_pcb at start of each call. `validate_connector_orientations` records its result + the same hash. If the latest validator result for the current hash is missing or `passed=false`, `autoroute` refuses with a structured error including the violations. The user-facing rule "never autoroute with bad placement" becomes mechanically enforced rather than honor-system.
+
+Same pattern can extend to: `check_courtyard_overlaps.passed=false` blocking `autoroute`, `validate_schematic_for_pcb` blocking `sync_schematic_to_pcb`, etc. — the orientation gate is the first one to wire up because it's where today's failure happened.
+
+#### 6.1.5 Tests
+- `tests/test_identify_edge_facing_connectors.py` — fixture footprints (`USB_C_Receptacle_Amphenol`, `Jack_3.5mm_CUI_SJ1-3523N_Horizontal`, `JST_PH_S2B-PH-K_*Horizontal`, plus an SMT chip that should NOT be flagged) covering each detection mechanism.
+- `tests/test_validate_connector_orientations.py` — fixtures with connectors at each rotation × each edge proximity, including the case where two edges are equidistant.
+- `tests/test_place_at_edge.py` — verifies rotation arithmetic for all four edges × four starting rotations × two footprint asymmetries.
+- `tests/test_autoroute_gate.py` — confirms `autoroute` refuses without prior validation pass; confirms it accepts after pass; confirms re-`move_component` invalidates the prior pass.
+
+---
+
+### 6.2 Tier 2 — `/build-pcb` Phase 4 sub-gates
+
+The skill's Phase 4 is currently `sync → set_rules → auto_place → check_overlaps`. Split into ordered sub-phases with their own gates so the model cannot skip from "synced" to "no overlaps" without explicit orientation work.
+
+#### 6.2.1 Phase 4 rewrite in `.claude/commands/build-pcb.md`
+- **4a — Sync & survey:** `sync_schematic_to_pcb`, `set_board_design_rules`, `identify_edge_facing_connectors`. Report names every detected edge-facing ref. Gate: every detected ref has a planned edge assignment.
+- **4b — Anchor connectors:** `place_at_edge` for each ref from 4a. Re-run `validate_connector_orientations`. Gate: `passed == true`.
+- **4c — Bulk placement:** `auto_place` (with anchored refs locked — see 6.2.2). Gate: every non-anchored ref has a position.
+- **4d — Overlap check:** `check_courtyard_overlaps`. Resolve via `move_component`. Gate: `passed == true`.
+- **4e — Final orientation re-check:** `validate_connector_orientations` once more (covers cases where overlap-resolution moves rotated a connector). Gate: `passed == true`.
+
+Each sub-gate gets its own report block in the skill so the model cannot collapse them.
+
+#### 6.2.2 `auto_place` accepts an `anchors` parameter
+`auto_place(path, anchors=[ref, ref, ...])` skips listed refs in its placement loop, treating them as fixed obstacles. Required by 4c so that the connector orientations set in 4b survive bulk placement.
+
+#### 6.2.3 `CLAUDE.md` PCB Design Protocol updates
+- Phase 4 row in the table replaced with five rows (4a–4e) showing each gate condition.
+- Hard rules updated: "NEVER call autoroute when `validate_connector_orientations.passed == false`" added alongside the existing courtyard rule.
+- Reference to memory entry on edge-facing connectors (this becomes important institutional knowledge).
+
+---
+
+### 6.3 Tier 3 — Schematic-driven placement intent
+
+The schematic currently dictates connectivity but is dropped on the floor for layout. Fix that by letting symbols carry placement intent that flows through `sync_schematic_to_pcb` to seed initial PCB state, and by clustering placement using sheet hierarchy that's already in the data.
+
+#### 6.3.1 `PlacementIntent` symbol property
+Custom property on schematic symbols, opaque string, parsed by `sync_schematic_to_pcb`:
+- `edge:north` / `edge:south` / `edge:east` / `edge:west` — anchor at the named edge with outward-facing rotation, equivalent to a `place_at_edge` call after sync
+- `cluster:<name>` — keep refs sharing the cluster name geometrically grouped; `auto_place` reads the cluster annotation and treats them as a soft constraint
+- `lock` — never move once placed (combined with `edge:*` for fixed connectors)
+
+#### 6.3.2 `sync_schematic_to_pcb` reads `PlacementIntent`
+After importing footprints + nets, parse `PlacementIntent` for each component. For `edge:*` values, call `place_at_edge` with computed offset. For `cluster:*`, attach metadata to the footprint's `(property "ClusterId" "...")` so `auto_place` can cluster by it. Symbols without the property fall through to today's behavior (origin placement).
+
+This is what makes the schematic actually contribute to layout. Today the schematic is a netlist generator; with this, it's a placement plan.
+
+#### 6.3.3 `auto_place` respects sheet hierarchy
+Components in the same hierarchical sheet cluster spatially on the PCB. The sheet hierarchy is already in `.kicad_sch`; `sync_schematic_to_pcb` already preserves the path. `auto_place` reads the `(path ...)` from each component instance and treats common-prefix paths as soft clustering hints. No new file format.
+
+#### 6.3.4 Tests
+- `tests/test_sync_placement_intent.py` — fixture schematic with `PlacementIntent: edge:south` symbol → confirm post-sync footprint is at south edge with correct rotation.
+- `tests/test_auto_place_clustering.py` — fixture with three sheets → confirm components within a sheet land closer to each other than to other sheets' components.
+
+---
+
+### 6.4 Sequencing & success criteria
+
+Tiers are independently shippable. Recommended order: **6.1 → 6.2 → 6.3** (each is a prerequisite for the next becoming useful).
+
+**Phase 6 is complete when:**
+- Re-running `/build-pcb` on `bt_audio_v1` produces J1, J2, J3 facing outward without manual rotation calls.
+- `validate_connector_orientations` returns `passed=true` after Phase 4d on every example project in `examples/`.
+- `autoroute` returns a clear refusal error if invoked on a board with failing orientation validation.
+- A schematic with `PlacementIntent: edge:south` on a connector symbol produces that connector at the south edge after `sync_schematic_to_pcb`, with no manual `place_at_edge` call.
+
+---
+
 ## Quick Reference: Known Technical Debt
 
 | Item | File | Severity |
 |---|---|---|
-| `mypy` type coverage incomplete | `src/` (all modules) | Medium — CI runs informational only (`continue-on-error: true`); enforce strict mode as a future phase |
+| ~~`mypy` type coverage incomplete~~ | ~~`src/` (all modules)~~ | **FIXED** 2026-07-12 — whole-repo `mypy src/` is clean and BLOCKING in CI; hot files additionally held to `mypy --strict` (also blocking) |
 | ~~`definitions.py` type annotation `backend: CompositeBackend`~~ | ~~`src/kicad_mcp/resources/definitions.py:16`~~ | **FIXED** 2026-05-02 (3.6) |
 | ~~`kicad_mcp.__main__` legacy entry point~~ | ~~`src/kicad_mcp/__main__.py`~~ | **FIXED** 2026-05-02 |
 | `reload_board` falls through to `Refresh()` on KiCad 9 — does not rebuild track cache | `kicad_mcp_bridge.py:_handle_reload_board` | Low — only callers (`import_ses`, ex-`clear_routes`) already mutate the live board, so the reload is redundant. Documented in 3.4 above. |

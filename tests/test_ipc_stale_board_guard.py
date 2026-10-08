@@ -15,16 +15,22 @@ the bridge — the bridge holds the SAME stale live board.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 pytest.importorskip("kipy")
 
+import kipy.board_types as kbt
+from kipy.proto.board.board_types_pb2 import BoardLayer
+
 from kicad_mcp.backends.base import BoardOps
 from kicad_mcp.backends.ipc_backend import IPCBoardOps, _coherence_mismatch
 from kicad_mcp.backends.ipc_connection import IPCStaleBoardError, IPCUnavailableError
+from kicad_mcp.backends.plugin_backend import StaleBoardError
 from kicad_mcp_plugin.backends.plugin_direct import _LiveBoardOps
 
 
@@ -48,6 +54,8 @@ def _board_text(
     tracks: int = 0,
     vias: int = 0,
     zones: int = 0,
+    edge_rect: tuple[float, float, float, float] | None = None,
+    edge_arcs: int = 0,
 ) -> str:
     parts = ['(kicad_pcb\n\t(version 20241229)\n\t(generator "test")\n']
     for ref, x, y in footprints:
@@ -63,6 +71,17 @@ def _board_text(
     parts.extend(
         '\t(zone (net 1) (net_name "GND") (layer "B.Cu") (uuid "z"))\n'
         for _ in range(zones)
+    )
+    if edge_rect is not None:
+        x0, y0, x1, y1 = edge_rect
+        parts.append(
+            f"\t(gr_rect (start {x0} {y0}) (end {x1} {y1}) "
+            f'(stroke (width 0.05) (type default)) (layer "Edge.Cuts"))\n'
+        )
+    parts.extend(
+        "\t(gr_arc (start 10 0) (mid 15 5) (end 10 10) "
+        '(stroke (width 0.05) (type default)) (layer "Edge.Cuts"))\n'
+        for _ in range(edge_arcs)
     )
     parts.append(")\n")
     return "".join(parts)
@@ -90,6 +109,18 @@ class _LiveFP:
         self.position = _Pos(round(x_mm * 1e6), round(y_mm * 1e6))
 
 
+class _Box:
+    """kipy Box2 stand-in: pos + size in nanometers."""
+
+    def __init__(self, x0_nm: int, y0_nm: int, x1_nm: int, y1_nm: int) -> None:
+        self.pos = _Pos(x0_nm, y0_nm)
+        self.size = _Pos(x1_nm - x0_nm, y1_nm - y0_nm)
+
+
+def _mm_box(x0: float, y0: float, x1: float, y1: float) -> _Box:
+    return _Box(round(x0 * 1e6), round(y0 * 1e6), round(x1 * 1e6), round(y1 * 1e6))
+
+
 class _FakeLiveBoard:
     def __init__(
         self,
@@ -98,12 +129,35 @@ class _FakeLiveBoard:
         tracks: int = 0,
         vias: int = 0,
         zones: int = 0,
+        edge_rect: tuple[float, float, float, float] | None = None,
+        edge_arc_boxes: list[_Box] | None = None,
+        edge_beziers: int = 0,
     ) -> None:
         self.name = name
         self._fps = [_LiveFP(ref, x, y) for ref, x, y in footprints]
         self._tracks = tracks
         self._vias = vias
         self._zones = zones
+        # Real kipy shape wrappers (standalone construction is how
+        # add_board_outline builds its rectangle) + per-shape boxes served
+        # by get_item_bounding_box below.
+        self._shapes: list[Any] = []
+        self._boxes: dict[int, _Box | None] = {}
+        if edge_rect is not None:
+            rect = kbt.BoardRectangle()
+            rect.layer = BoardLayer.BL_Edge_Cuts
+            self._shapes.append(rect)
+            self._boxes[id(rect)] = _mm_box(*edge_rect)
+        for arc_box in edge_arc_boxes or []:
+            arc = kbt.BoardArc()
+            arc.layer = BoardLayer.BL_Edge_Cuts
+            self._shapes.append(arc)
+            self._boxes[id(arc)] = arc_box
+        for _ in range(edge_beziers):
+            bezier = kbt.BoardBezier()
+            bezier.layer = BoardLayer.BL_Edge_Cuts
+            self._shapes.append(bezier)
+            self._boxes[id(bezier)] = None
 
     def get_footprints(self) -> list[_LiveFP]:
         return self._fps
@@ -116,6 +170,12 @@ class _FakeLiveBoard:
 
     def get_zones(self) -> list[object]:
         return [object()] * self._zones
+
+    def get_shapes(self) -> list[Any]:
+        return self._shapes
+
+    def get_item_bounding_box(self, items: list[Any]) -> list[_Box | None]:
+        return [self._boxes.get(id(item)) for item in items]
 
 
 _FPS = [("C1", 141.605, 99.695), ("R1", 136.271, 107.95), ("U1", 149.225, 113.665)]
@@ -183,6 +243,66 @@ def test_missing_file_is_coherent_new_board(tmp_path: Path) -> None:
     assert _coherence_mismatch(board, tmp_path / "nonexistent.kicad_pcb") is None
 
 
+# ── F-DV11-R1 — Edge.Cuts graphics join the coherence check ─────────────────
+
+def test_edge_cuts_count_drift_is_a_mismatch(tmp_path: Path) -> None:
+    path = _write_board(tmp_path, edge_rect=(0.0, 0.0, 80.0, 70.0))
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)  # no edge shapes live
+    mismatch = _coherence_mismatch(board, path)
+    assert mismatch == "edge-cuts graphic count 0 live vs 1 in the file"
+
+
+def test_edge_cuts_outline_revert_is_a_mismatch(tmp_path: Path) -> None:
+    # Incident regression: the live board reverted to the default 80×70
+    # gr_rect while the file holds the real outline — equal counts, so only
+    # the aggregate-bbox check can catch it.
+    path = _write_board(tmp_path, edge_rect=(100.0, 80.0, 220.0, 180.0))
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS,
+                           edge_rect=(0.0, 0.0, 80.0, 70.0))
+    mismatch = _coherence_mismatch(board, path)
+    assert mismatch is not None and "edge-cuts outline bbox" in mismatch
+
+
+def test_edge_cuts_bbox_within_tolerance_is_coherent(tmp_path: Path) -> None:
+    path = _write_board(tmp_path, edge_rect=(0.0, 0.0, 80.0, 70.0))
+    # 0.3 mm delta on every bound — under the 0.5 mm stroke/arc tolerance.
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS,
+                           edge_rect=(0.3, 0.3, 80.3, 70.3))
+    assert _coherence_mismatch(board, path) is None
+
+
+def test_edge_cuts_bbox_check_skipped_for_arc_outlines(tmp_path: Path) -> None:
+    # The file-side arc bbox is the start/mid/end hull, which the true arc can
+    # bulge past by ~its radius — so divergent bboxes stay coherent when an
+    # arc is present on both sides...
+    path = _write_board(tmp_path, edge_arcs=2)
+    board = _FakeLiveBoard(
+        "board.kicad_pcb", _FPS,
+        edge_arc_boxes=[_mm_box(0.0, 0.0, 100.0, 100.0),
+                        _mm_box(0.0, 0.0, 100.0, 100.0)],
+    )
+    assert _coherence_mismatch(board, path) is None
+    # ...while the count check stays exact for arcs.
+    short = _FakeLiveBoard("board.kicad_pcb", _FPS,
+                           edge_arc_boxes=[_mm_box(0.0, 0.0, 100.0, 100.0)])
+    mismatch = _coherence_mismatch(short, path)
+    assert mismatch == "edge-cuts graphic count 1 live vs 2 in the file"
+
+
+def test_board_without_edge_cuts_is_coherent(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    assert _coherence_mismatch(board, path) is None
+
+
+def test_edge_cuts_bezier_excluded_from_count(tmp_path: Path) -> None:
+    # The file regex cannot count beziers, so the live side ignores them too
+    # (symmetric blind spot): a live-only bezier must not read as drift.
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS, edge_beziers=1)
+    assert _coherence_mismatch(board, path) is None
+
+
 # ── _board(check_coherence=True) raises the structured error ────────────────
 
 class _StubConn:
@@ -219,6 +339,82 @@ def test_board_coherent_write_passes_the_guard(tmp_path: Path) -> None:
     path = _write_board(tmp_path, tracks=2, zones=1)
     live = _FakeLiveBoard("board.kicad_pcb", _FPS, tracks=2, zones=1)
     assert _ipc_ops(live)._board(path, check_coherence=True) is live
+
+
+# ── F-DV11-R3 — the post-commit save path cannot bypass a stale refusal ─────
+
+def _bump_mtime(path: Path) -> None:
+    stat = os.stat(path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+
+def test_bridge_stale_refusal_aborts_save_without_kipy_fallback(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    ops = _ipc_ops(board)
+    refusal = StaleBoardError("board on disk is newer than in-memory copy")
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=refusal), \
+         patch("kicad_mcp.backends.ipc_backend._save_board") as save_board:
+        with pytest.raises(IPCStaleBoardError) as excinfo:
+            ops._save(path, board)  # type: ignore[arg-type]
+    assert "stale_board" in str(excinfo.value)
+    assert excinfo.value.remedy is not None and "reopen" in excinfo.value.remedy
+    save_board.assert_not_called()
+
+
+def test_bridge_down_still_falls_back_to_direct_save(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    ops = _ipc_ops(board)
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call",
+               side_effect=ConnectionRefusedError("bridge down")), \
+         patch("kicad_mcp.backends.ipc_backend._save_board") as save_board:
+        ops._save(path, board)  # type: ignore[arg-type]
+    save_board.assert_called_once_with(board)
+
+
+def test_disk_change_after_check_refuses_direct_save(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    ops = _ipc_ops(board)
+    assert ops._board(path, check_coherence=True) is board  # records the baseline
+    _bump_mtime(path)  # external writer races the operation
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call",
+               side_effect=ConnectionRefusedError("bridge down")), \
+         patch("kicad_mcp.backends.ipc_backend._save_board") as save_board:
+        with pytest.raises(IPCStaleBoardError) as excinfo:
+            ops._save(path, board)  # type: ignore[arg-type]
+    assert "changed on disk after the coherence check" in str(excinfo.value)
+    save_board.assert_not_called()
+
+
+def test_unchanged_disk_passes_direct_save_and_rebaselines(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    ops = _ipc_ops(board)
+    ops._board(path, check_coherence=True)
+
+    def fake_save(board_: Any) -> None:
+        _bump_mtime(path)  # a real save rewrites the file and advances its mtime
+
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call",
+               side_effect=ConnectionRefusedError("bridge down")), \
+         patch("kicad_mcp.backends.ipc_backend._save_board",
+               side_effect=fake_save) as save_board:
+        ops._save(path, board)  # type: ignore[arg-type]  # re-baselines post-save
+        ops._save(path, board)  # type: ignore[arg-type]  # no external change → passes
+    assert save_board.call_count == 2
+
+
+def test_save_without_baseline_skips_verification(tmp_path: Path) -> None:
+    path = _write_board(tmp_path)
+    board = _FakeLiveBoard("board.kicad_pcb", _FPS)
+    ops = _ipc_ops(board)  # no guarded _board call → no baseline recorded
+    with patch("kicad_mcp.backends.plugin_backend._tcp_call",
+               side_effect=ConnectionRefusedError("bridge down")), \
+         patch("kicad_mcp.backends.ipc_backend._save_board") as save_board:
+        ops._save(path, board)  # type: ignore[arg-type]
+    save_board.assert_called_once_with(board)
 
 
 # ── _LiveBoardOps must NOT bridge-retry a stale-board refusal ───────────────

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ def run_startup_checklist() -> dict[str, Any]:
     ipc_still_loading = False
     ipc_board_name = ""
     ipc_detail = ""
+    conn: Any = None  # hoisted so the board_file_coherent item can reuse it
     try:
         from kicad_mcp.backends.ipc_connection import (
             IPCConnection,
@@ -215,7 +217,63 @@ def run_startup_checklist() -> dict[str, Any]:
         else:
             required_actions.append("Open a .kicad_pcb file in the KiCad PCB editor.")
 
-    # ── 6. kicad-cli on PATH ─────────────────────────────────────────────────
+    # ── 6. Live board coherent with the file on disk (F-DV11-R2) ────────────
+    # Needs BOTH live paths: the kipy board object (IPC) for the comparison
+    # and the full .kicad_pcb path (bridge get_active_project — IPC only
+    # yields the bare filename). A coherence item that cannot run must not
+    # block or alarm: every skip is a PASS with a skip detail, and a real
+    # mismatch is a WARN (reads are legal on a stale board), never a FAIL.
+    coherent_status = "PASS"
+    coherent_mismatch: str | None = None
+    try:
+        if not ipc_board_ready or conn is None:
+            coherent_detail = "Skipped (no live IPC board to compare)."
+        else:
+            coherent_board_path = ""
+            if bridge_ok and _tcp_call is not None:
+                active = _tcp_call("get_active_project", ping_timeout)
+                if isinstance(active, dict):
+                    coherent_board_path = str(active.get("board_path", "") or "")
+            if not coherent_board_path:
+                coherent_detail = (
+                    "Skipped (full board path unavailable — bridge not "
+                    "serving get_active_project)."
+                )
+            elif (os.path.normcase(Path(coherent_board_path).name)
+                    != os.path.normcase(ipc_board_name)):
+                coherent_detail = "Skipped (live paths disagree on the open board)."
+            else:
+                from kicad_mcp.backends.ipc_backend import _coherence_mismatch
+                mismatch = _coherence_mismatch(conn.board(), Path(coherent_board_path))
+                if mismatch is None:
+                    coherent_detail = f"Live board matches {ipc_board_name} on disk."
+                else:
+                    coherent_status = "WARN"
+                    coherent_mismatch = mismatch
+                    coherent_detail = (
+                        f"Live board is STALE vs {ipc_board_name} on disk — "
+                        f"{mismatch}. Reads are safe; writes will be refused "
+                        f"(stale_board)."
+                    )
+                    required_actions.append(
+                        "Live board is stale vs the file on disk. Close and "
+                        "reopen the board in KiCad's PCB editor before any "
+                        "board write (reads are safe)."
+                    )
+    except Exception as exc:  # noqa: BLE001 — never let the coherence item block
+        coherent_status = "PASS"
+        coherent_mismatch = None
+        coherent_detail = f"Skipped (coherence check errored: {exc})."
+    coherent_item: dict[str, Any] = {
+        "item": "board_file_coherent",
+        "status": coherent_status,
+        "detail": coherent_detail,
+    }
+    if coherent_mismatch is not None:
+        coherent_item["mismatch"] = coherent_mismatch
+    checklist.append(coherent_item)
+
+    # ── 7. kicad-cli on PATH ─────────────────────────────────────────────────
     cli_path_str = shutil.which("kicad-cli")
     if not cli_path_str:
         cli = find_kicad_cli()
@@ -231,7 +289,7 @@ def run_startup_checklist() -> dict[str, Any]:
         ),
     })
 
-    # ── 7. Active project loaded ─────────────────────────────────────────────
+    # ── 8. Active project loaded ─────────────────────────────────────────────
     checklist.append({
         "item": "project_loaded",
         "status": "PASS" if pcb_editor_ok else "FAIL",
@@ -284,8 +342,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
              (WARN when reachable but version unknown; mirrors bridge_reachable when down)
           5. pcb_editor_open  — a board is READY (loaded, not still-loading) on a
              live path (FAIL blocks PCB ops)
-          6. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
-          7. project_loaded   — an active board path was resolved (FAIL blocks PCB ops)
+          6. board_file_coherent — live board matches the .kicad_pcb on disk (WARN
+             when stale: writes will refuse; close + reopen the board first)
+          7. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
+          8. project_loaded   — an active board path was resolved (FAIL blocks PCB ops)
 
         Returns:
             JSON with ready_for_pcb bool, checklist, and required_actions list.

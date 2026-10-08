@@ -13,7 +13,8 @@ re-implementation (REQ-ROLLUP-*).
 
 Artifact generation is gated on DRC passing, reproducing §6.3's
 ``export_gerbers``←``run_drc`` refuse-gate intent by ordering (REQ-VERDICT-003).
-A missing 3D model is an advisory, never blocking (Q7-d).
+A missing 3D model is an advisory, never blocking (Q7-d). A valid partial STEP
+export (F-DV13) is an advisory (``partial_step``), not a blocker.
 """
 
 from __future__ import annotations
@@ -67,7 +68,11 @@ def run_manufacturing_readiness_audit(
     """
     from kicad_mcp.tools.board import run_verify_board_size
     from kicad_mcp.tools.drc import run_check_courtyard_overlaps
-    from kicad_mcp.tools.export import run_verify_3d_models
+    from kicad_mcp.tools.export import (
+        STEP_PARTIAL_REMEDY,
+        run_verify_3d_models,
+        step_excluded_models,
+    )
 
     tol = {
         "panel_keepout_mm": panel_keepout_mm,
@@ -193,6 +198,25 @@ def run_manufacturing_readiness_audit(
                 value: Any = files[0] if files else None
             else:
                 value = res.get(result_field)
+            if res.get("partial"):
+                # F-DV13: a valid partial export (only step emits this today)
+                # IS generated — a usable artifact exists on disk at the
+                # reported path — and surfaces as a partial_step advisory,
+                # never a blocking issue.
+                artifacts.append({
+                    "name": name, "generated": True, "partial": True,
+                    surface_key: value,
+                    "detail": {"stderr": res.get("stderr"),
+                               "message": res.get("message")},
+                })
+                advisories.append({
+                    "type": "partial_step",
+                    "artifact": name,
+                    "stderr": res.get("stderr"),
+                    "excluded_models": step_excluded_models(board_path),
+                    "remedy": STEP_PARTIAL_REMEDY,
+                })
+                return
             entry: dict[str, Any] = {"name": name, "generated": ok, surface_key: value}
             if not ok:
                 entry["detail"] = {"message": res.get("message")}
@@ -259,8 +283,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Runs DRC, board-size verification (§6.5), courtyard-overlap, and 3D-model
         resolution (§6.6), then — only if DRC passes — exports Gerbers, drill,
         BOM, pick-and-place, and STEP into ``output_dir``. A missing 3D model is
-        an advisory, not a blocker. Reuses the same backend DRC/export ops as the
-        standalone tools; adds no new write surface.
+        an advisory, not a blocker; a valid partial STEP (F-DV13) is likewise an
+        advisory (``partial_step``), not a blocker. Reuses the same backend
+        DRC/export ops as the standalone tools; adds no new write surface.
 
         Args:
             board_path: Path to the .kicad_pcb file.

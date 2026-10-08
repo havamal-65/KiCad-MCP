@@ -1003,8 +1003,10 @@ class TestSaveRouting:
 
 def _coherent_disk_text(tracks: int = 1, vias: int = 1) -> str:
     """File text that coheres with ``write_board`` for the F-DV11 write guard:
-    U1 at (0, 0) and matching track/via/zone counts — clear_routes is a write
-    path, so a disk file that disagrees with the live board is refused."""
+    U1 at (0, 0), matching track/via/zone counts, and two Edge.Cuts graphics
+    whose bbox matches the fake board's shape union (F-DV11-R1) —
+    clear_routes is a write path, so a disk file that disagrees with the
+    live board is refused."""
     lines = [
         "(kicad_pcb",
         "\t(version 20241229)",
@@ -1024,6 +1026,13 @@ def _coherent_disk_text(tracks: int = 1, vias: int = 1) -> str:
         '\t(via (at 5 6) (size 0.8) (drill 0.4) (layers "F.Cu" "B.Cu") (net 1))'
         for _ in range(vias)
     )
+    # write_board's two Edge.Cuts shapes union to (10, 20)-(60, 50) mm
+    lines.extend([
+        '\t(gr_line (start 10 20) (end 60 20) (stroke (width 0.1) (type default)) '
+        '(layer "Edge.Cuts"))',
+        '\t(gr_line (start 10 20) (end 10 50) (stroke (width 0.1) (type default)) '
+        '(layer "Edge.Cuts"))',
+    ])
     lines.append(")")
     return "\n".join(lines) + "\n"
 

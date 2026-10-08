@@ -103,9 +103,22 @@ def _sync_tool():
                 if t.name == "sync_schematic_to_pcb")
 
 
+def _bridge_version_tuple(version: str) -> tuple[int, ...]:
+    """Numeric triple of a bridge version string like '2.7.0-zones'."""
+    numeric = version.split("-", 1)[0]
+    try:
+        return tuple(int(part) for part in numeric.split("."))
+    except ValueError:
+        return (0,)
+
+
 def test_live_sync_native_placement_and_nets(bridge_session, tmp_path: Path):
-    if bridge_session.get("bridge_version") != "2.6.0-sync":
-        pytest.skip("bridge < 2.6.0-sync — reinstall the bridge for NS tests")
+    version = bridge_session.get("bridge_version", "")
+    if _bridge_version_tuple(version) < (2, 6, 0):
+        pytest.skip(
+            f"bridge {version or '<unknown>'} < 2.6.0 — reinstall the bridge "
+            "for NS tests"
+        )
 
     sch = tmp_path / "ns_fixture.kicad_sch"
     sch.write_text(_FIXTURE_SCH, encoding="utf-8")

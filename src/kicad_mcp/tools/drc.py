@@ -638,6 +638,15 @@ _EDGE_NAME_TOKENS: tuple[str, ...] = (
     "Altech_AK",
 )
 
+# SW-2 (remediation build 2026-10-06): "Horizontal" is an orientation
+# adjective (how the part lies on the board), not a connector identifier —
+# every horizontally-mounted axial passive in the KiCad libraries carries it
+# (R_Axial, C_Axial, D_DO-xx diodes, cylinder fuse holders). A Signal-2
+# candidate whose ONLY token hit is a generic token is kept only when its
+# refdes class names a connector.
+_GENERIC_EDGE_TOKENS: frozenset[str] = frozenset({"Horizontal"})
+_CONNECTOR_REF_CLASSES: frozenset[str] = frozenset({"J", "P", "X", "XP", "XS", "CON"})
+
 
 def _classify_footprint_local_face(local_x: float, local_y: float) -> str:
     """Return the dominant compass direction of (local_x, local_y) in local frame.
@@ -843,6 +852,22 @@ def _name_matches_edge_connector(lib_id: str) -> str | None:
     return None
 
 
+def _ref_class(ref: str) -> str:
+    """Leading alphabetic run of a reference designator, uppercased.
+
+    "R12" → "R", "con3" → "CON", "XS2" → "XS".
+    """
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        i += 1
+    return ref[:i].upper()
+
+
+def _has_specific_edge_token(lib_id: str) -> bool:
+    """True when lib_id matches any non-generic _EDGE_NAME_TOKENS entry (SW-2)."""
+    return any(t in lib_id for t in _EDGE_NAME_TOKENS if t not in _GENERIC_EDGE_TOKENS)
+
+
 def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
     """Detect footprints that need outward-facing edge placement.
 
@@ -859,7 +884,11 @@ def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
          "Connector_Audio", "Connector_JST", "Connector_BarrelJack",
          "Connector_RJ", "Connector_HDMI", "Connector_Coaxial". When
          matched, mating face is inferred from the pad-cluster centroid:
-         the cable enters opposite the pad cluster.
+         the cable enters opposite the pad cluster. A candidate whose
+         ONLY token hit is the generic orientation word "Horizontal" is
+         kept only when its refdes class is a connector class
+         (J/P/X/XP/XS/CON) — axial passives carry "Horizontal" too and
+         are silently skipped (SW-2).
 
       3. (attr through_hole exclude_from_pos_files) combined with a
          J/P reference is a confidence-bump for hand-solder cable
@@ -953,6 +982,10 @@ def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
         matched_token = _name_matches_edge_connector(lib_id)
         if matched_token is None:
             continue
+        if (matched_token in _GENERIC_EDGE_TOKENS
+                and not _has_specific_edge_token(lib_id)
+                and _ref_class(ref) not in _CONNECTOR_REF_CLASSES):
+            continue  # SW-2: orientation adjective on a non-connector refdes — not a connector
         pad_centroid = _scan_footprint_pad_centroid(block)
         cy_center = _scan_footprint_courtyard_center(block)
         if pad_centroid is not None and cy_center is not None:
@@ -2040,6 +2073,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
           2. Footprint name heuristic — Horizontal, _Receptacle_, Connector_USB,
              Connector_Audio, Connector_JST, Connector_BarrelJack, etc. (medium)
 
+        A name match whose only token hit is the generic orientation word
+        'Horizontal' is kept only when the refdes class is a connector class
+        (J/P/X/XP/XS/CON) — axial passives are silently skipped (SW-2).
+
         Returns the mating-face direction in the footprint's local frame.
         The placed footprint's outer (at x y rotation) must be applied by
         the caller to convert to board frame — that's what
@@ -2073,7 +2110,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Connectors whose mating face could not be determined (medium-confidence
         name-matches without a usable pad centroid) are reported under
         'indeterminate' rather than failing the gate — the model should
-        review them manually.
+        review them manually. Generic-'Horizontal' name matches on
+        non-connector refdes classes are excluded upstream by
+        identify_edge_facing_connectors, so axial passives no longer
+        appear here (SW-2).
 
         Side effect: the result is written to <board>.validation_cache.json so
         that autoroute can refuse to start when the most recent orientation

@@ -285,3 +285,134 @@ def test_bt_audio_v1_detects_three_connectors():
     assert flagged["J3"]["confidence"] == "high", (
         f"J3 expected high (marker present), got {flagged['J3']['confidence']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# SW-2: generic "Horizontal" matches need a connector refdes class
+# ---------------------------------------------------------------------------
+
+_ECC83_AXIAL_LIB_ID = "Footprints:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+
+
+def _axial_block(
+    lib_id: str,
+    ref: str,
+    *,
+    courtyard: tuple[float, float, float, float] = (-1.05, -1.5, 8.67, 1.5),
+    pads: tuple[tuple[float, float], ...] = ((0.0, 0.0), (7.62, 0.0)),
+) -> str:
+    """A horizontally-mounted axial passive (ecc83 R_Axial geometry).
+
+    Symmetric pads whose centroid coincides with the courtyard center — the
+    pre-SW-2 'indeterminate' case.
+    """
+    cx0, cy0, cx1, cy1 = courtyard
+    lines = [
+        f'  (footprint "{lib_id}" (layer "F.Cu") (at 30.0 30.0)',
+        f'    (property "Reference" "{ref}" (at 0 0 0) (layer "F.Fab"))',
+        f'    (fp_rect (start {cx0} {cy0}) (end {cx1} {cy1}) '
+        f'(layer "F.CrtYd") (stroke (width 0.05)))',
+    ]
+    for pad_num, (px, py) in enumerate(pads, start=1):
+        lines.append(
+            f'    (pad "{pad_num}" thru_hole circle (at {px} {py}) '
+            f'(size 1.6 1.6) (drill 0.8) (layers "*.Cu" "*.Mask"))'
+        )
+    lines.append("  )")
+    return "\n".join(lines) + "\n"
+
+
+def test_axial_resistor_horizontal_not_flagged(tmp_path: Path):
+    """The ecc83 noise case: 'Horizontal' is an orientation adjective — a
+    refdes-class R axial resistor must not be flagged (but is still counted)."""
+    board = _write(tmp_path, "axial.kicad_pcb", _board(
+        _axial_block(_ECC83_AXIAL_LIB_ID, "R1"),
+    ))
+    result = _call_tool(board)
+    assert result["connectors"] == []
+    assert result["checked_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "ref,lib_id",
+    [
+        ("C1", "Capacitor_THT:C_Axial_L12.0mm_D7.5mm_P15.00mm_Horizontal"),
+        ("D1", "Diode_THT:D_DO-35_SOD27_P7.62mm_Horizontal"),
+        ("F1", "Fuse:Fuseholder_Cylinder-5x20mm_Schurter_0031_8201_Horizontal_Open"),
+        ("L1", "Inductor_THT:L_Axial_L5.3mm_D2.2mm_P10.16mm_Horizontal"),
+    ],
+)
+def test_axial_passive_refdes_classes_not_flagged(tmp_path: Path, ref, lib_id):
+    """The guard kills the whole noise class: C/D/F/L axial passives too."""
+    board = _write(tmp_path, f"axial_{ref}.kicad_pcb", _board(
+        _axial_block(lib_id, ref),
+    ))
+    result = _call_tool(board)
+    assert result["connectors"] == []
+
+
+@pytest.mark.parametrize("ref", ["P1", "X1", "CON1"])
+def test_horizontal_only_with_connector_refdes_still_flagged(tmp_path: Path, ref):
+    """A Horizontal-only match on a connector refdes class stays detected.
+
+    (J1 is already pinned by test_horizontal_name_match_no_marker_medium.)
+    """
+    board = _write(tmp_path, f"conn_{ref}.kicad_pcb", _board(
+        _fp_block(
+            "Connector_Generic:Custom_Horizontal_Connector",
+            ref, at_x=10.0, at_y=10.0,
+            pads=((0.0, -3.0), (2.0, -3.0)),
+        ),
+    ))
+    result = _call_tool(board)
+    assert len(result["connectors"]) == 1
+    c = result["connectors"][0]
+    assert c["ref"] == ref
+    assert c["confidence"] == "medium"
+    assert "name match 'Horizontal'" in c["evidence"]
+
+
+def test_specific_token_with_passive_refdes_still_flagged(tmp_path: Path):
+    """Footprint identity outranks a wrong refdes: a TerminalBlock lib_id on
+    ref R1 is still flagged — the guard fires only on generic-only matches."""
+    board = _write(tmp_path, "tb_r1.kicad_pcb", _board(
+        _fp_block(
+            "TerminalBlock_Altech:Altech_AK300_1x02_P5.00mm_45-Degree",
+            "R1", at_x=10.0, at_y=10.0,
+            pads=((0.0, 0.0), (5.0, 0.0)),
+        ),
+    ))
+    result = _call_tool(board)
+    assert len(result["connectors"]) == 1
+    assert result["connectors"][0]["ref"] == "R1"
+
+
+def test_generic_match_rescued_by_specific_token_elsewhere_in_name(tmp_path: Path):
+    """The guard's rescue branch: a lib_id whose FIRST token hit is the generic
+    'Horizontal' (first-token-wins) but which carries a specific connector
+    token elsewhere ('Connector_JST') stays flagged even on a passive ref —
+    _has_specific_edge_token vetoes the skip."""
+    board = _write(tmp_path, "rescued.kicad_pcb", _board(
+        _fp_block(
+            "Connector_JST:JST_XH_Horizontal",
+            "R1", at_x=10.0, at_y=10.0,
+            pads=((0.0, -3.0), (2.0, -3.0)),
+        ),
+    ))
+    result = _call_tool(board)
+    assert len(result["connectors"]) == 1
+    c = result["connectors"][0]
+    assert c["ref"] == "R1"
+    # First-token-wins: the generic token is genuinely the matched one.
+    assert "name match 'Horizontal'" in c["evidence"]
+
+
+def test_ref_class_extraction():
+    """_ref_class returns the leading alphabetic run, uppercased."""
+    from kicad_mcp.tools.drc import _ref_class
+
+    assert _ref_class("R12") == "R"
+    assert _ref_class("CON3") == "CON"
+    assert _ref_class("J1") == "J"
+    assert _ref_class("r5") == "R"
+    assert _ref_class("XS2") == "XS"

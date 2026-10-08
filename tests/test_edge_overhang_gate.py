@@ -137,6 +137,23 @@ def test_indeterminate_face_falls_back_to_crossed_edge(tmp_path: Path):
     assert "fallback" in exemptions[0]["evidence"]
 
 
+def test_overhanging_axial_resistor_not_exempted(tmp_path: Path):
+    """SW-2 closes the latent masking hole: an axial resistor whose courtyard
+    crosses exactly ONE board edge is no longer a "connector" to the F2-Q2
+    fallback — it stays a genuine out_of_outline violation. (The existing
+    test_indeterminate_face_falls_back_to_crossed_edge pins that the fallback
+    survives for real J-ref connectors.)"""
+    board = _write(tmp_path, _board({
+        "ref": "R1", "at_x": 40.0, "at_y": 69.0,
+        "lib_id": "Footprints:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+        "courtyard": (-1.05, -1.5, 8.67, 1.5),   # board y 67.5..70.5 → south only
+        "pads": [(0.0, 0.0), (7.62, 0.0)],
+    }))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 1, metric
+    assert "edge_overhang_exemptions" not in metric
+
+
 def test_mixed_board_counts_only_genuine_offenders(tmp_path: Path):
     """Exempt connector + genuine offender on one board: count reflects only
     the real violation and the exemption is reported alongside it."""

@@ -198,6 +198,62 @@ def run_verify_3d_models(board_path: Path) -> dict[str, Any]:
     return result
 
 
+# F-DV13 partial-STEP remedy — the exact advisory text, shared by the
+# export_step tool and the manufacturing audit's partial_step advisory.
+STEP_PARTIAL_REMEDY = (
+    "The STEP file on disk is valid and usable; it omits the models listed in "
+    "excluded_models. To get a complete export, provide a STEP/STP version of "
+    "each omitted model next to its .wrl (kicad-cli --subst-models picks up "
+    "same-name siblings), or accept the partial file."
+)
+
+
+def step_excluded_models(board_path: Path) -> list[dict[str, Any]]:
+    """Models a kicad-cli STEP export drops, as best-effort advisory entries.
+
+    A heuristic mirror of kicad-cli's own resolver (F-DV13): it informs the
+    partial-export report, it never participates in the partial determination.
+    Reuses the §6.6 walk (``FileBoardOps.get_components`` →
+    ``_resolve_model_path`` → sibling-aware existence checks). Per excluded
+    model it emits ``{ref, footprint, model_path, reason}`` where reason is:
+
+    - ``"vrml_only"`` — the path resolves but only a ``.wrl`` exists, no
+      ``.step``/``.stp`` sibling (mesh-only, unconvertible to STEP);
+    - ``"model_missing"`` — unresolved variable or file not found with no
+      sibling.
+
+    Models that resolve to an existing ``.step``/``.stp`` (directly or via
+    sibling) are not listed. Capped at 25 entries (advisory list).
+    """
+    from kicad_mcp.backends.file_backend import FileBoardOps
+
+    project_dir = board_path.parent
+    components = FileBoardOps(project_dir=str(project_dir)).get_components(board_path)
+
+    excluded: list[dict[str, Any]] = []
+    for comp in components:
+        ref = comp.get("reference", "?")
+        fp = comp.get("footprint", "?")
+        for model_path in comp.get("models", []):
+            resolved, _var = _resolve_model_path(model_path, project_dir)
+            if resolved is None:
+                excluded.append({"ref": ref, "footprint": fp,
+                                 "model_path": model_path,
+                                 "reason": "model_missing"})
+                continue
+            if any(resolved.with_suffix(ext).exists() for ext in (".step", ".stp")):
+                continue  # a STEP-format model is present — included in the export
+            if resolved.with_suffix(".wrl").exists():
+                excluded.append({"ref": ref, "footprint": fp,
+                                 "model_path": model_path,
+                                 "reason": "vrml_only"})
+            elif not resolved.exists():
+                excluded.append({"ref": ref, "footprint": fp,
+                                 "model_path": model_path,
+                                 "reason": "model_missing"})
+    return excluded[:25]
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register export tools on the MCP server."""
 
@@ -649,12 +705,19 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Generates a STEP file suitable for mechanical integration and 3D viewer import.
         Requires kicad-cli (installed with KiCad).
 
+        Status is three-way: "success" (clean export), "partial" (kicad-cli
+        exited nonzero — e.g. VRML-only 3D models it cannot convert — but
+        wrote a valid STEP file; the payload adds excluded_models and a
+        remedy), or "error" (no usable STEP file produced).
+
         Args:
             path: Path to .kicad_pcb file.
             output: Output .step file path. Defaults to same directory as board with .step extension.
 
         Returns:
-            JSON with export result and output file path.
+            JSON with export result and output file path. A partial result
+            carries partial: true, file_size_bytes, stderr, excluded_models
+            [{ref, footprint, model_path, reason}], and remedy.
         """
         p = validate_kicad_path(path, ".kicad_pcb")
         out = Path(output) if output else p.with_suffix(".step")
@@ -663,8 +726,22 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             backend.save_board(p)
             ops = backend.get_export_ops()
             result = ops.export_step(p, out)
-            change_log.record("export_step", {"path": path, "output": str(out)})
-            return json.dumps({"status": "success", **result}, indent=2)
+            if result.get("success"):
+                change_log.record("export_step", {"path": path, "output": str(out)})
+                return json.dumps({"status": "success", **result}, indent=2)
+            if result.get("partial"):
+                payload: dict[str, Any] = {"status": "partial", **result}
+                # Best-effort advisory — a failing walk never fails the report.
+                try:
+                    payload["excluded_models"] = step_excluded_models(p)
+                except Exception as exc:  # noqa: BLE001 — advisory must not raise
+                    payload["excluded_models"] = []
+                    payload["excluded_models_error"] = str(exc)
+                payload["remedy"] = STEP_PARTIAL_REMEDY
+                # An artifact was produced — record partial like success.
+                change_log.record("export_step", {"path": path, "output": str(out)})
+                return json.dumps(payload, indent=2)
+            return json.dumps({"status": "error", **result}, indent=2)
         except Exception as e:
             return json.dumps({
                 "status": "error",

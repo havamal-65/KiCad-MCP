@@ -102,6 +102,45 @@ _FOOTPRINT_AT_RE = re.compile(
     re.S,
 )
 _COHERENCE_TOL_NM = 1000  # 1 µm — well under any real placement delta
+_EDGE_BBOX_TOL_NM = 500_000  # 0.5 mm — absorbs stroke/arc bbox modeling
+_REOPEN_REMEDY = (
+    "Close and reopen the board in KiCad's PCB editor "
+    "so the live board matches the file, then retry."
+)
+
+
+def _stat_mtime_ns(path: Path) -> int | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _edge_cuts_live(board: Any) -> tuple[int, bool, tuple[int, int, int, int] | None]:
+    """(count, has_arc, bbox_nm) of live board-level Edge.Cuts shapes.
+
+    Shapes are board.get_shapes() filtered to BoardLayer.BL_Edge_Cuts,
+    excluding kbt.BoardBezier instances (the file regex cannot count
+    beziers, so both sides ignore them — symmetric blind spot).
+    has_arc — any kbt.BoardArc among them. bbox_nm — the aggregate
+    (min_x, min_y, max_x, max_y) from board.get_item_bounding_box(edges)
+    using the same None-filtering union as _edge_bbox_mm, or None when
+    there are no shapes or no usable boxes.
+    """
+    edges = [s for s in board.get_shapes()
+             if s.layer == BoardLayer.BL_Edge_Cuts
+             and not isinstance(s, kbt.BoardBezier)]
+    if not edges:
+        return 0, False, None
+    has_arc = any(isinstance(s, kbt.BoardArc) for s in edges)
+    boxes = [b for b in board.get_item_bounding_box(edges) if b is not None]
+    if not boxes:
+        return len(edges), has_arc, None
+    x0 = min(b.pos.x for b in boxes)
+    y0 = min(b.pos.y for b in boxes)
+    x1 = max(b.pos.x + b.size.x for b in boxes)
+    y1 = max(b.pos.y + b.size.y for b in boxes)
+    return len(edges), has_arc, (x0, y0, x1, y1)
 
 
 def _coherence_mismatch(board: Any, path: Path) -> str | None:
@@ -109,7 +148,9 @@ def _coherence_mismatch(board: Any, path: Path) -> str | None:
 
     Returns a human-readable description of the first disagreement, or None
     when live and file agree. Checked: footprint reference set + positions
-    (1 µm tolerance), track count (segments + arcs), via count, zone count.
+    (1 µm tolerance), track count (segments + arcs), via count, zone count,
+    Edge.Cuts graphic count + aggregate bounding box (0.5 mm tolerance;
+    bbox skipped for arc outlines).
     A missing/unreadable file is not a mismatch (new board being created).
     """
     try:
@@ -155,6 +196,31 @@ def _coherence_mismatch(board: Any, path: Path) -> str | None:
     live_zones = len(board.get_zones())
     if file_zones != live_zones:
         return f"zone count {live_zones} live vs {file_zones} in the file"
+
+    # F-DV11-R1: board-level Edge.Cuts graphics (count + aggregate bbox) —
+    # the one board graphic whose loss invalidates placement/routing work.
+    from kicad_mcp.backends.file_backend import edge_cuts_graphics
+
+    file_count, file_has_arc, file_bbox = edge_cuts_graphics(text)
+    live_count, live_has_arc, live_bbox = _edge_cuts_live(board)
+    if file_count != live_count:
+        return f"edge-cuts graphic count {live_count} live vs {file_count} in the file"
+    # The file-side bbox is the hull of an arc's start/mid/end points; the
+    # true arc can bulge past that hull by ~its radius, so no fixed tolerance
+    # makes bbox equality safe for arc outlines — counts stay exact for arcs.
+    # An unmeasurable side (bbox None) skips the check — never guess a mismatch.
+    if (file_count > 0 and not file_has_arc and not live_has_arc
+            and file_bbox is not None and live_bbox is not None):
+        fx0, fy0, fx1, fy1 = (round(v * 1e6) for v in file_bbox)
+        lx0, ly0, lx1, ly1 = live_bbox
+        if any(abs(fv - lv) > _EDGE_BBOX_TOL_NM
+               for fv, lv in ((fx0, lx0), (fy0, ly0), (fx1, lx1), (fy1, ly1))):
+            return (
+                f"edge-cuts outline bbox ({lx0 / 1e6:.4f}, {ly0 / 1e6:.4f})-"
+                f"({lx1 / 1e6:.4f}, {ly1 / 1e6:.4f}) mm live vs "
+                f"({fx0 / 1e6:.4f}, {fy0 / 1e6:.4f})-"
+                f"({fx1 / 1e6:.4f}, {fy1 / 1e6:.4f}) mm in the file"
+            )
     return None
 
 
@@ -199,11 +265,23 @@ def _bridge_save(path: Path) -> bool:
     would be refused as stale (live-caught in the S1 step-7 batch). So the
     post-commit flush prefers the bridge whenever it is reachable; both paths
     save the same live in-memory board.
+
+    A bridge ``stale_board`` refusal (#14C) re-raises as ``IPCStaleBoardError``
+    (F-DV11-R3) instead of returning False — falling back to the direct kipy
+    save would commit exactly the clobber the bridge just refused.
     """
     try:
-        from kicad_mcp.backends.plugin_backend import _get_op_timeout, _tcp_call
+        from kicad_mcp.backends.plugin_backend import (
+            StaleBoardError, _get_op_timeout, _tcp_call,
+        )
         _tcp_call("save_board", _get_op_timeout(), path=str(path))
         return True
+    except StaleBoardError as exc:
+        raise IPCStaleBoardError(
+            f"Board write refused (stale_board): the bridge refused the "
+            f"post-commit save of {Path(path).name} — {exc}",
+            remedy=_REOPEN_REMEDY,
+        ) from exc
     except Exception:  # noqa: BLE001 — bridge down/refused: IPC-only session
         return False
 
@@ -213,6 +291,9 @@ class IPCBoardOps(BoardOps):
 
     def __init__(self, connection: IPCConnection) -> None:
         self._conn = connection
+        # F-DV11-R3: disk mtime recorded when a coherence check passes, so the
+        # post-commit save can detect a writer that raced this operation.
+        self._disk_baseline: dict[str, int | None] = {}
 
     # -- Board resolution ------------------------------------------------------
 
@@ -246,9 +327,9 @@ class IPCBoardOps(BoardOps):
                     f"Board write refused (stale_board): the board KiCad holds "
                     f"in memory disagrees with {Path(path).name} on disk — "
                     f"{mismatch}. Writing now would overwrite the newer state.",
-                    remedy="Close and reopen the board in KiCad's PCB editor "
-                           "so the live board matches the file, then retry.",
+                    remedy=_REOPEN_REMEDY,
                 )
+            self._disk_baseline[os.path.normcase(str(path))] = _stat_mtime_ns(path)
         return board
 
     # -- Transactional write pattern (REQ-IPC-4, REQ-IPC-6) --------------------
@@ -286,9 +367,30 @@ class IPCBoardOps(BoardOps):
         return result
 
     def _save(self, path: Path, board: Board) -> None:
-        """Flush the live board to disk — bridge-first (see _bridge_save)."""
+        """Flush the live board to disk — bridge-first (see _bridge_save).
+
+        Refuses when the file changed on disk after this op's coherence
+        check (F-DV11-R3): the post-commit save would overwrite whatever
+        the racing writer produced. On a refusal the commit has already
+        been pushed to the live board, so live and file stay diverged
+        until the board is reopened — the next write's coherence check
+        refuses consistently, the file (newer state) is preserved, and
+        the unsaved mutation is re-run after reopening. A missing
+        baseline skips verification (defensive only: every write path
+        records one via ``_board(check_coherence=True)`` first).
+        """
+        key = os.path.normcase(str(path))
+        if key in self._disk_baseline and _stat_mtime_ns(path) != self._disk_baseline[key]:
+            raise IPCStaleBoardError(
+                f"Board write refused (stale_board): {Path(path).name} "
+                f"changed on disk after the coherence check (another "
+                f"writer raced this operation); the post-commit save "
+                f"was refused to avoid overwriting the newer file.",
+                remedy=_REOPEN_REMEDY,
+            )
         if not _bridge_save(path):
             _save_board(board)
+        self._disk_baseline[key] = _stat_mtime_ns(path)
 
     # -- kipy lookup helpers -----------------------------------------------------
 

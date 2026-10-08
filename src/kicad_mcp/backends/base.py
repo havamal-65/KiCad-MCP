@@ -227,11 +227,16 @@ class SchematicOps(ABC):
         mirror: str | None = None, footprint: str = "",
         properties: dict[str, str] | None = None,
         unit: int = 1,
+        in_bom: bool = True, on_board: bool = True,
+        dnp: bool = False, exclude_from_sim: bool = False,
     ) -> dict[str, Any]:
         """Add a component symbol to the schematic.
 
         ``unit`` places one unit of a multi-unit symbol; placing another unit
         is another call with the same reference and lib_id (RW-S1 C1).
+        ``in_bom`` / ``on_board`` / ``dnp`` / ``exclude_from_sim`` author the
+        symbol's bare attribute flags (F-DV12); the defaults reproduce
+        today's output byte for byte.
         """
         raise NotImplementedError("This backend does not support schematic modification")
 
@@ -297,6 +302,20 @@ class SchematicOps(ABC):
         """Update or add a property on a placed schematic symbol."""
         raise NotImplementedError("This backend does not support schematic modification")
 
+    def set_symbol_attributes(
+        self, path: Path, reference: str, *,
+        in_bom: bool | None = None,
+        on_board: bool | None = None,
+        dnp: bool | None = None,
+        exclude_from_sim: bool | None = None,
+    ) -> dict[str, Any]:
+        """Set the bare symbol attribute flags on a placed symbol (F-DV12).
+
+        The flags are not (property ...) clauses — update_component_property
+        cannot reach them. ``None`` leaves a flag unchanged.
+        """
+        raise NotImplementedError("This backend does not support schematic modification")
+
     def remove_wire(
         self, path: Path, start_x: float, start_y: float,
         end_x: float, end_y: float,
@@ -358,7 +377,8 @@ class SchematicOps(ABC):
 
         components: list of dicts matching add_component's parameters
                     (lib_id, reference, value, x, y, optional rotation,
-                    mirror, footprint, properties).
+                    mirror, footprint, properties, in_bom, on_board, dnp,
+                    exclude_from_sim).
         Returns {"placed": [...], "failed": [...]}.
         """
         raise NotImplementedError("This backend does not support add_components_bulk")

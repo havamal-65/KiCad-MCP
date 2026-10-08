@@ -209,11 +209,19 @@ def run_manufacturing_readiness_audit(
                     "detail": {"stderr": res.get("stderr"),
                                "message": res.get("message")},
                 })
+                try:
+                    excluded = step_excluded_models(board_path)
+                except Exception as adv_exc:  # noqa: BLE001 — RB-RES2: advisory detail must never abort the audit
+                    logger.warning(
+                        "manufacturing audit: step_excluded_models failed: %s",
+                        adv_exc,
+                    )
+                    excluded = None
                 advisories.append({
                     "type": "partial_step",
                     "artifact": name,
                     "stderr": res.get("stderr"),
-                    "excluded_models": step_excluded_models(board_path),
+                    "excluded_models": excluded,
                     "remedy": STEP_PARTIAL_REMEDY,
                 })
                 return

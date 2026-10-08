@@ -44,12 +44,32 @@ SCH_FOOTER = """\
 )
 """
 
-# Bare symbol entry for a generic Device:R — presence in lib_symbols is
+# Symbol entry for a generic Device:R — presence in lib_symbols is
 # enough to short-circuit _ensure_lib_symbol_cached. The cached definition
-# deliberately carries its own (in_bom yes) token (foundation 8).
+# deliberately carries its own (in_bom yes) token (foundation 8). The unit
+# sub-symbols (R_0_1 body, R_1_1 pins) are required by kicad-skip, whose
+# LibSymbol.__init__ accesses a child (symbol ...) unconditionally — a bare
+# entry crashes it and silently sends read_schematic down the sexp fallback
+# (RB-RES3).
 DEVICE_R_LIB_SYMBOL = """\
     (symbol "Device:R" (pin_numbers (hide no)) (pin_names (offset 0))
       (exclude_from_sim no) (in_bom yes) (on_board yes)
+      (symbol "R_0_1"
+        (rectangle (start -1.016 -2.54) (end 1.016 2.54)
+          (stroke (width 0.254) (type default))
+          (fill (type none))
+        )
+      )
+      (symbol "R_1_1"
+        (pin passive line (at 0 3.81 270) (length 1.27)
+          (name "~" (effects (font (size 1.27 1.27))))
+          (number "1" (effects (font (size 1.27 1.27))))
+        )
+        (pin passive line (at 0 -3.81 90) (length 1.27)
+          (name "~" (effects (font (size 1.27 1.27))))
+          (number "2" (effects (font (size 1.27 1.27))))
+        )
+      )
     )
 """
 
@@ -358,6 +378,18 @@ def _symbol_row(read_result: dict, ref: str) -> dict:
     )
 
 
+def _read_with_skip_strict(ops: FileSchematicOps, sch: Path) -> dict:
+    """The kicad-skip read leg with NO silent fallback (RB-RES3).
+
+    read_schematic() falls back to the sexp parser on any skip exception,
+    so an equivalence test built on it can silently compare sexp against
+    sexp. This parses with skip.Schematic directly — a skip crash fails
+    the test instead of hiding behind the fallback.
+    """
+    skip = pytest.importorskip("skip")
+    return ops._read_with_skip(skip.Schematic(str(sch)), sch)
+
+
 def test_read_schematic_roundtrip_attrs(tmp_path: Path):
     sch = _make_schematic(tmp_path)
     ops = FileSchematicOps()
@@ -365,7 +397,7 @@ def test_read_schematic_roundtrip_attrs(tmp_path: Path):
         sch, "Device:R", "R1", "10k", 100, 50, in_bom=False, dnp=True,
     )
 
-    for read_result in (ops.read_schematic(sch), ops._read_with_sexp(sch)):
+    for read_result in (_read_with_skip_strict(ops, sch), ops._read_with_sexp(sch)):
         row = _symbol_row(read_result, "R1")
         assert row["in_bom"] is False
         assert row["dnp"] is True
@@ -378,7 +410,7 @@ def test_read_schematic_attr_defaults_when_absent(tmp_path: Path):
     sch = _make_schematic(tmp_path, instances=_instance("R1", attr_line=""))
     ops = FileSchematicOps()
 
-    for read_result in (ops.read_schematic(sch), ops._read_with_sexp(sch)):
+    for read_result in (_read_with_skip_strict(ops, sch), ops._read_with_sexp(sch)):
         row = _symbol_row(read_result, "R1")
         assert row["in_bom"] is True
         assert row["on_board"] is True

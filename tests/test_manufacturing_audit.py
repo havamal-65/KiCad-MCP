@@ -330,6 +330,29 @@ def test_audit_partial_step_ready_to_ship_true(tmp_path, monkeypatch):
     assert result["blocking_issues"] == []
 
 
+def test_audit_partial_step_survives_excluded_models_failure(tmp_path, monkeypatch):
+    """RB-RES2: a crash in the step_excluded_models advisory helper must not
+    abort the audit — the advisory still lands, with excluded_models None."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    ops.export_step.return_value = dict(_STEP_PARTIAL)
+    backend = _backend(_DRC_PASS, export_ops=ops)
+
+    def _boom(_path):
+        raise RuntimeError("parse exploded")
+
+    monkeypatch.setattr("kicad_mcp.tools.export.step_excluded_models", _boom)
+
+    result = run_manufacturing_readiness_audit(backend, _board(tmp_path), tmp_path / "out")
+
+    advs = [a for a in result["advisories"] if a["type"] == "partial_step"]
+    assert len(advs) == 1
+    assert advs[0]["excluded_models"] is None
+    assert advs[0]["remedy"] == _STEP_PARTIAL_REMEDY
+    assert result["ready_to_ship"] is True
+    assert result["blocking_issues"] == []
+
+
 def test_audit_bare_step_failure_still_blocks(tmp_path, monkeypatch):
     """Regression pin: a bare failure (no partial key) keeps today's behavior —
     generated False, blocking issue, ready_to_ship False."""

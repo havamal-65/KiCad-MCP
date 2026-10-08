@@ -8,7 +8,9 @@ snapshot dict + the picker list, so it unit-tests without KiCad or a window.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 # The 6 authoritative startup checks, in display order (same keys the monitor's
@@ -32,6 +34,37 @@ _BACKEND_KEY = {
 }
 
 BRIDGE_PORT = 9760
+
+# U5 VS-5: the board's authoring KiCad version, from the file head.
+_GENERATOR_VERSION_RE = re.compile(r'\(generator_version\s+"(\d+)(?:\.\d+)*"')
+
+
+def board_format_hint(board: Path | None, selected_version: str | None) -> str | None:
+    """K10 HLRP Q3 format hint: the selected board was saved by a NEWER KiCad
+    major than the selected version (older KiCad cannot open it). Hint only.
+
+    Tolerant by design — missing board, unreadable file, absent
+    ``generator_version`` stamp, or unparsable versions all return None.
+    Reads only the file head (the stamp sits in the first few lines).
+    """
+    if board is None or not selected_version:
+        return None
+    try:
+        with open(board, encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(2048)
+        m = _GENERATOR_VERSION_RE.search(head)
+        if not m:
+            return None
+        saved_major = int(m.group(1))
+        selected_major = int(selected_version.split(".")[0])
+    except (OSError, ValueError):
+        return None
+    if saved_major > selected_major:
+        return (
+            f"{board.name} was saved by KiCad {saved_major} — "
+            f"KiCad {selected_version} cannot open it"
+        )
+    return None
 
 
 def _avail(value: Any) -> str:

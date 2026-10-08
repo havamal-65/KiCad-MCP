@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -36,6 +37,10 @@ _UI_HTML = Path(__file__).resolve().parent / "ui" / "index.html"
 _MONITOR_PATH = Path(__file__).resolve().parents[1] / "scripts" / "mcp_health_monitor.py"
 
 _STATUS_COLOR = {"ok": "#42d17f", "warn": "#f2b13c", "down": "#f2647a"}
+
+# U5 AS-3: the singleton mutex handle — module-level so it lives as long as
+# the process (the OS releases it on exit).
+_MUTEX_HANDLE: Any = None
 
 
 def _load_monitor() -> Any:
@@ -128,10 +133,14 @@ class LauncherApi:
         self._selected = 0
         self._busy_phase: str | None = None
         self._busy_until = 0.0
+        # U5 VS-2: apply the persisted KiCad version pin BEFORE anything
+        # resolves pcbnew/kicad-cli paths. A persisted version that is no
+        # longer installed is cleared (the resolver refuses silent pins).
+        self._apply_version_pin(self.settings.get("kicad_version"))
         self._m = _load_monitor()
         self._poller = self._m.Poller()
         self._poller.start()
-        # Cached environment facts (don't change while running).
+        # Cached environment facts (refreshed on a version switch).
         from kicad_mcp.utils.platform_helper import find_pcbnew_executable
         import shutil
 
@@ -285,6 +294,14 @@ class LauncherApi:
         st["variant"] = self.settings["variant"]
         st["trayAvailable"] = self._tray.available
         st["diags"] = self._diags(processes.mcp_http_running(self.cfg))
+        # U5: version switcher + auto-surface state.
+        from kicad_mcp.utils import kicad_version as kv
+
+        pref = kv.preferred()
+        st["kicadVersions"] = [i.version for i in kv.installed()]
+        st["kicadVersion"] = pref.version if pref else None
+        st["versionNotes"] = self._version_notes()
+        st["autoSurface"] = bool(self.settings.get("auto_surface", True))
         # Tray color + bridge-transition notification.
         severity = (snap or {}).get("severity") or ("ok" if st["phase"] == "running" else "warn")
         self._tray.set_status(severity, f"KiCad-MCP — {(snap or {}).get('overall', 'starting')}")
@@ -305,6 +322,73 @@ class LauncherApi:
             pass
         self._poller.refresh_now()
         return {"ok": True}
+
+    # ------------------------------------------------------------- U5 version
+    def _apply_version_pin(self, version: Any) -> None:
+        """Pin the resolver + env to *version* ('' / None = newest default).
+
+        The env var makes spawned children (the MCP server) inherit the pin;
+        the in-process pin steers this process's own discovery. A persisted
+        version that is no longer installed is cleared from settings.
+        """
+        from kicad_mcp.utils import kicad_version as kv
+
+        if not version:
+            kv.set_preferred(None)
+            os.environ.pop(kv.ENV_PREFERRED, None)
+            return
+        if str(version) not in {i.version for i in kv.installed()}:
+            self.settings = settings.save_settings(self.cfg, kicad_version=None)
+            return
+        kv.set_preferred(str(version))
+        os.environ[kv.ENV_PREFERRED] = str(version)
+
+    def _version_notes(self) -> list[str]:
+        """Non-blocking warnings for the selected version (VS-4 + VS-5)."""
+        from kicad_mcp.utils import kicad_version as kv
+
+        pref = kv.preferred()
+        if pref is None:
+            return []
+        notes: list[str] = []
+        others = [v for v in processes.running_pcbnew_versions() if v != pref.version]
+        if others:
+            notes.append(
+                f"KiCad {others[0]} is open and holds the bridge port — "
+                f"close it before starting KiCad {pref.version}"
+            )
+        hint = dashboard.board_format_hint(self._current_board(), pref.version)
+        if hint:
+            notes.append(hint)
+        return notes
+
+    def set_kicad_version(self, version: Any) -> dict[str, Any]:
+        """U5 VS-3: select the KiCad install everything targets."""
+        from kicad_mcp.utils import kicad_version as kv
+        from kicad_mcp.utils.platform_helper import find_pcbnew_executable
+
+        v = str(version).strip() if version else ""
+        if v and v not in {i.version for i in kv.installed()}:
+            return {"ok": False, "messages": [f"KiCad {v} is not installed"]}
+        self._apply_version_pin(v or None)
+        self.settings = settings.save_settings(self.cfg, kicad_version=v or None)
+        self._pcbnew_exe = find_pcbnew_executable()
+        self._setup_cache = None  # wizard rows re-target the selected version
+        pref = kv.preferred()
+        label = pref.version if pref else "none found"
+        msgs = [f"KiCad version: {label}" + ("" if v else " (newest)")]
+        msgs += self._version_notes()
+        return {"ok": True, "version": label, "messages": msgs}
+
+    def set_auto_surface(self, enabled: Any) -> dict[str, Any]:
+        """U5 AS-3: toggle server-started auto-surfacing of this window."""
+        val = bool(enabled)
+        self.settings = settings.save_settings(self.cfg, auto_surface=val)
+        return {
+            "ok": True,
+            "autoSurface": val,
+            "messages": [f"auto-surface {'on' if val else 'off'}"],
+        }
 
     def set_variant(self, variant: Any) -> dict[str, Any]:
         v = "bento" if variant == "bento" else "console"
@@ -536,6 +620,15 @@ def _webview2_missing_dialog() -> None:
 
 
 def main() -> None:
+    # U5 AS-3: hold the singleton mutex for the window's lifetime so a
+    # server-side auto-surface never opens a second launcher. If another
+    # launcher already holds it, exit quietly — that window is the product.
+    from kicad_mcp.utils.launcher_surface import acquire_launcher_mutex
+
+    global _MUTEX_HANDLE
+    _MUTEX_HANDLE = acquire_launcher_mutex()
+    if _MUTEX_HANDLE is None and sys.platform == "win32":
+        raise SystemExit(0)
     if not _webview2_present():
         _webview2_missing_dialog()
         raise SystemExit(1)

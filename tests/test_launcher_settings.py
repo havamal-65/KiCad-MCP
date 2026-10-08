@@ -129,3 +129,29 @@ def test_matches_server_port_aware():
     # stdio server (no streamable-http) never matches
     stdio = ["python", "-m", "kicad_mcp_plugin"]
     assert _matches_server(stdio, 8765) is False
+
+
+# --- U5 settings keys (kicad_version / auto_surface) -------------------------
+
+def test_u5_keys_default(tmp_path):
+    st = settings.load_settings(_cfg(tmp_path))
+    assert st["kicad_version"] is None
+    assert st["auto_surface"] is True
+
+
+def test_kicad_version_persist_and_validate(tmp_path):
+    cfg = _cfg(tmp_path)
+    settings.save_settings(cfg, kicad_version="10.0")
+    assert settings.load_settings(cfg)["kicad_version"] == "10.0"
+    settings.save_settings(cfg, kicad_version="banana")       # not x.y
+    assert settings.load_settings(cfg)["kicad_version"] is None
+    settings.save_settings(cfg, kicad_version=10.0)           # not a str
+    assert settings.load_settings(cfg)["kicad_version"] is None
+
+
+def test_auto_surface_persist_and_validate(tmp_path):
+    cfg = _cfg(tmp_path)
+    settings.save_settings(cfg, auto_surface=False)
+    assert settings.load_settings(cfg)["auto_surface"] is False
+    settings.save_settings(cfg, auto_surface="yes")           # not a bool
+    assert settings.load_settings(cfg)["auto_surface"] is True

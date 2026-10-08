@@ -132,6 +132,8 @@ function renderVals(st){
     backends, activity, activityRate, logs, g,
     startLabel, startDisabled, restartDisabled, stopDisabled,
     diags: st.diags||[], variant: st.variant||'console', trayAvailable: !!st.trayAvailable,
+    kicadVersions: st.kicadVersions||[], kicadVersion: st.kicadVersion||'',
+    versionNotes: st.versionNotes||[], autoSurface: st.autoSurface!==false,
     projects: st.projects||[], projectIndex: st.projectIndex||0, projectPath: st.projectPath||''};
 }
 
@@ -159,8 +161,25 @@ function fragToolbar(v, pad){
     <button class="tool" data-act="copyCfg">Copy MCP config</button>
     <button class="tool" data-act="reinstallBridge">Reinstall bridge</button>
     <button class="tool" data-act="openSetup">Setup</button>
+    <button class="tool" data-act="${v.autoSurface?'autoSurfaceOff':'autoSurfaceOn'}">Auto-surface: ${v.autoSurface?'on':'off'}</button>
     ${layout}${tray}
   </div>`;
+}
+
+/* U5 VS-6: KiCad version picker — hidden when fewer than 2 installs. */
+function fragVersionSelect(v){
+  if((v.kicadVersions||[]).length < 2) return '';
+  const opts = v.kicadVersions.map(k=>`<option value="${esc(k)}" ${k===v.kicadVersion?'selected':''}>KiCad ${esc(k)}</option>`).join('');
+  return `<select id="kver" class="sel" title="KiCad version the whole stack targets" style="flex:none;background:#161b26;border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:9px 10px;color:#e6e9ef;font:500 12.5px/1 var(--sans);cursor:pointer">${opts}</select>`;
+}
+
+/* U5 VS-4/VS-5: advisory notes (port collision, board format) — amber, non-blocking. */
+function fragVersionNotes(v, margin){
+  if(!(v.versionNotes||[]).length) return '';
+  return v.versionNotes.map(n=>`<div style="margin:${margin};background:${AMBER}12;border:1px solid ${AMBER}38;border-radius:11px;padding:10px 14px;display:flex;align-items:center;gap:11px">
+    <span style="width:14px;height:14px;border-radius:50%;background:${AMBER};display:flex;align-items:center;justify-content:center;font:700 10px var(--sans);color:#0d1117;flex:none">!</span>
+    <span style="flex:1;min-width:0;font:400 12px/1.5 var(--sans);color:#c8cfda">${esc(n)}</span>
+  </div>`).join('');
 }
 
 function fragDiags(v, margin){
@@ -320,6 +339,7 @@ function tplConsole(v){
       <div style="display:flex;align-items:center;gap:10px;margin-top:16px">
         <span style="font:500 11px/1 var(--mono);color:#5f6b7c;text-transform:uppercase;letter-spacing:.08em">Project</span>
         <select id="proj" class="sel" style="flex:1;min-width:0;background:#161b26;border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:9px 12px;color:#e6e9ef;font:500 13px/1 var(--sans);cursor:pointer">${options}</select>
+        ${fragVersionSelect(v)}
       </div>
       <div style="font:400 11px/1.4 var(--mono);color:#5f6b7c;margin-top:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.projectPath)}</div>
     </div>
@@ -333,6 +353,7 @@ function tplConsole(v){
     ${fragToolbar(v, '4px 22px 12px')}
     ${fragSetupBanner('0 22px 12px')}
     ${fragDiags(v, '0 22px 12px')}
+    ${fragVersionNotes(v, '0 22px 12px')}
 
     <div style="display:flex;gap:12px;padding:0 22px 18px">
       <div style="flex:1">${fragCard('pcbnew bridge', v.bridgeColor, v.bridgeLabel, v.bridgeDetail1, v.bridgeDetail2, 13)}</div>
@@ -388,6 +409,7 @@ function tplBento(v){
       <span style="width:28px;height:28px;border-radius:8px;background:#42d17f1a;border:1px solid #42d17f40;display:flex;align-items:center;justify-content:center;font:700 14px var(--disp);color:#42d17f">K</span>
       <div style="font:600 15px/1 var(--disp);letter-spacing:-.01em">MCP Launcher</div>
       <select id="proj" class="sel" style="max-width:300px;background:#161b26;border:1px solid rgba(255,255,255,.09);border-radius:9px;padding:8px 12px;color:#e6e9ef;font:500 12.5px/1 var(--sans);cursor:pointer">${options}</select>
+      ${fragVersionSelect(v)}
       <div style="flex:1"></div>
       <button data-act="restart" ${v.restartDisabled?'disabled':''} style="${v.restartDisabled?b.secDis:b.sec}">Restart</button>
       <button data-act="stop" ${v.stopDisabled?'disabled':''} style="${v.stopDisabled?b.secDis:b.sec}">Stop</button>
@@ -397,6 +419,7 @@ function tplBento(v){
     ${fragToolbar(v, '12px 24px 0')}
     ${fragSetupBanner('12px 24px 0')}
     ${fragDiags(v, '12px 24px 0')}
+    ${fragVersionNotes(v, '12px 24px 0')}
 
     <div style="padding:16px 24px 24px;display:grid;grid-template-columns:1fr 1fr;gap:14px">
       <div style="grid-column:1 / -1;background:linear-gradient(135deg,#161b26,#141926);border:1px solid rgba(255,255,255,.07);border-radius:15px;padding:20px 22px;display:flex;align-items:center;gap:24px">
@@ -487,9 +510,13 @@ function render(st){
   }
   const sel=document.getElementById('proj');
   if(sel && document.activeElement===sel) return;   // don't clobber an open dropdown
+  const kv=document.getElementById('kver');
+  if(kv && document.activeElement===kv) return;
   const v=renderVals(LAST_ST);
   app.innerHTML = v.variant==='bento' ? tplBento(v) : tplConsole(v);
   document.getElementById('proj').addEventListener('change', onProjectChange);
+  const kver=document.getElementById('kver');
+  if(kver) kver.addEventListener('change', onVersionChange);
   app.querySelectorAll('button[data-act]').forEach(b=>b.addEventListener('click', onAction));
   requestAnimationFrame(fitWindow);
 }
@@ -511,6 +538,15 @@ async function onProjectChange(e){
   refresh();
 }
 
+async function onVersionChange(e){
+  const a=await api(); if(!a || !a.set_kicad_version) return;
+  let res=null;
+  try{ res=await a.set_kicad_version(e.target.value); }
+  catch(err){ toast('version switch failed: '+err); }
+  if(res && res.messages && res.messages.length) toast(res.messages.join('\n'));
+  refresh();
+}
+
 const ACTIONS = {
   start: a=>a.start_everything(),
   restart: a=>a.restart_mcp(),
@@ -525,6 +561,8 @@ const ACTIONS = {
   stopForeign: a=>a.stop_foreign_server(),
   variantBento: a=>a.set_variant('bento'),
   variantConsole: a=>a.set_variant('console'),
+  autoSurfaceOn: a=>a.set_auto_surface(true),
+  autoSurfaceOff: a=>a.set_auto_surface(false),
   tray: a=>a.hide_to_tray(),
   openSetup: async a=>{ VIEW='setup'; render(); SETUP=await a.get_setup_state(true); render(); return null; },
   backDash: async a=>{ VIEW='dashboard'; render(); return null; },

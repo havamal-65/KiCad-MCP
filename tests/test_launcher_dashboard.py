@@ -137,3 +137,42 @@ def test_selected_index_out_of_range_clamps():
     st = dashboard.build_state(_snap(), PROJECTS, 99)
     assert st["projectIndex"] == 0
     assert st["projectPath"].endswith("alpha.kicad_pcb")
+
+
+# --- board_format_hint (U5 VS-5) ---------------------------------------------
+
+_PCB_HEAD = '(kicad_pcb\n\t(version 20241229)\n\t(generator "pcbnew")\n\t(generator_version "{v}")\n'
+
+
+def _board(tmp_path, generator_version):
+    p = tmp_path / "b.kicad_pcb"
+    p.write_text(_PCB_HEAD.format(v=generator_version), encoding="utf-8")
+    return p
+
+
+def test_hint_newer_board_older_kicad(tmp_path):
+    hint = dashboard.board_format_hint(_board(tmp_path, "10.0"), "9.0")
+    assert hint is not None
+    assert "b.kicad_pcb" in hint and "KiCad 10" in hint and "9.0" in hint
+
+
+def test_hint_none_when_majors_equal(tmp_path):
+    assert dashboard.board_format_hint(_board(tmp_path, "10.0"), "10.0") is None
+
+
+def test_hint_none_when_board_older(tmp_path):
+    assert dashboard.board_format_hint(_board(tmp_path, "9.0"), "10.0") is None
+
+
+def test_hint_tolerates_missing_inputs(tmp_path):
+    assert dashboard.board_format_hint(None, "10.0") is None
+    assert dashboard.board_format_hint(_board(tmp_path, "10.0"), None) is None
+    assert dashboard.board_format_hint(_board(tmp_path, "10.0"), "") is None
+    assert dashboard.board_format_hint(tmp_path / "ghost.kicad_pcb", "9.0") is None
+
+
+def test_hint_tolerates_unstamped_or_garbage(tmp_path):
+    p = tmp_path / "old.kicad_pcb"
+    p.write_text("(kicad_pcb (version 20171130) (host pcbnew 4.0))\n", encoding="utf-8")
+    assert dashboard.board_format_hint(p, "9.0") is None          # no stamp
+    assert dashboard.board_format_hint(_board(tmp_path, "10.0"), "abc") is None

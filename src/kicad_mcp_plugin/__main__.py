@@ -76,6 +76,17 @@ def main() -> None:
     from kicad_mcp_plugin.server import create_plugin_server
     mcp = create_plugin_server(config)
 
+    # F4 (U5): the server was started a non-launcher way (Claude stdio, dev
+    # http) — surface the launcher window unless disabled or already up.
+    # Best-effort: an outcome string for the log, never a startup failure.
+    try:
+        from kicad_mcp.utils.launcher_surface import maybe_surface_launcher
+
+        outcome = maybe_surface_launcher()
+        print(f"launcher auto-surface: {outcome}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 — surfacing must never break server startup
+        pass
+
     if config.transport == TransportType.STREAMABLE_HTTP:
         # Served at http://<host>:<port>/mcp — point a dev .mcp.json at that URL.
         mcp.run(

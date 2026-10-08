@@ -9,6 +9,7 @@ and *observes* state.
 
 from __future__ import annotations
 
+import re
 import shutil
 import socket
 import subprocess
@@ -214,6 +215,31 @@ def restart_mcp_http(cfg: LauncherConfig) -> Result:
             break
         time.sleep(0.25)
     return start_mcp_http(cfg)
+
+
+_KICAD_VERSION_IN_PATH = re.compile(r"[\\/]KiCad[\\/](\d+\.\d+)[\\/]")
+
+
+def running_pcbnew_versions() -> list[str]:
+    """Version strings ('10.0') of the KiCad installs with a pcbnew.exe
+    running, parsed from each process's exe path (U5 VS-4 port-collision
+    surface). Processes whose exe path is unreadable or not under a
+    ``KiCad\\<x.y>\\`` dir contribute nothing."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    versions: list[str] = []
+    for proc in psutil.process_iter(["name", "exe"]):
+        try:
+            if (proc.info.get("name") or "").lower() != "pcbnew.exe":
+                continue
+            m = _KICAD_VERSION_IN_PATH.search(proc.info.get("exe") or "")
+            if m and m.group(1) not in versions:
+                versions.append(m.group(1))
+        except Exception:
+            continue
+    return versions
 
 
 def _pcbnew_pids() -> list[int]:

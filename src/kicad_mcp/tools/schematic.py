@@ -174,6 +174,7 @@ def _attempt_footprint_swap(
         }
 
     removed = mutate_ops.remove_component(pcb_p, ref)
+    placed = False
     try:
         mutate_ops.place_component(
             pcb_p, ref, new_fp,
@@ -181,6 +182,7 @@ def _attempt_footprint_swap(
             layer=removed.get("layer") or "F.Cu",
             rotation=removed.get("rotation", 0.0),
         )
+        placed = True
 
         unmatched_pads: list[dict[str, str]] = []
         for pad_name, net in sorted(old_pad_nets.items()):
@@ -198,6 +200,25 @@ def _attempt_footprint_swap(
         # (OQ2 carve-out: no raw_block there).
         raw_block = removed.get("raw_block")
         if via == "file" and raw_block:
+            if placed:
+                # RB-RES1: the new footprint block already landed in the
+                # file — remove it first, or the verbatim restore below
+                # would re-insert the old block ALONGSIDE it (duplicate
+                # reference). If this cleanup fails, report rollback
+                # failure rather than create the duplicate.
+                try:
+                    file_ops.remove_component(pcb_p, ref)
+                except Exception as cleanup_exc:  # noqa: BLE001 — reported, never raised
+                    return {
+                        "applied": False,
+                        "reason": (
+                            f"swap failed: {exc}; ROLLBACK FAILED: could not"
+                            f" remove the half-placed new footprint:"
+                            f" {cleanup_exc} — restore {ref} from the sync"
+                            f" backup"
+                        ),
+                        "restored": False,
+                    }
             try:
                 file_ops.restore_footprint_block(pcb_p, raw_block)
             except Exception as restore_exc:  # noqa: BLE001 — reported, never raised

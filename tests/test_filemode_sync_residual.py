@@ -375,6 +375,55 @@ def test_swap_rollback_restores_part_on_place_failure(tmp_path: Path):
     assert "Footprints:OldPart" in content
 
 
+def test_swap_rollback_after_place_success_single_block(tmp_path: Path):
+    """RB-RES1: a failure AFTER a successful place must not restore the old
+    block alongside the new one (duplicate reference) — the rollback removes
+    the half-placed new footprint first, then restores the original."""
+    _proj, board = _make_project(
+        tmp_path, ["OldPart", "NewPart"], board_text=_BOARD_OLDPART)
+    with patch.object(FileBoardOps, "assign_net",
+                      side_effect=RuntimeError("board opened in KiCad")):
+        swap = schematic._attempt_footprint_swap(
+            board, "R1", "Footprints:NewPart", board_ops=FileBoardOps())
+    assert swap["applied"] is False
+    assert swap["restored"] is True
+    content = board.read_text(encoding="utf-8")
+    assert content.count('(footprint "Footprints:OldPart"') == 1
+    assert '(footprint "Footprints:NewPart"' not in content
+    assert find_footprint_block_by_reference(content, "R1") is not None
+
+
+def test_swap_rollback_cleanup_failure_reports_not_duplicates(tmp_path: Path):
+    """RB-RES1: when the half-placed new block cannot be removed, the swap
+    reports ROLLBACK FAILED (sync backup named) instead of restoring the old
+    block alongside it."""
+    _proj, board = _make_project(
+        tmp_path, ["OldPart", "NewPart"], board_text=_BOARD_OLDPART)
+    real_remove = FileBoardOps.remove_component
+    calls = {"n": 0}
+
+    def _remove_then_fail(self, path, ref):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_remove(self, path, ref)
+        raise OSError("disk full")
+
+    with patch.object(FileBoardOps, "assign_net",
+                      side_effect=RuntimeError("board opened in KiCad")), \
+         patch.object(FileBoardOps, "remove_component", _remove_then_fail):
+        swap = schematic._attempt_footprint_swap(
+            board, "R1", "Footprints:NewPart", board_ops=FileBoardOps())
+    assert swap["applied"] is False
+    assert swap["restored"] is False
+    assert "ROLLBACK FAILED" in swap["reason"]
+    assert "half-placed" in swap["reason"]
+    assert "sync backup" in swap["reason"]
+    # No duplicate: the old block is NOT re-inserted next to the new one.
+    content = board.read_text(encoding="utf-8")
+    assert '(footprint "Footprints:OldPart"' not in content
+    assert content.count('(footprint "Footprints:NewPart"') == 1
+
+
 def test_swap_rollback_failure_names_backup(tmp_path: Path):
     """Restore also raising: reason carries ROLLBACK FAILED, restored False,
     and sync emits the swap_rollback_failed warning."""

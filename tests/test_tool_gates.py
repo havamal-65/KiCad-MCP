@@ -66,6 +66,8 @@ def test_refuse_if_ungated_blocks_then_passes(tmp_path: Path):
     assert parsed["status"] == "blocked"
     assert parsed["reason"] == "run_drc_gate"
     assert "has not been run" in parsed["message"]
+    # Hard gate keeps the imperative "stop and retry" wording (F11).
+    assert "then retry" in parsed["message"].lower()
 
     record_validation(p, "run_drc", {"passed": True})
     assert refuse_if_ungated(p, "run_drc", "export_gerbers") is None
@@ -76,6 +78,10 @@ def test_warn_if_ungated_warns_then_clears(tmp_path: Path):
     warning = warn_if_ungated(p, "validate_schematic_for_pcb", "sync_schematic_to_pcb")
     assert warning is not None
     assert warning["type"] == "validate_schematic_for_pcb_not_passed"
+    # Soft gate is advisory: no false "requires ... then retry" (F11).
+    assert "Advisory" in warning["message"]
+    assert "retry" not in warning["message"].lower()
+    assert "will continue" in warning["message"].lower()
 
     record_validation(p, "validate_schematic_for_pcb", {"passed": True})
     assert warn_if_ungated(p, "validate_schematic_for_pcb", "sync_schematic_to_pcb") is None

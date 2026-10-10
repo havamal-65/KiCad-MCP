@@ -171,6 +171,28 @@ GATE_PROMOTE_ADVISORY: bool = False
 
 
 # ---------------------------------------------------------------------------
+# Placement tidy-up pass (FC — post-legalization, never-worse)
+# ---------------------------------------------------------------------------
+
+#: Master switch for the tidy-up pass (grid-snap + same-footprint row alignment +
+#: paired-orientation squaring + far-decap tightening). Every tidy move is guarded
+#: legality-preserving AND Total-HPWL-non-increasing, so it stays on by default;
+#: set False to reproduce the pre-tidy layout without a code edit.
+TIDY_ENABLE: bool = True
+
+#: Coarse grid (mm) the tidy pass snaps part origins to. Equal to the constructive
+#: / legalizer lattice (``PROX_CANDIDATE_GRID_MM``) so a snapped part lands where
+#: the placer already reasons — it cannot be shoved into a slot those stages
+#: rejected.
+TIDY_GRID_MM: float = 0.5
+
+#: "Same line" tolerance (mm) for row/column alignment of same-footprint parts:
+#: members whose shared-axis coordinate is within this band of the group's
+#: grid-snapped median are pulled onto that median.
+TIDY_ALIGN_BAND_MM: float = 0.5
+
+
+# ---------------------------------------------------------------------------
 # Keep-out gate geometry (K1 — REQ-KGEOM-003/004)
 # ---------------------------------------------------------------------------
 
@@ -211,6 +233,9 @@ _OVERRIDABLE: frozenset[str] = frozenset({
     "GATE_PROMOTE_ADVISORY",
     "ARC_MAX_DEVIATION_MM",
     "KEEPOUT_EDGE_TOL_MM",
+    "TIDY_ENABLE",
+    "TIDY_GRID_MM",
+    "TIDY_ALIGN_BAND_MM",
 })
 
 

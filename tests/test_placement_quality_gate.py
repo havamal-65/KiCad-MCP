@@ -205,6 +205,35 @@ def test_gate_promotion_makes_advisory_blocking(tmp_path: Path, monkeypatch) -> 
     assert any("promoted to blocking" in a for a in result["required_actions"])
 
 
+def test_placement_quality_no_courtyard_advisory_nonblocking(
+    tmp_path: Path,
+) -> None:
+    """A footprint with no courtyard geometry yields an advisory no_courtyard
+    violation that names the ref but does not block (RW-S3 G3)."""
+    fps = [
+        _footprint("LibA:MCU", "U1", (10.0, 10.0, 0.0), [
+            ("1", 0.0, 0.0, 1, "SIG"), ("4", -0.5, 0.0, 5, "VCC"),
+            ("5", -1.0, 0.0, 6, "GND"),
+        ]),
+        _footprint("LibA:R", "R9", (30.0, 10.0, 0.0),
+                   [("1", 0.0, 0.0, 1, "SIG")],
+                   courtyard=None),
+    ]
+    p = _write(tmp_path, _board(fps, _NETS))
+    result = run_validate_placement_quality(p)
+    assert result["passed"] is True
+    no_cyd = [v for v in result["violations"] if v["type"] == "no_courtyard"]
+    assert len(no_cyd) == 1
+    assert no_cyd[0]["severity"] == "advisory"
+    assert no_cyd[0]["refs"] == ["R9"]
+    assert "R9" in no_cyd[0]["message"]
+    assert "invisible to overlap/legality checks" in no_cyd[0]["message"]
+    assert not any(v["severity"] == "blocking" for v in result["violations"])
+    # The metric bundle carries the same data for the phase report.
+    assert result["placement_metric"]["no_courtyard"] == ["R9"]
+    assert result["placement_metric"]["no_courtyard_count"] == 1
+
+
 def test_gate_records_validation_cache(tmp_path: Path) -> None:
     """The result lands in <board>.validation_cache.json (REQ-GATE-002)."""
     p = _clean_board_with_far_decap(tmp_path)

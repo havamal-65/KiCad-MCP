@@ -60,6 +60,19 @@ class IPCUnavailableError(BackendNotAvailableError):
         self.remedy = remedy
 
 
+class IPCStaleBoardError(IPCUnavailableError):
+    """The live board KiCad holds disagrees with the ``.kicad_pcb`` on disk.
+
+    Raised by the IPC write guard (F-DV11) BEFORE a mutation, because a
+    commit + save against a stale live board silently overwrites newer
+    file-side state (placements, routing). KiCad cannot reload a board
+    in place, so the only remedy is closing and reopening the board in
+    the PCB editor. Never retried on the bridge: the bridge holds the
+    SAME stale live board, and its own mtime guard does not fire when
+    this process's saves have kept its baseline current.
+    """
+
+
 def ipc_enabled() -> bool:
     """Operator kill-switch — KICAD_MCP_IPC_ENABLED=0 forces bridge/file paths."""
     raw = os.environ.get("KICAD_MCP_IPC_ENABLED", "1").strip().lower()

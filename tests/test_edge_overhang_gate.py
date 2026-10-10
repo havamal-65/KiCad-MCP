@@ -137,6 +137,23 @@ def test_indeterminate_face_falls_back_to_crossed_edge(tmp_path: Path):
     assert "fallback" in exemptions[0]["evidence"]
 
 
+def test_overhanging_axial_resistor_not_exempted(tmp_path: Path):
+    """SW-2 closes the latent masking hole: an axial resistor whose courtyard
+    crosses exactly ONE board edge is no longer a "connector" to the F2-Q2
+    fallback — it stays a genuine out_of_outline violation. (The existing
+    test_indeterminate_face_falls_back_to_crossed_edge pins that the fallback
+    survives for real J-ref connectors.)"""
+    board = _write(tmp_path, _board({
+        "ref": "R1", "at_x": 40.0, "at_y": 69.0,
+        "lib_id": "Footprints:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal",
+        "courtyard": (-1.05, -1.5, 8.67, 1.5),   # board y 67.5..70.5 → south only
+        "pads": [(0.0, 0.0), (7.62, 0.0)],
+    }))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 1, metric
+    assert "edge_overhang_exemptions" not in metric
+
+
 def test_mixed_board_counts_only_genuine_offenders(tmp_path: Path):
     """Exempt connector + genuine offender on one board: count reflects only
     the real violation and the exemption is reported alongside it."""
@@ -155,3 +172,93 @@ def test_mixed_board_counts_only_genuine_offenders(tmp_path: Path):
 
     gate = run_validate_placement_quality(board)
     assert gate["passed"] is False  # R1 still blocks
+
+
+# ---------------------------------------------------------------------------
+# RW-S4 §6 — terminal blocks admitted to the exemption chain (aqs #18
+# follow-up: the AK300 family had no matching token, so P4 could never be
+# exempted no matter how it faced)
+# ---------------------------------------------------------------------------
+
+_AK300_LIB_ID = "TerminalBlock_Altech:Altech_AK300_1x02_P5.00mm_45-Degree"
+
+# AK300-style geometry (measured 2026-08-22): pad centroid (2.5, 0.0),
+# courtyard center (2.5, 0.25) → offset +0.25 mm in +y (5x the 0.05
+# threshold) → real mating_face "+y" (south at rotation 0).
+_AK300_SOUTH = {
+    "ref": "J3", "at_x": 40.0, "at_y": 66.0, "rotation": 0,
+    "lib_id": _AK300_LIB_ID,
+    "courtyard": (-2.75, -4.75, 7.75, 5.25),   # center (2.5, 0.25)
+    "pads": [(0.0, 0.0), (5.0, 0.0)],          # centroid (2.5, 0.0)
+}
+
+
+def test_terminal_block_token_admits_ak300():
+    from kicad_mcp.tools.drc import _name_matches_edge_connector
+
+    assert _name_matches_edge_connector(_AK300_LIB_ID) == "TerminalBlock"
+
+
+def test_phoenix_token_admits():
+    from kicad_mcp.tools.drc import _name_matches_edge_connector
+
+    assert _name_matches_edge_connector(
+        "Connector_Phoenix_MC:PhoenixContact_MC_1-5_2-G-3.81_1x02"
+    ) == "Connector_Phoenix"
+
+
+def test_south_edge_terminal_block_exempted(tmp_path: Path):
+    """An AK300-style terminal block whose wire entry points off the south
+    edge overhangs legally — out_of_outline no longer counts it."""
+    board = _write(tmp_path, _board(_AK300_SOUTH))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 0, metric
+    exemptions = metric.get("edge_overhang_exemptions", [])
+    assert [e["reference"] for e in exemptions] == ["J3"]
+
+
+def test_backwards_terminal_block_still_counts(tmp_path: Path):
+    """Rotated 180° the wire entry faces north while the body overhangs
+    south — a real placement error, still counted."""
+    fp = dict(_AK300_SOUTH)
+    fp["rotation"] = 180
+    fp["at_y"] = 66.5   # rotated courtyard y: 61.25..71.25 → south only
+    fp["at_x"] = 45.0   # rotated courtyard x: 37.25..47.75 → inside
+    board = _write(tmp_path, _board(fp))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 1, metric
+    assert "edge_overhang_exemptions" not in metric
+
+# ---------------------------------------------------------------------------
+# F-DV6 (DV build, spec-edge-tokens-rehoming) — project-local re-homing strips
+# the stock library prefix, so the TerminalBlock/Connector_Phoenix tokens never
+# fire on re-homed parts (the ecc83 demo ships its AK300s as
+# "Footprints:Altech_AK300_…"). The manufacturer-series token lives in the
+# footprint NAME and survives re-homing.
+# ---------------------------------------------------------------------------
+
+_REHOMED_AK300_LIB_ID = "Footprints:Altech_AK300_1x02_P5.00mm_45-Degree"
+
+
+def test_altech_token_admits_rehomed_ak300():
+    from kicad_mcp.tools.drc import _name_matches_edge_connector
+
+    assert _name_matches_edge_connector(_REHOMED_AK300_LIB_ID) == "Altech_AK"
+    # Stock lib id keeps matching its original token (list order preserved).
+    assert _name_matches_edge_connector(_AK300_LIB_ID) == "TerminalBlock"
+
+
+def test_rehomed_south_edge_terminal_block_exempted(tmp_path: Path):
+    """The ecc83 P4 case: a re-homed AK300 overhanging only the south edge is
+    legal mating overhang — the gate passes."""
+    fp = dict(_AK300_SOUTH)
+    fp["lib_id"] = _REHOMED_AK300_LIB_ID
+    board = _write(tmp_path, _board(fp))
+    metric = placement_metric(board)
+    assert metric["out_of_outline_count"] == 0, metric
+    exemptions = metric.get("edge_overhang_exemptions", [])
+    assert [e["reference"] for e in exemptions] == [fp["ref"]]
+    assert "south" in exemptions[0]["evidence"]
+
+    gate = run_validate_placement_quality(board)
+    assert gate["passed"] is True, gate

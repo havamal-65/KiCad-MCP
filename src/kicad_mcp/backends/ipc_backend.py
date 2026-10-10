@@ -27,13 +27,18 @@ surface stays in millimeters, rounded to 4 decimals like the bridge.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
 from kicad_mcp.backends.base import BackendCapability, BoardOps, KiCadBackend
-from kicad_mcp.backends.ipc_connection import IPCConnection, IPCUnavailableError
+from kicad_mcp.backends.ipc_connection import (
+    IPCConnection,
+    IPCStaleBoardError,
+    IPCUnavailableError,
+)
 from kicad_mcp.backends.placement_guard import (
     check_placement,
     idempotent_success,
@@ -49,10 +54,14 @@ if TYPE_CHECKING:
 try:
     import kipy.board_types as kbt
     from kipy.common_types import LibraryIdentifier
-    from kipy.geometry import Angle, Vector2
+    from kipy.geometry import Angle, PolygonWithHoles, PolyLine, PolyLineNode, Vector2
     from kipy.project_types import TextVariables
     from kipy.proto.board.board_pb2 import BoardStackupLayerType
-    from kipy.proto.board.board_types_pb2 import BoardLayer, ViaType
+    from kipy.proto.board.board_types_pb2 import (
+        BoardLayer,
+        ViaType,
+        ZoneConnectionStyle,
+    )
     from kipy.proto.common.types import MapMergeMode
     from kipy.proto.common.types import project_settings_pb2
     from kipy.util.board_layer import canonical_name, layer_from_canonical_name
@@ -66,6 +75,10 @@ except ImportError:  # REQ-IPC-8: missing client degrades, never crashes
     BoardStackupLayerType = None  # type: ignore[assignment,misc]
     BoardLayer = None  # type: ignore[assignment,misc]
     ViaType = None  # type: ignore[assignment,misc]
+    ZoneConnectionStyle = None  # type: ignore[assignment,misc]
+    PolygonWithHoles = None  # type: ignore[assignment,misc]
+    PolyLine = None  # type: ignore[assignment,misc]
+    PolyLineNode = None  # type: ignore[assignment,misc]
     MapMergeMode = None  # type: ignore[assignment,misc]
     project_settings_pb2 = None  # type: ignore[assignment]
     canonical_name = None  # type: ignore[assignment]
@@ -83,6 +96,161 @@ def _mm4(value_nm: int) -> float:
     return round(to_mm(value_nm), 4)
 
 
+_FOOTPRINT_AT_RE = re.compile(
+    r'\(footprint\s+"[^"]+".*?\(at\s+([\d.eE+-]+)\s+([\d.eE+-]+)[\s)]'
+    r'.*?\(property\s+"Reference"\s+"([^"]+)"',
+    re.S,
+)
+_COHERENCE_TOL_NM = 1000  # 1 µm — well under any real placement delta
+_EDGE_BBOX_TOL_NM = 500_000  # 0.5 mm — absorbs stroke/arc bbox modeling
+_REOPEN_REMEDY = (
+    "Close and reopen the board in KiCad's PCB editor "
+    "so the live board matches the file, then retry."
+)
+
+
+def _stat_mtime_ns(path: Path) -> int | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def _edge_cuts_live(board: Any) -> tuple[int, bool, tuple[int, int, int, int] | None]:
+    """(count, has_arc, bbox_nm) of live board-level Edge.Cuts shapes.
+
+    Shapes are board.get_shapes() filtered to BoardLayer.BL_Edge_Cuts,
+    excluding kbt.BoardBezier instances (the file regex cannot count
+    beziers, so both sides ignore them — symmetric blind spot).
+    has_arc — any kbt.BoardArc among them. bbox_nm — the aggregate
+    (min_x, min_y, max_x, max_y) from board.get_item_bounding_box(edges)
+    using the same None-filtering union as _edge_bbox_mm, or None when
+    there are no shapes or no usable boxes.
+    """
+    edges = [s for s in board.get_shapes()
+             if s.layer == BoardLayer.BL_Edge_Cuts
+             and not isinstance(s, kbt.BoardBezier)]
+    if not edges:
+        return 0, False, None
+    has_arc = any(isinstance(s, kbt.BoardArc) for s in edges)
+    boxes = [b for b in board.get_item_bounding_box(edges) if b is not None]
+    if not boxes:
+        return len(edges), has_arc, None
+    x0 = min(b.pos.x for b in boxes)
+    y0 = min(b.pos.y for b in boxes)
+    x1 = max(b.pos.x + b.size.x for b in boxes)
+    y1 = max(b.pos.y + b.size.y for b in boxes)
+    return len(edges), has_arc, (x0, y0, x1, y1)
+
+
+def _coherence_mismatch(board: Any, path: Path) -> str | None:
+    """Compare the live board against the ``.kicad_pcb`` on disk (F-DV11).
+
+    Returns a human-readable description of the first disagreement, or None
+    when live and file agree. Checked: footprint reference set + positions
+    (1 µm tolerance), track count (segments + arcs), via count, zone count,
+    Edge.Cuts graphic count + aggregate bounding box (0.5 mm tolerance;
+    bbox skipped for arc outlines).
+    A missing/unreadable file is not a mismatch (new board being created).
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    file_fps = {
+        ref: (round(float(x) * 1e6), round(float(y) * 1e6))
+        for x, y, ref in _FOOTPRINT_AT_RE.findall(text)
+    }
+    live_fps = {
+        fp.reference_field.text.value: (fp.position.x, fp.position.y)
+        for fp in board.get_footprints()
+    }
+    if set(file_fps) != set(live_fps):
+        only_file = sorted(set(file_fps) - set(live_fps))
+        only_live = sorted(set(live_fps) - set(file_fps))
+        return (
+            f"footprint sets differ (file-only: {only_file or '-'}, "
+            f"live-only: {only_live or '-'})"
+        )
+    for ref, (fx, fy) in file_fps.items():
+        lx, ly = live_fps[ref]
+        if abs(fx - lx) > _COHERENCE_TOL_NM or abs(fy - ly) > _COHERENCE_TOL_NM:
+            return (
+                f"footprint {ref} at ({lx / 1e6:.4f}, {ly / 1e6:.4f}) live vs "
+                f"({fx / 1e6:.4f}, {fy / 1e6:.4f}) in the file"
+            )
+
+    file_tracks = len(re.findall(r"^\t\(segment\b", text, re.M)) + len(
+        re.findall(r"^\t\(arc\b", text, re.M))
+    live_tracks = len(board.get_tracks())
+    if file_tracks != live_tracks:
+        return f"track count {live_tracks} live vs {file_tracks} in the file"
+
+    file_vias = len(re.findall(r"^\t\(via\b", text, re.M))
+    live_vias = len(board.get_vias())
+    if file_vias != live_vias:
+        return f"via count {live_vias} live vs {file_vias} in the file"
+
+    file_zones = len(re.findall(r"^\t\(zone\b", text, re.M))
+    live_zones = len(board.get_zones())
+    if file_zones != live_zones:
+        return f"zone count {live_zones} live vs {file_zones} in the file"
+
+    # F-DV11-R1: board-level Edge.Cuts graphics (count + aggregate bbox) —
+    # the one board graphic whose loss invalidates placement/routing work.
+    from kicad_mcp.backends.file_backend import edge_cuts_graphics
+
+    file_count, file_has_arc, file_bbox = edge_cuts_graphics(text)
+    live_count, live_has_arc, live_bbox = _edge_cuts_live(board)
+    if file_count != live_count:
+        return f"edge-cuts graphic count {live_count} live vs {file_count} in the file"
+    # The file-side bbox is the hull of an arc's start/mid/end points; the
+    # true arc can bulge past that hull by ~its radius, so no fixed tolerance
+    # makes bbox equality safe for arc outlines — counts stay exact for arcs.
+    # An unmeasurable side (bbox None) skips the check — never guess a mismatch.
+    if (file_count > 0 and not file_has_arc and not live_has_arc
+            and file_bbox is not None and live_bbox is not None):
+        fx0, fy0, fx1, fy1 = (round(v * 1e6) for v in file_bbox)
+        lx0, ly0, lx1, ly1 = live_bbox
+        if any(abs(fv - lv) > _EDGE_BBOX_TOL_NM
+               for fv, lv in ((fx0, lx0), (fy0, ly0), (fx1, lx1), (fy1, ly1))):
+            return (
+                f"edge-cuts outline bbox ({lx0 / 1e6:.4f}, {ly0 / 1e6:.4f})-"
+                f"({lx1 / 1e6:.4f}, {ly1 / 1e6:.4f}) mm live vs "
+                f"({fx0 / 1e6:.4f}, {fy0 / 1e6:.4f})-"
+                f"({fx1 / 1e6:.4f}, {fy1 / 1e6:.4f}) mm in the file"
+            )
+    return None
+
+
+def _apply_zone_connection(
+    zone: Any, pad_connection: str, thermal_gap_nm: int, thermal_spoke_width_nm: int,
+) -> None:
+    """Write pad-connection + thermal settings onto a kipy Zone (F-DV10).
+
+    kipy's ``ZoneConnectionSettings.thermal_spokes`` getter constructs its
+    wrapper with the positional ``proto`` argument, which CopyFrom()s a
+    DETACHED copy — setting ``.gap``/``.width`` on it silently mutates a
+    throwaway (the zone file then stores thermal_gap 0). Bind our own
+    ``ThermalSpokeSettings`` to the live proto via ``proto_ref`` so the
+    writes reach the zone. ``zone_connection`` itself writes through because
+    ``Zone.connection`` is already a proto_ref wrapper.
+    """
+    connection_map = {
+        "thermal": ZoneConnectionStyle.ZCS_THERMAL,
+        "solid": ZoneConnectionStyle.ZCS_FULL,
+        "none": ZoneConnectionStyle.ZCS_NONE,
+    }
+    connection = zone.connection
+    if connection is None:
+        return
+    connection.zone_connection = connection_map[pad_connection]
+    spokes = kbt.ThermalSpokeSettings(proto_ref=connection._proto.thermal_spokes)
+    spokes.gap = thermal_gap_nm
+    spokes.width = thermal_spoke_width_nm
+
+
 def _save_board(board: Board) -> None:
     # kipy 0.5.0 ships py.typed but leaves Board.save() unannotated
     board.save()  # type: ignore[no-untyped-call]
@@ -97,11 +265,23 @@ def _bridge_save(path: Path) -> bool:
     would be refused as stale (live-caught in the S1 step-7 batch). So the
     post-commit flush prefers the bridge whenever it is reachable; both paths
     save the same live in-memory board.
+
+    A bridge ``stale_board`` refusal (#14C) re-raises as ``IPCStaleBoardError``
+    (F-DV11-R3) instead of returning False — falling back to the direct kipy
+    save would commit exactly the clobber the bridge just refused.
     """
     try:
-        from kicad_mcp.backends.plugin_backend import _get_op_timeout, _tcp_call
+        from kicad_mcp.backends.plugin_backend import (
+            StaleBoardError, _get_op_timeout, _tcp_call,
+        )
         _tcp_call("save_board", _get_op_timeout(), path=str(path))
         return True
+    except StaleBoardError as exc:
+        raise IPCStaleBoardError(
+            f"Board write refused (stale_board): the bridge refused the "
+            f"post-commit save of {Path(path).name} — {exc}",
+            remedy=_REOPEN_REMEDY,
+        ) from exc
     except Exception:  # noqa: BLE001 — bridge down/refused: IPC-only session
         return False
 
@@ -111,16 +291,26 @@ class IPCBoardOps(BoardOps):
 
     def __init__(self, connection: IPCConnection) -> None:
         self._conn = connection
+        # F-DV11-R3: disk mtime recorded when a coherence check passes, so the
+        # post-commit save can detect a writer that raced this operation.
+        self._disk_baseline: dict[str, int | None] = {}
 
     # -- Board resolution ------------------------------------------------------
 
-    def _board(self, path: Path) -> Board:
+    def _board(self, path: Path, *, check_coherence: bool = False) -> Board:
         """Resolve the open board and verify it is the one ``path`` names.
 
         IPC has no "open board" call (C1b) — it serves whatever document KiCad
         already has open. ``Board.name`` is the bare filename (live-verified),
         so the match is by filename; a mismatch raises with the canonical
         "does not match open board" phrase the recovery guidance keys on.
+
+        ``check_coherence=True`` (every write path, F-DV11) additionally
+        verifies the live board agrees with the file on disk and refuses with
+        ``IPCStaleBoardError`` otherwise: committing + saving against a stale
+        live board silently overwrites newer file-side state (file-side tools
+        like autoroute and the placement engine write the .kicad_pcb that the
+        GUI never reloads in place).
         """
         board = self._conn.board()
         if os.path.normcase(Path(path).name) != os.path.normcase(board.name):
@@ -130,6 +320,16 @@ class IPCBoardOps(BoardOps):
                 remedy="Call open_kicad with the correct .kicad_pcb path and wait "
                        "for the board to load, then retry.",
             )
+        if check_coherence:
+            mismatch = _coherence_mismatch(board, path)
+            if mismatch is not None:
+                raise IPCStaleBoardError(
+                    f"Board write refused (stale_board): the board KiCad holds "
+                    f"in memory disagrees with {Path(path).name} on disk — "
+                    f"{mismatch}. Writing now would overwrite the newer state.",
+                    remedy=_REOPEN_REMEDY,
+                )
+            self._disk_baseline[os.path.normcase(str(path))] = _stat_mtime_ns(path)
         return board
 
     # -- Transactional write pattern (REQ-IPC-4, REQ-IPC-6) --------------------
@@ -161,15 +361,36 @@ class IPCBoardOps(BoardOps):
         architecture has file-based tools (courtyard, orientation, quality)
         reading the .kicad_pcb, so every live write must land on disk too.
         """
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         result = self._commit(board, mutate)
         self._save(path, board)
         return result
 
     def _save(self, path: Path, board: Board) -> None:
-        """Flush the live board to disk — bridge-first (see _bridge_save)."""
+        """Flush the live board to disk — bridge-first (see _bridge_save).
+
+        Refuses when the file changed on disk after this op's coherence
+        check (F-DV11-R3): the post-commit save would overwrite whatever
+        the racing writer produced. On a refusal the commit has already
+        been pushed to the live board, so live and file stay diverged
+        until the board is reopened — the next write's coherence check
+        refuses consistently, the file (newer state) is preserved, and
+        the unsaved mutation is re-run after reopening. A missing
+        baseline skips verification (defensive only: every write path
+        records one via ``_board(check_coherence=True)`` first).
+        """
+        key = os.path.normcase(str(path))
+        if key in self._disk_baseline and _stat_mtime_ns(path) != self._disk_baseline[key]:
+            raise IPCStaleBoardError(
+                f"Board write refused (stale_board): {Path(path).name} "
+                f"changed on disk after the coherence check (another "
+                f"writer raced this operation); the post-commit save "
+                f"was refused to avoid overwriting the newer file.",
+                remedy=_REOPEN_REMEDY,
+            )
         if not _bridge_save(path):
             _save_board(board)
+        self._disk_baseline[key] = _stat_mtime_ns(path)
 
     # -- kipy lookup helpers -----------------------------------------------------
 
@@ -251,7 +472,7 @@ class IPCBoardOps(BoardOps):
         self, path: Path, reference: str, x: float, y: float,
         rotation: float | None = None,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         fp = self._find_footprint(board, reference)
 
         def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
@@ -319,7 +540,7 @@ class IPCBoardOps(BoardOps):
     def assign_net(
         self, path: Path, reference: str, pad: str, net: str,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         fp = self._find_footprint(board, reference)
         existing_net = self._find_net(board, net)
 
@@ -378,7 +599,7 @@ class IPCBoardOps(BoardOps):
         self, path: Path, x: float, y: float,
         width: float, height: float, line_width: float = 0.05,
     ) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         # Idempotency (bridge parity): existing Edge.Cuts shapes are replaced,
         # atomically in the same commit as the new outline.
         stale_edges = [s for s in board.get_shapes()
@@ -405,7 +626,7 @@ class IPCBoardOps(BoardOps):
         return result
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         backup_path: str | None = None
         if backup:
             # Flush live state first so the backup matches the pre-clear board
@@ -439,17 +660,129 @@ class IPCBoardOps(BoardOps):
     # -- Specialized ops (spec §3 rows 16–19, S2) --------------------------------
 
     def refill_zones(self, path: Path) -> dict[str, Any]:
-        """Spec §3 row 16 — ``board.refill_zones()`` (kipy blocks until done)."""
-        board = self._board(path)
+        """Spec §3 row 16 — ``board.refill_zones()`` (kipy blocks until done).
+
+        Zoneless boards skip both refill and save — a no-op must not dirty
+        the file mtime (spec-zones Z5).
+        """
+        board = self._board(path, check_coherence=True)
         zones = board.get_zones()
-        if zones:
-            board.refill_zones()
+        if not zones:
+            return {"status": "ok", "zones_filled": 0,
+                    "note": "board has no zones"}
+        board.refill_zones()
         self._save(path, board)
         return {"status": "ok", "zones_filled": len(zones)}
 
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        """Create a copper zone over IPC (spec-zones Z1, measured fact 4)."""
+        board = self._board(path, check_coherence=True)
+
+        net_obj = next((n for n in board.get_nets() if n.name == net), None)
+        if net_obj is None:
+            return {
+                "status": "error",
+                "error_code": "net_not_found",
+                "message": f"net '{net}' not found on board; "
+                           "run sync_schematic_to_pcb first",
+            }
+
+        def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
+            zone = kbt.Zone()
+            zone.layers = [layer_from_canonical_name(layer)]
+            zone.net = net_obj
+            if name:
+                zone.name = name
+            poly = PolygonWithHoles()
+            for pt in outline:
+                poly.outline.append(
+                    PolyLineNode.from_xy(from_mm(pt["x"]), from_mm(pt["y"]))
+                )
+            zone.outline = poly
+            zone.clearance = from_mm(clearance_mm)
+            zone.min_thickness = from_mm(min_thickness_mm)
+            _apply_zone_connection(
+                zone, pad_connection,
+                from_mm(thermal_gap_mm), from_mm(thermal_spoke_width_mm))
+            created = board_.create_items(zone)
+            if not created:
+                raise RuntimeError("IPC create_items returned no created zone")
+            item = created[0]
+            return {
+                "status": "success",
+                "zone_name": name,
+                "zone_uuid": getattr(getattr(item, "id", None), "value", ""),
+                "layer": layer,
+                "net": net,
+                "outline_points": len(outline),
+                "filled": False,
+                "filled_area_mm2": None,
+                "via": "ipc",
+                "warnings": [],
+            }
+
+        result = self._commit(board, mutate)
+        if refill:
+            board.refill_zones()
+            result["filled"] = True
+        self._save(path, board)
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        """Delete one copper zone over IPC (spec-zones Z3)."""
+        board = self._board(path, check_coherence=True)
+        matches = [
+            z for z in board.get_zones()
+            if (uuid and getattr(z.id, "value", "") == uuid)
+            or (name and z.name == name)
+        ]
+
+        selector = uuid or name
+        if not matches:
+            return {"status": "error", "error_code": "zone_not_found",
+                    "message": f"no zone matching {selector}"}
+        if len(matches) > 1:
+            return {"status": "error", "error_code": "zone_ambiguous",
+                    "message": f"name '{name}' matches {len(matches)} zones; "
+                               "use uuid"}
+
+        zone = matches[0]
+        if zone.is_rule_area():
+            return {"status": "error", "error_code": "zone_is_rule_area",
+                    "message": f"'{zone.name or getattr(zone.id, 'value', '')}'"
+                               " is a rule area; use the keep-out tools"}
+
+        deleted_uuid = getattr(zone.id, "value", "")
+        deleted_name = zone.name
+        net_name = zone.net.name if zone.net is not None else ""
+
+        def mutate(board_: Board, commit: Commit) -> dict[str, Any]:
+            board_.remove_items([zone])
+            return {
+                "status": "success",
+                "deleted": deleted_uuid,
+                "zone_name": deleted_name,
+                "net": net_name,
+                "via": "ipc",
+            }
+
+        return self._write(path, mutate)
+
     def save_board(self, path: Path) -> dict[str, Any]:
         """Spec §3 row 19 — flush the live board to disk (bridge-first save)."""
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         self._save(path, board)
         return {"success": True, "path": str(path)}
 
@@ -466,7 +799,7 @@ class IPCBoardOps(BoardOps):
         pcbnew's back (#14C hazard). Net-less vias count as tracks for parity
         with the SWIG path (``board.GetTracks()`` includes vias).
         """
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         doomed_zones = (
             [z for z in board.get_zones() if z.is_rule_area()]
             if remove_keepouts else []
@@ -510,7 +843,7 @@ class IPCBoardOps(BoardOps):
         from kicad_mcp.backends.file_backend import build_engine_parts
         from kicad_mcp.utils import placement_engine as engine
 
-        board = self._board(path)
+        board = self._board(path, check_coherence=True)
         self._save(path, board)  # live board -> disk, so the plan is current
 
         parts = build_engine_parts(path, path.parent)
@@ -726,11 +1059,12 @@ class IPCBackend(KiCadBackend):
 
     @property
     def capabilities(self) -> set[BackendCapability]:
-        # REQ-IPC-7 — exactly the four live-board capability groups.
+        # REQ-IPC-7 — the live-board capability groups (+ ZONE_CREATE, RW-S2).
         return {
             BackendCapability.BOARD_READ,
             BackendCapability.BOARD_MODIFY,
             BackendCapability.ZONE_REFILL,
+            BackendCapability.ZONE_CREATE,
             BackendCapability.BOARD_STACKUP,
         }
 

@@ -40,7 +40,11 @@ from kicad_mcp.backends.base import (
 from kicad_mcp.backends.cli_backend import CLIBackend
 from kicad_mcp.backends.file_backend import FileBackend
 from kicad_mcp.backends.ipc_backend import IPCBackend
-from kicad_mcp.backends.ipc_connection import IPCUnavailableError, connection_remedy
+from kicad_mcp.backends.ipc_connection import (
+    IPCStaleBoardError,
+    IPCUnavailableError,
+    connection_remedy,
+)
 from kicad_mcp.backends.plugin_backend import (
     BridgeTemporarilyUnavailableError,
     PluginBoardOps,
@@ -87,6 +91,13 @@ class _LiveBoardOps(BoardOps):
     def _call(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         try:
             result = getattr(self._ipc_ops, method)(*args, **kwargs)
+        except IPCStaleBoardError:
+            # F-DV11: NEVER retry a stale-board refusal on the bridge — it
+            # holds the SAME stale live board, and its mtime baseline stays
+            # current whenever this process's saves went through it, so the
+            # bridge-side guard cannot fire and the write would clobber the
+            # newer file.
+            raise
         except (NotImplementedError, AttributeError, IPCUnavailableError) as exc:
             bridge = self._bridge_supplier()  # raises if the bridge is down too
             logger.debug("op %s fell through IPC → bridge (%s)", method, exc)
@@ -183,8 +194,66 @@ class _LiveBoardOps(BoardOps):
             "set_footprint_value", path, reference, value)
         return result
 
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra; IPC has no equivalent, so _call falls through to the
+        # bridge on the IPC side's AttributeError (KIR4 NS).
+        result: dict[str, Any] = self._call(
+            "set_footprint_metadata", path, reference, sheet_path, fields)
+        return result
+
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        # bridge extra (not on the BoardOps base); IPC has no equivalent, so
+        # _call falls through to the bridge on the IPC side's AttributeError
+        result: dict[str, Any] = self._call("get_reference_texts", path)
+        return result
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra (not on the BoardOps base)
+        result: dict[str, Any] = self._call(
+            "set_reference_text", path, reference,
+            x=x, y=y, dx=dx, dy=dy, visible=visible)
+        return result
+
     def refill_zones(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("refill_zones", path)
+        return result
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_zone", path, net, layer, outline,
+            clearance_mm=clearance_mm,
+            min_thickness_mm=min_thickness_mm,
+            pad_connection=pad_connection,
+            thermal_gap_mm=thermal_gap_mm,
+            thermal_spoke_width_mm=thermal_spoke_width_mm,
+            name=name,
+            refill=refill,
+        )
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("delete_zone", path, name=name, uuid=uuid)
         return result
 
     def save_board(self, path: Path) -> dict[str, Any]:
@@ -227,6 +296,15 @@ class _LiveBoardOps(BoardOps):
 
     def import_ses(self, path: Path, ses_path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("import_ses", path, ses_path)
+        return result
+
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("add_routed_tracks", path, segments, vias)
         return result
 
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
@@ -441,6 +519,9 @@ class PluginDirectBackend(BackendProtocol):
     def get_zone_refill_ops(self) -> BoardOps | None:
         return self._resolve_live_ops(BackendCapability.ZONE_REFILL, write=True)
 
+    def get_zone_create_ops(self) -> BoardOps | None:
+        return self._resolve_live_ops(BackendCapability.ZONE_CREATE, write=True)
+
     def get_board_stackup_ops(self) -> BoardOps | None:
         return self._resolve_live_ops(BackendCapability.BOARD_STACKUP, write=False)
 
@@ -476,6 +557,23 @@ class PluginDirectBackend(BackendProtocol):
         """Import FreeRouting SES into live in-memory board via bridge. Always executes."""
         try:
             return self._board_ops.import_ses(path, ses_path)
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
+
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed tracks to the live in-memory board via bridge.
+
+        TraceMaker seam — always executes on the bridge (atomic batch; a failed
+        batch never modifies the board file).
+        """
+        try:
+            return self._board_ops.add_routed_tracks(path, segments, vias)
         except BridgeTemporarilyUnavailableError:
             self._on_bridge_disconnect()
             raise
@@ -616,12 +714,14 @@ class PluginDirectBackend(BackendProtocol):
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
     })
     _PLUGIN_CAPS = frozenset({
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
         BackendCapability.BOARD_ROUTE,
     })
@@ -678,6 +778,7 @@ class PluginDirectBackend(BackendProtocol):
                 "BOARD_READ": "ipc→plugin→file",
                 "BOARD_MODIFY": "ipc→plugin→file",
                 "ZONE_REFILL": "ipc→plugin→file",
+                "ZONE_CREATE": "ipc→plugin→file",
                 "BOARD_STACKUP": "ipc→plugin→file",
                 "SCHEMATIC_READ": "file",
                 "SCHEMATIC_MODIFY": "file",

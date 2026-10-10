@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from fastmcp import FastMCP
 
@@ -97,11 +97,12 @@ def run_validate_symbol_footprint_pairs(sch_path: Path) -> dict[str, Any]:
     LIMIT = 20
 
     symbols = _collect_all_real_symbols(sch_path)
-    lib_ops = FileLibraryOps()
-    # Resolve footprints with the project dir so project-local .pretty libraries
-    # (registered in the project fp-lib-table, S1) resolve — otherwise they'd be
-    # mis-reported as unresolvable and falsely block sync.
+    # Resolve footprints AND symbols with the project dir so project-local
+    # libraries (registered in the project fp-lib-table / sym-lib-table)
+    # resolve — otherwise they'd be mis-reported as unresolvable and falsely
+    # block sync (RW-S4 §3 / F-REC3).
     project_dir = sch_path.parent
+    lib_ops = FileLibraryOps(project_dir=project_dir)
 
     seen_refs: set[str] = set()
     checked = 0
@@ -386,29 +387,54 @@ def run_validate_schematic_for_pcb(sch_path: Path) -> dict[str, Any]:
     return result
 
 
+class _CourtyardPrims(NamedTuple):
+    """Exact-testable courtyard primitives in board coordinates (F-DV5).
+
+    ``circles`` holds ``(cx, cy, r)`` with the center rotated exactly by the
+    footprint rotation; ``rest`` is the bbox of every non-circle courtyard
+    point (``None`` for circle-only courtyards).
+    """
+
+    circles: list[tuple[float, float, float]]
+    rest: tuple[float, float, float, float] | None
+
+
 def _parse_placed_courtyards(
     content: str,
 ) -> tuple[dict[str, dict[str, float]], list[str]]:
     """Parse every real footprint's courtyard bounding box from board text.
 
     Returns ``(courtyards, no_courtyard)`` where ``courtyards`` maps each real
-    ref (non-``#``) that carries an ``F.CrtYd``/``B.CrtYd`` rectangle to its
-    board-frame ``{xmin, ymin, xmax, ymax}`` (rotation applied), and
-    ``no_courtyard`` lists real refs that have no courtyard geometry. Shared by
+    ref (non-``#``) that carries ``F.CrtYd``/``B.CrtYd`` geometry (rect, line,
+    poly, circle, arc, or Bézier — via ``courtyard_primitives``) to its
+    board-frame ``{xmin, ymin, xmax, ymax}`` (rotation applied; a circle's
+    bbox comes from its rotated center ± r), and ``no_courtyard`` lists real
+    refs that have no courtyard geometry. Shared by
     ``check_courtyard_overlaps`` (overlap detection) and ``verify_board_size``
     (§6.5 area/dimension sizing).
     """
+    courtyards, no_courtyard, _prims = _parse_courtyards_with_primitives(content)
+    return courtyards, no_courtyard
+
+
+def _parse_courtyards_with_primitives(
+    content: str,
+) -> tuple[dict[str, dict[str, float]], list[str], dict[str, _CourtyardPrims]]:
+    """Single walk behind ``_parse_placed_courtyards`` that also returns the
+    per-ref exact primitives the overlap gate refines candidate pairs with
+    (spec-courtyard-exact-overlap X2)."""
     import math as _math
 
+    from kicad_mcp.utils.courtyard_geometry import courtyard_primitives
     from kicad_mcp.utils.sexp_parser import _walk_balanced_parens
 
     courtyards: dict[str, dict[str, float]] = {}
     no_courtyard: list[str] = []
+    primitives: dict[str, _CourtyardPrims] = {}
 
     at_pat = re.compile(r'\(at\s+([-\d.]+)\s+([-\d.]+)(?:\s+([-\d.]+))?\)')
     ref_pat = re.compile(r'\(property\s+"Reference"\s+"([^"]+)"')
     fp_ref_pat = re.compile(r'\(fp_text\s+reference\s+"([^"]+)"')
-    coord_pat = re.compile(r'\((?:start|end)\s+([-\d.]+)\s+([-\d.]+)\)')
 
     i = 0
     n = len(content)
@@ -441,48 +467,50 @@ def _parse_placed_courtyards(
             origin_y = float(at_m.group(2)) if at_m else 0.0
             rotation_deg = float(at_m.group(3)) if (at_m and at_m.group(3)) else 0.0
 
-            cyd_xs: list[float] = []
-            cyd_ys: list[float] = []
+            circles, rest_points = courtyard_primitives(block)
 
-            bi = 0
-            bn = len(block)
-            while bi < bn:
-                if block[bi] != "(":
-                    bi += 1
-                    continue
-                bj = bi + 1
-                while bj < bn and block[bj] not in (" ", "\t", "\n", "(", ")"):
-                    bj += 1
-                sub_token = block[bi + 1 : bj]
-                if sub_token in ("fp_rect", "fp_line"):
-                    sub_end = _walk_balanced_parens(block, bi)
-                    if sub_end is not None:
-                        sub_block = block[bi : sub_end + 1]
-                        if '"F.CrtYd"' in sub_block or '"B.CrtYd"' in sub_block:
-                            for m in coord_pat.finditer(sub_block):
-                                cyd_xs.append(float(m.group(1)))
-                                cyd_ys.append(float(m.group(2)))
-                        bi = sub_end + 1
-                        continue
-                bi += 1
-
-            if cyd_xs and cyd_ys:
+            if circles or rest_points:
                 if abs(rotation_deg) > 0.01:
                     # KiCad convention: (x,y) -> (x*c + y*s, -x*s + y*c)
                     # (positive rotation = CCW on screen = CW in y-down file
-                    # coords; see tests/test_rotation_convention.py).
+                    # coords; see tests/test_rotation_convention.py). Circle
+                    # centers rotate exactly; radii are rotation-invariant.
                     rad = _math.radians(rotation_deg)
                     cos_r, sin_r = _math.cos(rad), _math.sin(rad)
-                    cyd_xs, cyd_ys = (
-                        [x * cos_r + y * sin_r for x, y in zip(cyd_xs, cyd_ys)],
-                        [-x * sin_r + y * cos_r for x, y in zip(cyd_xs, cyd_ys)],
+                    rest_points = [
+                        (x * cos_r + y * sin_r, -x * sin_r + y * cos_r)
+                        for x, y in rest_points
+                    ]
+                    circles = [
+                        (cx * cos_r + cy * sin_r, -cx * sin_r + cy * cos_r, r)
+                        for cx, cy, r in circles
+                    ]
+                board_circles = [
+                    (origin_x + cx, origin_y + cy, r) for cx, cy, r in circles
+                ]
+                rest_box: tuple[float, float, float, float] | None = None
+                if rest_points:
+                    rest_box = (
+                        origin_x + min(p[0] for p in rest_points),
+                        origin_y + min(p[1] for p in rest_points),
+                        origin_x + max(p[0] for p in rest_points),
+                        origin_y + max(p[1] for p in rest_points),
                     )
+                # Overall bbox: union of the rest box and each circle's exact
+                # center±r box (fixes the pre-F-DV5 understatement from
+                # rotating a circle's corner points at non-axis angles).
+                xs = [v for cx, cy, r in board_circles for v in (cx - r, cx + r)]
+                ys = [v for cx, cy, r in board_circles for v in (cy - r, cy + r)]
+                if rest_box is not None:
+                    xs.extend((rest_box[0], rest_box[2]))
+                    ys.extend((rest_box[1], rest_box[3]))
                 courtyards[ref] = {
-                    "xmin": origin_x + min(cyd_xs),
-                    "ymin": origin_y + min(cyd_ys),
-                    "xmax": origin_x + max(cyd_xs),
-                    "ymax": origin_y + max(cyd_ys),
+                    "xmin": min(xs),
+                    "ymin": min(ys),
+                    "xmax": max(xs),
+                    "ymax": max(ys),
                 }
+                primitives[ref] = _CourtyardPrims(board_circles, rest_box)
             else:
                 no_courtyard.append(ref)
 
@@ -490,19 +518,61 @@ def _parse_placed_courtyards(
             continue
         i += 1
 
-    return courtyards, no_courtyard
+    return courtyards, no_courtyard, primitives
+
+
+def _circle_box_intersect(
+    circle: tuple[float, float, float],
+    box: tuple[float, float, float, float],
+) -> bool:
+    """Exact (strict) circle-vs-axis-aligned-box intersection."""
+    import math as _math
+
+    cx, cy, r = circle
+    qx = min(max(cx, box[0]), box[2])
+    qy = min(max(cy, box[1]), box[3])
+    return _math.hypot(cx - qx, cy - qy) < r
+
+
+def _primitives_intersect(a: _CourtyardPrims, b: _CourtyardPrims) -> bool:
+    """Exact pair test over courtyard primitives (spec X3): any circle or
+    rest-box of one footprint strictly intersecting any of the other's.
+    Strict inequalities keep the bbox test's tangency semantics (touching is
+    not an overlap)."""
+    import math as _math
+
+    for ca in a.circles:
+        for cb in b.circles:
+            if _math.hypot(ca[0] - cb[0], ca[1] - cb[1]) < ca[2] + cb[2]:
+                return True
+        if b.rest is not None and _circle_box_intersect(ca, b.rest):
+            return True
+    if a.rest is not None:
+        for cb in b.circles:
+            if _circle_box_intersect(cb, a.rest):
+                return True
+        if b.rest is not None:
+            if (
+                min(a.rest[2], b.rest[2]) > max(a.rest[0], b.rest[0])
+                and min(a.rest[3], b.rest[3]) > max(a.rest[1], b.rest[1])
+            ):
+                return True
+    return False
 
 
 def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
     """File-based courtyard overlap check — extracted for use by pcb_pipeline.
 
     Returns the same structure as the check_courtyard_overlaps MCP tool
-    (without the JSON serialisation step).
+    (without the JSON serialisation step). The overall-bbox interval test is
+    a prefilter; candidate pairs are confirmed with exact primitive tests
+    (circle-circle / circle-box / box-box) so circular courtyards no longer
+    false-positive from bbox squaring (F-DV5, spec-courtyard-exact-overlap).
     """
     import math as _math
 
     content = pcb_path.read_text(encoding="utf-8")
-    courtyards, _ = _parse_placed_courtyards(content)
+    courtyards, no_courtyard, primitives = _parse_courtyards_with_primitives(content)
 
     overlaps: list[dict[str, Any]] = []
     refs = sorted(courtyards.keys())
@@ -513,6 +583,14 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
             overlap_x = min(a["xmax"], b["xmax"]) - max(a["xmin"], b["xmin"])
             overlap_y = min(a["ymax"], b["ymax"]) - max(a["ymin"], b["ymin"])
             if overlap_x > 0 and overlap_y > 0:
+                prim_a = primitives.get(ra)
+                prim_b = primitives.get(rb)
+                if (
+                    prim_a is not None
+                    and prim_b is not None
+                    and not _primitives_intersect(prim_a, prim_b)
+                ):
+                    continue  # bbox phantom — exact shapes clear each other
                 suggested_move = _math.sqrt(overlap_x ** 2 + overlap_y ** 2)
                 overlaps.append({
                     "ref_a": ra,
@@ -527,6 +605,8 @@ def run_check_courtyard_overlaps(pcb_path: Path) -> dict[str, Any]:
         "overlap_count": len(overlaps),
         "footprints_checked": len(courtyards),
         "overlaps": overlaps,
+        "no_courtyard": no_courtyard,
+        "no_courtyard_count": len(no_courtyard),
     }
 
 
@@ -546,7 +626,26 @@ _EDGE_NAME_TOKENS: tuple[str, ...] = (
     "Connector_RJ",
     "Connector_HDMI",
     "Connector_Coaxial",
+    # RW-S4 §6 (aqs #18 follow-up): wire-entry terminal blocks mate at the
+    # board edge too — covers TerminalBlock_Altech/Phoenix/MetzConnect and
+    # plain TerminalBlock libs, plus Phoenix connector libs without the word.
+    "TerminalBlock",
+    "Connector_Phoenix",
+    # F-DV6 (DV build 2026-10-05): the two tokens above live in the STOCK
+    # library prefix, which project-local re-homing replaces (the ecc83 demo
+    # ships its AK300s as "Footprints:Altech_AK300_…"). Manufacturer-series
+    # tokens live in the footprint NAME and survive re-homing.
+    "Altech_AK",
 )
+
+# SW-2 (remediation build 2026-10-06): "Horizontal" is an orientation
+# adjective (how the part lies on the board), not a connector identifier —
+# every horizontally-mounted axial passive in the KiCad libraries carries it
+# (R_Axial, C_Axial, D_DO-xx diodes, cylinder fuse holders). A Signal-2
+# candidate whose ONLY token hit is a generic token is kept only when its
+# refdes class names a connector.
+_GENERIC_EDGE_TOKENS: frozenset[str] = frozenset({"Horizontal"})
+_CONNECTOR_REF_CLASSES: frozenset[str] = frozenset({"J", "P", "X", "XP", "XS", "CON"})
 
 
 def _classify_footprint_local_face(local_x: float, local_y: float) -> str:
@@ -753,6 +852,22 @@ def _name_matches_edge_connector(lib_id: str) -> str | None:
     return None
 
 
+def _ref_class(ref: str) -> str:
+    """Leading alphabetic run of a reference designator, uppercased.
+
+    "R12" → "R", "con3" → "CON", "XS2" → "XS".
+    """
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        i += 1
+    return ref[:i].upper()
+
+
+def _has_specific_edge_token(lib_id: str) -> bool:
+    """True when lib_id matches any non-generic _EDGE_NAME_TOKENS entry (SW-2)."""
+    return any(t in lib_id for t in _EDGE_NAME_TOKENS if t not in _GENERIC_EDGE_TOKENS)
+
+
 def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
     """Detect footprints that need outward-facing edge placement.
 
@@ -769,7 +884,11 @@ def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
          "Connector_Audio", "Connector_JST", "Connector_BarrelJack",
          "Connector_RJ", "Connector_HDMI", "Connector_Coaxial". When
          matched, mating face is inferred from the pad-cluster centroid:
-         the cable enters opposite the pad cluster.
+         the cable enters opposite the pad cluster. A candidate whose
+         ONLY token hit is the generic orientation word "Horizontal" is
+         kept only when its refdes class is a connector class
+         (J/P/X/XP/XS/CON) — axial passives carry "Horizontal" too and
+         are silently skipped (SW-2).
 
       3. (attr through_hole exclude_from_pos_files) combined with a
          J/P reference is a confidence-bump for hand-solder cable
@@ -863,6 +982,10 @@ def run_identify_edge_facing_connectors(pcb_path: Path) -> dict[str, Any]:
         matched_token = _name_matches_edge_connector(lib_id)
         if matched_token is None:
             continue
+        if (matched_token in _GENERIC_EDGE_TOKENS
+                and not _has_specific_edge_token(lib_id)
+                and _ref_class(ref) not in _CONNECTOR_REF_CLASSES):
+            continue  # SW-2: orientation adjective on a non-connector refdes — not a connector
         pad_centroid = _scan_footprint_pad_centroid(block)
         cy_center = _scan_footprint_courtyard_center(block)
         if pad_centroid is not None and cy_center is not None:
@@ -1464,6 +1587,10 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
       ceiling) and decap distance over ``GATE_DECAP_MAX_MM`` are **advisory**
       violations: reported, but the gate still passes unless
       ``GATE_PROMOTE_ADVISORY`` promotes them to blocking (REQ-CFG-002).
+    - Footprints with no courtyard geometry are an **advisory**
+      ``no_courtyard`` violation (RW-S3 G3): they are invisible to the
+      overlap/out-of-outline/keep-out figures, so the gate names them rather
+      than staying silently blind.
 
     Side effect: the result is recorded to the board's sidecar validation cache
     (same mechanism as ``validate_connector_orientations``), which is what lets
@@ -1547,6 +1674,23 @@ def run_validate_placement_quality(pcb_path: Path) -> dict[str, Any]:
             "severity": "advisory",
             "decap_max_mm": float(decap_max),
             "target_mm": decap_target,
+        })
+
+    # Footprints with no courtyard geometry at all are invisible to every
+    # legality figure above — surface them so the gate is never silently
+    # blind (RW-S3 G3). Advisory: absent geometry is a library property, not
+    # a placement defect.
+    no_cyd = metric.get("no_courtyard") or []
+    if no_cyd:
+        violations.append({
+            "type": "no_courtyard",
+            "severity": "advisory",
+            "refs": list(no_cyd),
+            "message": (
+                f"{len(no_cyd)} footprint(s) have no courtyard geometry and "
+                "are invisible to overlap/legality checks: "
+                f"{', '.join(no_cyd)}"
+            ),
         })
 
     promote = get_bool("GATE_PROMOTE_ADVISORY")
@@ -1929,6 +2073,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
           2. Footprint name heuristic — Horizontal, _Receptacle_, Connector_USB,
              Connector_Audio, Connector_JST, Connector_BarrelJack, etc. (medium)
 
+        A name match whose only token hit is the generic orientation word
+        'Horizontal' is kept only when the refdes class is a connector class
+        (J/P/X/XP/XS/CON) — axial passives are silently skipped (SW-2).
+
         Returns the mating-face direction in the footprint's local frame.
         The placed footprint's outer (at x y rotation) must be applied by
         the caller to convert to board frame — that's what
@@ -1962,7 +2110,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Connectors whose mating face could not be determined (medium-confidence
         name-matches without a usable pad centroid) are reported under
         'indeterminate' rather than failing the gate — the model should
-        review them manually.
+        review them manually. Generic-'Horizontal' name matches on
+        non-connector refdes classes are excluded upstream by
+        identify_edge_facing_connectors, so axial passives no longer
+        appear here (SW-2).
 
         Side effect: the result is written to <board>.validation_cache.json so
         that autoroute can refuse to start when the most recent orientation

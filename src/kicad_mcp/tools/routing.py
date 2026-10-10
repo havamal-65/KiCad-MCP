@@ -1,12 +1,14 @@
-"""Auto-routing tools - 5 tools for PCB trace routing via FreeRouting."""
+"""Auto-routing tools - 5 tools for PCB trace routing via TraceMaker/FreeRouting."""
 
 from __future__ import annotations
 
+import contextlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 
@@ -29,6 +31,9 @@ from kicad_mcp.utils.platform_helper import (
 )
 from kicad_mcp.utils.validation import validate_kicad_path
 
+if TYPE_CHECKING:
+    from kicad_mcp.utils.tracemaker_runtime import TracemakerRuntime
+
 logger = get_logger("tools.routing")
 
 
@@ -47,14 +52,23 @@ def _impl_clear_routes(
     Tries the live in-memory bridge path so the bridge cache stays in sync with
     disk. Falls back to FileBoardOps when the bridge is unreachable.
     """
-    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.backends.file_backend import BoardOpenInKiCadError, FileBoardOps
     from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
 
     p = validate_kicad_path(path, ".kicad_pcb")
     try:
         result = backend.get_board_modify_ops().clear_routes(p, backup=backup)
     except BridgeTemporarilyUnavailableError:
-        result = FileBoardOps().clear_routes(p, backup=backup)
+        try:
+            result = FileBoardOps().clear_routes(p, backup=backup)
+        except BoardOpenInKiCadError as exc:
+            # KIR4 NS invariant: the board is open in KiCad but no live path
+            # can serve the write — refuse loudly, never edit behind KiCad.
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
 
     change_log.record(
         "clear_routes",
@@ -67,6 +81,44 @@ def _impl_clear_routes(
         backup_path=result.get("backup_path"),
     )
     return json.dumps(result, indent=2)
+
+
+def _clear_routes_for_reroute(
+    p: Path, backend: BackendProtocol, change_log: ChangeLog,
+) -> dict[str, Any]:
+    """Clear routed tracks ahead of a re-route (F16), pipeline-grade fallbacks.
+
+    ``_impl_clear_routes`` (the standalone tool body) falls back only on
+    BridgeTemporarilyUnavailableError. Inside the autoroute pipeline the clear
+    must also degrade like the clean/export/import steps do: on a backend with
+    no live board ops (NotImplementedError/AttributeError) and on a
+    reachable-but-boardless bridge (#13C), fall to the file backend. Raises on
+    real failures. Always writes the clear_routes backup first.
+    """
+    from kicad_mcp.backends.file_backend import FileBoardOps
+    from kicad_mcp.backends.plugin_backend import BridgeTemporarilyUnavailableError
+
+    try:
+        result = backend.get_board_modify_ops().clear_routes(p, backup=True)
+    except (NotImplementedError, AttributeError, BridgeTemporarilyUnavailableError):
+        result = FileBoardOps().clear_routes(p, backup=True)
+    except Exception as exc:
+        if _is_boardless_bridge_error(exc):
+            result = FileBoardOps().clear_routes(p, backup=True)
+        else:
+            raise
+    change_log.record(
+        "clear_routes",
+        {
+            "path": str(p),
+            "tracks_removed": result.get("tracks_removed", 0),
+            "vias_removed": result.get("vias_removed", 0),
+            "reason": "autoroute pre-clear (F16 idempotent re-route)",
+        },
+        file_modified=str(p),
+        backup_path=result.get("backup_path"),
+    )
+    return result
 
 
 def _is_boardless_bridge_error(err: object) -> bool:
@@ -323,6 +375,51 @@ def _parse_freerouting_track_length(ses_path: Path) -> float | None:
     return total
 
 
+def _ses_well_formed(ses_path: Path) -> bool:
+    """True when *ses_path* looks like a complete Specctra session file.
+
+    Guards the via-ladder and import against the truncated SES a killed
+    FreeRouting process can leave behind (a timeout ``proc.kill()`` can land
+    mid-write). LC-1 probe, verified on pcbnew 9.0.7 AND 10.0.4:
+    ``ImportSpecctraSES`` returns false on a truncated file (without mutating
+    the board) but imports a well-formed *partial* session fine — so this check
+    is exactly the line between "importable" and "hard failure".
+
+    Checks: readable, first token is ``(session``, and parentheses balance.
+    The scan is quote-aware with backslash-escape handling (net names like
+    ``"Net-(C1-Pad1)"`` put parens inside quoted strings — 66 such strings in
+    the LC-0 sample SES), mirroring ``sexp_parser._walk_balanced_parens``.
+    """
+    try:
+        text = ses_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not text.lstrip().startswith("(session"):
+        return False
+    depth = 0
+    in_quote = False
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+            continue
+        if in_quote:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_quote
+
+
 # Via-cost ladder for the v2.x adaptive auto-tune (REQ-FR-6). 50 is FreeRouting's
 # max-completeness default; higher costs trade completeness for fewer vias. The
 # completeness optimum is board-dependent and non-monotonic, so the whole ladder
@@ -363,6 +460,32 @@ def _detect_freerouting_is_v2(
         return False
 
 
+def _rank_via_ladder(rungs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """All rungs in import-preference order (REQ-FR-6 + FF next-best retry).
+
+    Fully-routed rungs first (fewest vias, then shortest track length, then
+    lowest via cost), then incomplete rungs by fewest unrouted with the same
+    tie-break. ``ranked[0]`` is the REQ-FR-6 winner; the tail is the retry
+    order when the winner's session fails to import (REQ-FF-5).
+    """
+    inf = float("inf")
+
+    def _via_key(r: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            r.get("vias") if r.get("vias") is not None else inf,
+            r.get("track_length") if r.get("track_length") is not None else inf,
+            r.get("via_costs", inf),
+        )
+
+    def _unrouted_key(r: dict[str, Any]) -> tuple[Any, ...]:
+        u = r.get("unrouted")
+        return (u if u is not None else inf, *_via_key(r))
+
+    complete = sorted((r for r in rungs if r.get("unrouted") == 0), key=_via_key)
+    rest = sorted((r for r in rungs if r.get("unrouted") != 0), key=_unrouted_key)
+    return complete + rest
+
+
 def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
     """Pick the best via-cost rung — REQ-FR-6.
 
@@ -374,24 +497,54 @@ def _select_via_ladder_winner(rungs: list[dict[str, Any]]) -> tuple[dict[str, An
     ``rungs`` entries carry: via_costs, unrouted (int|None), vias (int|None),
     track_length (float|None). Returns ``(winner, fully_complete)``.
     """
-    inf = float("inf")
+    winner = _rank_via_ladder(rungs)[0]
+    return winner, winner.get("unrouted") == 0
 
-    def _via_key(r: dict[str, Any]) -> tuple[Any, ...]:
-        return (
-            r.get("vias") if r.get("vias") is not None else inf,
-            r.get("track_length") if r.get("track_length") is not None else inf,
-            r.get("via_costs", inf),
-        )
 
-    complete = [r for r in rungs if r.get("unrouted") == 0]
-    if complete:
-        return min(complete, key=_via_key), True
+def _resolve_routing_runtime(
+    config: KiCadMCPConfig, freerouting_jar: str, java_path: str,
+) -> dict[str, Any]:
+    """Report which Java + FreeRouting the router will use, and how each was
+    chosen — without launching anything (F13). Mirrors the resolution order in
+    ``_impl_run_freerouter`` so the preflight can't disagree with the real run.
+    """
+    from kicad_mcp.utils.platform_helper import detect_java_major_version
 
-    def _unrouted_key(r: dict[str, Any]) -> tuple[Any, ...]:
-        u = r.get("unrouted")
-        return (u if u is not None else inf, *_via_key(r))
+    # Read config defensively: this info-only preflight must never break routing,
+    # and some harnesses pass a bare dict rather than a KiCadMCPConfig.
+    cfg_java = getattr(config, "java_path", None)
+    cfg_jar = getattr(config, "freerouting_jar", None)
 
-    return min(rungs, key=_unrouted_key), False
+    java: Path | None
+    java_source: str
+    if java_path:
+        java, java_source = Path(java_path), "argument"
+    elif cfg_java:
+        java, java_source = cfg_java, "KICAD_MCP_JAVA_PATH/config"
+    else:
+        java, java_source = find_java(), "auto-detected (PATH)"
+    java_major = (
+        detect_java_major_version(java)
+        if (java is not None and java.exists()) else None
+    )
+
+    jar: Path | None
+    jar_source: str
+    if freerouting_jar:
+        jar, jar_source = Path(freerouting_jar), "argument"
+    elif cfg_jar:
+        jar, jar_source = cfg_jar, "config"
+    else:
+        jar, jar_source = find_freerouting_jar(java_major), f"auto (java {java_major})"
+
+    return {
+        "java_path": str(java) if java else None,
+        "java_source": java_source,
+        "java_major": java_major,
+        "freerouting_jar": jar.name if jar else None,
+        "jar_source": jar_source,
+        "freerouting_version": _freerouting_version_from_jar(jar.name) if jar else None,
+    }
 
 
 def _impl_run_freerouter(
@@ -904,6 +1057,420 @@ def _read_hole_clearance_from_pro(pcb_path: Path, default: float = 0.22) -> floa
 
 
 # ---------------------------------------------------------------------------
+# Router selection + engine pipelines (TraceMaker Default Routing Stage 1)
+# ---------------------------------------------------------------------------
+
+def _detect_tracemaker_safe() -> tuple[TracemakerRuntime | None, str | None]:
+    """``detect_tracemaker()``, never raising — returns ``(runtime, error)``.
+
+    A broken detector must not break routing (same defensiveness as
+    ``_resolve_routing_runtime``): any exception is logged and surfaced as the
+    second tuple element instead of raised, so router="auto" can silently fall
+    back to FreeRouting while a forced router="tracemaker" can report the
+    TRUE failure ("detection failed: <err>" rather than the untrue "no
+    runtime was detected"). A clean no-runtime result is ``(None, None)``.
+    Function-level import so tests patch
+    ``kicad_mcp.utils.tracemaker_runtime.detect_tracemaker`` and so a cycle
+    with the runtime module can never form.
+    """
+    try:
+        from kicad_mcp.utils.tracemaker_runtime import detect_tracemaker
+        return detect_tracemaker(), None
+    except Exception as exc:  # noqa: BLE001 — detection is best-effort
+        logger.warning(
+            "TraceMaker detection failed (%s); falling back to FreeRouting", exc
+        )
+        return None, str(exc)
+
+
+def _route_with_freerouting(
+    report: dict[str, Any],
+    p: Path,
+    backend: BackendProtocol,
+    config: KiCadMCPConfig,
+    change_log: ChangeLog,
+    freerouting_jar: str,
+    java_path: str,
+    max_passes: int,
+    adaptive_via_cost: bool,
+    via_cost_ladder: list[int] | None,
+) -> int | None:
+    """FreeRouting pipeline: DSN export → FreeRouting run(s) → SES import.
+
+    Extracted from ``autoroute`` so it serves both the normal FreeRouting
+    branch and the TraceMaker-failure fallback. Mutates *report* (appends the
+    export_dsn / run_freerouter / import_ses steps, the via_ladder summary,
+    and on success/partial the final status + message) exactly as the inline
+    code did. Returns ``new_tracks`` on success or partial routing (temp DSN
+    and SES artifacts cleaned up), or ``None`` on failure — the report then
+    carries the structured error and preserved-artifact paths, and the caller
+    returns it as-is.
+    """
+    dsn = p.parent / "freerouting.dsn"
+    ses = p.parent / "freerouting.ses"
+
+    # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board),
+    # falling back to subprocess pcbnew when the bridge is unreachable or
+    # reachable-but-boardless (#13C).
+    dsn.unlink(missing_ok=True)  # stale-artifact guard (FF)
+    try:
+        dsn_result = _export_dsn_with_fallback(backend, p, dsn)
+        # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
+        try:
+            npth_pads = _extract_npth_pads(p)
+            if npth_pads:
+                expansion = _read_hole_clearance_from_pro(p)
+                n_keepouts = _inject_npth_keepouts_into_dsn(dsn, npth_pads, expansion)
+                dsn_result["npth_keepouts_injected"] = n_keepouts
+        except Exception as npth_exc:
+            logger.warning("NPTH keepout injection failed (non-fatal): %s", npth_exc)
+        report["steps"].append({"step": "export_dsn", "status": "success", **dsn_result})
+    except Exception as exc:
+        report["status"] = "error"
+        report["message"] = f"DSN export failed: {exc}"
+        return None
+
+    # Step 3: Run FreeRouting. On v2.x, auto-tune the via cost across the
+    # ladder and keep the best-complete result (REQ-FR-6); v1.x runs once.
+    temp_ses: list[Path] = []  # every SES written this run, for cleanup
+    is_v2 = _detect_freerouting_is_v2(config, freerouting_jar, java_path)
+    route_complete = False
+    route_unrouted: int | None = None
+
+    import_candidates: list[dict[str, Any]]
+    if is_v2 and adaptive_via_cost:
+        ladder = via_cost_ladder or _VIA_COST_LADDER
+        rungs: list[dict[str, Any]] = []
+        for vc in ladder:
+            ses_vc = p.parent / f"freerouting_vc{vc}.ses"
+            # Stale-artifact guard (FF): failure paths preserve SES files
+            # under these deterministic names, so a leftover from a
+            # previous run must be removed before launch — admission below
+            # may only ever see THIS run's output.
+            ses_vc.unlink(missing_ok=True)
+            temp_ses.append(ses_vc)
+            rj = json.loads(_impl_run_freerouter(
+                str(dsn), str(ses_vc), max_passes, freerouting_jar,
+                java_path, config, change_log, via_costs=vc,
+            ))
+            step: dict[str, Any] = {"step": "run_freerouter", **rj}
+            # A rung is admitted only if its SES exists AND is structurally
+            # valid — a truncated file from a timeout kill imports as a
+            # hard ImportSpecctraSES failure (REQ-FF-3, LC-1).
+            if ses_vc.exists():
+                if _ses_well_formed(ses_vc):
+                    rungs.append({
+                        "via_costs": vc,
+                        "unrouted": rj.get("unrouted"),
+                        "vias": rj.get("vias"),
+                        "track_length": _parse_freerouting_track_length(ses_vc),
+                        "ses_path": str(ses_vc),
+                    })
+                else:
+                    step["invalid_ses"] = True
+            report["steps"].append(step)
+            if rj.get("status") == "timeout":
+                break  # a stall won't improve at higher costs — stop laddering
+
+        if not rungs:
+            report["status"] = "error"
+            report["error_code"] = "no_valid_session"
+            report["message"] = (
+                "FreeRouting produced no valid session on any via-cost "
+                "rung. The DSN and any session files are preserved for "
+                "inspection; the board was not modified."
+            )
+            report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+            report["dsn_preserved"] = str(dsn) if dsn.exists() else None
+            return None
+
+        ranked = _rank_via_ladder(rungs)
+        winner = ranked[0]
+        route_complete = winner.get("unrouted") == 0
+        route_unrouted = winner.get("unrouted")
+        import_candidates = ranked
+        report["via_ladder"] = {
+            "tried": [r["via_costs"] for r in rungs],
+            "selected_via_cost": winner["via_costs"],
+            "complete": route_complete,
+            "vias": winner.get("vias"),
+            "unrouted": route_unrouted,
+        }
+    else:
+        ses.unlink(missing_ok=True)  # stale-artifact guard (FF)
+        rj = json.loads(_impl_run_freerouter(
+            str(dsn), str(ses), max_passes, freerouting_jar, java_path,
+            config, change_log,
+        ))
+        temp_ses.append(ses)
+        single_invalid = ses.exists() and not _ses_well_formed(ses)
+        single_step: dict[str, Any] = {"step": "run_freerouter", **rj}
+        if single_invalid:
+            single_step["invalid_ses"] = True
+        report["steps"].append(single_step)
+        if (rj.get("status") in ("error", "timeout") or not ses.exists()
+                or single_invalid):
+            report["status"] = "error"
+            if single_invalid:
+                report["error_code"] = "no_valid_session"
+                report["message"] = (
+                    "FreeRouting produced an invalid (truncated?) session "
+                    "file. It and the DSN are preserved for inspection; "
+                    "the board was not modified."
+                )
+            else:
+                report["message"] = f"FreeRouting failed: {rj.get('message', '')}"
+            report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+            report["dsn_preserved"] = str(dsn) if dsn.exists() else None
+            return None
+        route_unrouted = rj.get("unrouted")
+        # unrouted 0 → complete; None → v1.x can't report (treat as complete,
+        # its optimizer is strong); >0 → partial.
+        route_complete = route_unrouted in (0, None)
+        import_candidates = [{"ses_path": str(ses)}]
+
+    # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves),
+    # falling back to a headless subprocess that loads the board fresh from disk when the
+    # bridge is unreachable, boardless, or stale (#7 — preserves file-written Values).
+    # On the via-ladder, the winner is tried first and each remaining valid
+    # rung is the retry order (REQ-FF-5); a failed import never writes the
+    # board (bridge raises before save, subprocess saves only on success —
+    # LC-1 verified on KiCad 9 + 10), so retrying is safe.
+    import_attempts: list[dict[str, Any]] = []
+    ses_result: dict[str, Any] | None = None
+    imported_rung: dict[str, Any] | None = None
+    for candidate in import_candidates:
+        cand_path = Path(candidate["ses_path"])
+        try:
+            ses_result = _import_ses_with_fallback(backend, p, cand_path)
+            imported_rung = candidate
+            break
+        except Exception as exc:
+            logger.warning("import_ses failed for %s: %s", cand_path, exc)
+            import_attempts.append({
+                "ses_path": str(cand_path),
+                "via_costs": candidate.get("via_costs"),
+                "error": str(exc),
+            })
+    if ses_result is None or imported_rung is None:
+        report["status"] = "error"
+        report["error_code"] = "ses_import_failed"
+        report["message"] = (
+            "SES import failed for every candidate session. The board "
+            "file was NOT modified (a failed import never saves). The DSN "
+            "and session files are preserved on disk for inspection or a "
+            "manual import_ses; per-file errors are in import_attempts."
+        )
+        report["import_attempts"] = import_attempts
+        report["board_modified"] = False
+        report["ses_preserved"] = [str(s) for s in temp_ses if s.exists()]
+        report["dsn_preserved"] = str(dsn) if dsn.exists() else None
+        return None
+    import_step: dict[str, Any] = {"step": "import_ses", "status": "success", **ses_result}
+    if import_attempts:
+        import_step["failed_attempts"] = import_attempts
+    report["steps"].append(import_step)
+    # If a retry rung (not the winner) imported, the routed/unrouted truth
+    # comes from THAT rung.
+    if "via_costs" in imported_rung:
+        route_unrouted = imported_rung.get("unrouted")
+        route_complete = route_unrouted == 0
+        report["via_ladder"]["imported_via_cost"] = imported_rung.get("via_costs")
+
+    new_tracks = ses_result.get("new_tracks", 0)
+    if route_complete:
+        report["status"] = "success"
+        report["message"] = f"Auto-routing complete: {new_tracks} tracks routed"
+    else:
+        report["status"] = "partial"
+        report["message"] = (
+            f"Auto-routing incomplete: {new_tracks} tracks routed, "
+            f"{route_unrouted} connection(s) still unrouted — raise "
+            "max_passes or review placement."
+        )
+
+    # Clean up temp files (dsn + every rung's SES)
+    dsn.unlink(missing_ok=True)
+    for s in temp_ses:
+        s.unlink(missing_ok=True)
+
+    return int(new_tracks)
+
+
+def _route_with_tracemaker(
+    report: dict[str, Any],
+    p: Path,
+    backend: BackendProtocol,
+    config: KiCadMCPConfig,
+    change_log: ChangeLog,
+    runtime: TracemakerRuntime,
+    *,
+    allow_fallback: bool,
+    freerouting_jar: str,
+    java_path: str,
+    max_passes: int,
+    adaptive_via_cost: bool,
+    via_cost_ladder: list[int] | None,
+) -> int | None:
+    """TraceMaker pipeline: copy board+project → run → validate → import.
+
+    TraceMaker routes a COPY of the board (with its .kicad_pro — rules must
+    travel with the board; a rules-aware router must never see a bare
+    .kicad_pcb) in ``<board dir>/.tracemaker/``, and the routed tracks are
+    then imported back into the real board. Mutates *report* like
+    ``_route_with_freerouting`` and returns ``new_tracks``, or ``None`` on a
+    terminal failure.
+
+    Any failure (run error/timeout, missing/invalid output, extraction
+    failure, import exception): with *allow_fallback* (router="auto") the
+    failing step is recorded, a ``router_fallback`` step is appended (carrying
+    the FreeRouting resolution fields), and ``_route_with_freerouting`` runs;
+    without it (router="tracemaker" was forced) the result is a structured
+    ``tracemaker_failed`` error. The .tracemaker copies are kept on failure
+    for diagnosis and deleted on success.
+    """
+    from kicad_mcp.tools.routing_import import (
+        extract_new_routes,
+        import_routed_tracks_with_fallback,
+    )
+    from kicad_mcp.utils.tracemaker_runtime import run_tracemaker
+
+    run_dir = p.parent / ".tracemaker"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tm_in = run_dir / "tracemaker_in.kicad_pcb"
+    tm_in_pro = run_dir / "tracemaker_in.kicad_pro"
+    tm_out = run_dir / "tracemaker_out.kicad_pcb"
+    tm_out.unlink(missing_ok=True)  # stale-artifact guard (mirrors DSN/SES)
+    shutil.copyfile(p, tm_in)
+    pro = p.with_suffix(".kicad_pro")
+    if pro.exists():
+        shutil.copyfile(pro, tm_in_pro)
+    else:
+        tm_in_pro.unlink(missing_ok=True)  # never leave an earlier run's rules
+
+    failure: str | None = None
+    run_result: dict[str, Any] = {}
+    import_result: dict[str, Any] = {}
+
+    try:
+        run_result = run_tracemaker(runtime, tm_in, tm_out)
+    except Exception as exc:  # noqa: BLE001 — recorded, then fallback/refuse
+        report["steps"].append({
+            "step": "run_tracemaker", "status": "error", "error": str(exc),
+        })
+        failure = f"run_tracemaker raised: {exc}"
+    else:
+        report["steps"].append({"step": "run_tracemaker", **run_result})
+        if run_result.get("status") != "success":
+            failure = (
+                f"TraceMaker run ended with status '{run_result.get('status')}'"
+            )
+        elif not tm_out.exists():
+            failure = "TraceMaker reported success but wrote no output board"
+
+    if failure is None:
+        # Output validation: the routed board must hold extractable new routes
+        # (extract_new_routes raises on zero routes / malformed output).
+        try:
+            extract_info = extract_new_routes(tm_in, tm_out)
+            # Contract: extract_new_routes returns the route lists themselves
+            # ({"segments": [...], "vias": [...]}); a missing key is a
+            # contract break and must land in the except → fallback path.
+            new_segment_count = len(extract_info["segments"])
+            new_via_count = len(extract_info["vias"])
+        except Exception as exc:  # noqa: BLE001 — recorded, then fallback/refuse
+            report["steps"].append({
+                "step": "validate_output", "status": "error",
+                "error": str(exc),
+            })
+            failure = f"routed-output validation failed: {exc}"
+        else:
+            report["steps"].append({
+                "step": "validate_output",
+                "status": "success",
+                "new_segments": new_segment_count,
+                "new_vias": new_via_count,
+            })
+
+    if failure is None:
+        try:
+            import_result = import_routed_tracks_with_fallback(
+                backend, p, tm_in, tm_out,
+            )
+        except Exception as exc:  # noqa: BLE001 — recorded, then fallback/refuse
+            report["steps"].append({
+                "step": "import_routed_tracks", "status": "error",
+                "error": str(exc),
+            })
+            failure = f"routed-track import failed: {exc}"
+        else:
+            report["steps"].append({
+                "step": "import_routed_tracks", "status": "success",
+                **import_result,
+            })
+
+    if failure is not None:
+        # Keep the run-dir copies for diagnosis (like the DSN/SES artifacts).
+        report["tracemaker_preserved"] = [
+            str(f) for f in (tm_in, tm_in_pro, tm_out) if f.exists()
+        ]
+        if allow_fallback:
+            report["steps"].append({
+                "step": "router_fallback",
+                "from": "tracemaker",
+                "to": "freerouting",
+                "reason": failure,
+                **_resolve_routing_runtime(config, freerouting_jar, java_path),
+            })
+            return _route_with_freerouting(
+                report, p, backend, config, change_log,
+                freerouting_jar, java_path, max_passes,
+                adaptive_via_cost, via_cost_ladder,
+            )
+        report["status"] = "error"
+        report["error_code"] = "tracemaker_failed"
+        report["message"] = (
+            f"TraceMaker routing failed: {failure}. router='tracemaker' was "
+            "forced, so no FreeRouting fallback ran. The TraceMaker board "
+            "copies in .tracemaker/ are preserved for diagnosis."
+        )
+        return None
+
+    new_tracks = int(
+        import_result.get("new_tracks", import_result.get("tracks_added", 0))
+    )
+    route_unrouted = run_result.get("unrouted")
+    # unrouted 0 → complete; None → TraceMaker did not report a count (treat
+    # as complete, mirroring the single-run FreeRouting path, but say so —
+    # never a silently unverified success; post-route DRC stays the oracle
+    # that downgrades to success_with_drc_errors); >0 → partial.
+    if route_unrouted in (0, None):
+        report["status"] = "success"
+        report["message"] = f"Auto-routing complete: {new_tracks} tracks routed"
+        if route_unrouted is None:
+            report["unrouted_unverified"] = True
+            report["message"] += (
+                " (unrouted count unverified — confirm with post-route DRC)"
+            )
+    else:
+        report["status"] = "partial"
+        report["message"] = (
+            f"Auto-routing incomplete: {new_tracks} tracks routed, "
+            f"{route_unrouted} connection(s) still unrouted — raise "
+            "max_passes or review placement."
+        )
+
+    # Clean up the run-dir copies (success/partial only — kept on failure),
+    # then the run dir itself when nothing else lives in it.
+    for f in (tm_in, tm_in_pro, tm_out):
+        f.unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        run_dir.rmdir()
+
+    return new_tracks
+
+
+# ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
 
@@ -1086,11 +1653,33 @@ def register_tools(
         clean_board: bool = True,
         adaptive_via_cost: bool = True,
         via_cost_ladder: list[int] | None = None,
+        clear_routed_tracks: bool = True,
+        router: str = "auto",
     ) -> str:
         """Run the full auto-routing pipeline on a PCB board.
 
-        Complete workflow: clean board -> export DSN -> run FreeRouting -> import SES.
+        Complete workflow: clear existing routes -> clean board -> route with
+        the selected engine (TraceMaker: copy board+rules -> run -> import
+        tracks; FreeRouting: export DSN -> run FreeRouting -> import SES).
         Creates a backup of the board before any modifications.
+
+        Router selection (``router``): ``"auto"`` (default) uses TraceMaker
+        when a TraceMaker runtime is detected (KICAD_MCP_TRACEMAKER_DISTRO /
+        KICAD_MCP_TRACEMAKER_BIN; disable with KICAD_MCP_NO_TRACEMAKER) and
+        falls back to FreeRouting otherwise — including mid-run, when a
+        TraceMaker attempt fails (a ``router_fallback`` step is recorded).
+        ``"tracemaker"`` forces TraceMaker (a structured
+        ``tracemaker_unavailable`` / ``tracemaker_failed`` error instead of
+        any fallback); ``"freerouting"`` forces the FreeRouting pipeline. The
+        ``routing_preflight`` step names the selected router and how its
+        runtime resolved.
+
+        Re-running autoroute is idempotent (F16): existing routed tracks are
+        cleared first (with a .clear_routes_backup.kicad_pcb), because the SES
+        import ADDS tracks — without the clear, a re-route stacks a second copy
+        of every route on top of the old ones. Pass clear_routed_tracks=False
+        only when deliberately keeping hand-routed tracks; the run then warns
+        that the result may stack.
 
         Board outline and loadability are validated inside export_dsn — no separate
         preflight step is needed here.
@@ -1113,16 +1702,38 @@ def register_tools(
             adaptive_via_cost: Auto-tune the via cost on v2.x (default true).
             via_cost_ladder: Override the via-cost ladder (default
                 [50, 100, 150, 200, 300]). Ignored on v1.x / when adaptive off.
+            clear_routed_tracks: Clear existing routed tracks/vias before
+                routing (default true — idempotent re-route, backup written).
+                False keeps existing tracks and warns about stacking.
+            router: Routing engine — "auto" (default: TraceMaker when
+                detected, else FreeRouting, with automatic fallback),
+                "tracemaker" (forced, no fallback), or "freerouting"
+                (forced). Any other value is an "unknown_router" error.
 
         Returns:
             JSON with comprehensive routing report. status is "success" (fully
             routed), "partial" (routed but connections remain — carries
-            unrouted), "success_with_drc_errors", or "error".
+            unrouted), "success_with_drc_errors", or "error". On an import
+            failure the status is "error" with error_code "ses_import_failed"
+            and the DSN/SES artifacts are preserved on disk for diagnosis —
+            the board file itself is never modified by a failed import. A bad
+            router value is error_code "unknown_router"; a forced TraceMaker
+            run errors with "tracemaker_unavailable" (no runtime detected) or
+            "tracemaker_failed" (run/validation/import failed, .tracemaker/
+            artifacts preserved).
         """
-        p = validate_kicad_path(path, ".kicad_pcb")
-        dsn = p.parent / "freerouting.dsn"
-        ses = p.parent / "freerouting.ses"
         report: dict[str, Any] = {"status": "success", "steps": []}
+
+        if router not in ("auto", "tracemaker", "freerouting"):
+            report["status"] = "error"
+            report["error_code"] = "unknown_router"
+            report["message"] = (
+                f"Unknown router {router!r}. Allowed values: 'auto', "
+                "'tracemaker', 'freerouting'."
+            )
+            return json.dumps(report, indent=2)
+
+        p = validate_kicad_path(path, ".kicad_pcb")
 
         # Step 0: Connector-orientation gate (Phase 6.1.4).
         # autoroute refuses to start if validate_connector_orientations has not
@@ -1195,6 +1806,96 @@ def register_tools(
             "status": "success",
         })
 
+        # Router selection (TraceMaker Default Routing Stage 1) — after the
+        # two gates, before any routing work. "auto" prefers a detected
+        # TraceMaker runtime; explicit values force the engine.
+        tm_runtime: TracemakerRuntime | None = None
+        if router in ("auto", "tracemaker"):
+            tm_runtime, tm_detect_error = _detect_tracemaker_safe()
+            if tm_runtime is None and router == "tracemaker":
+                report["status"] = "error"
+                report["error_code"] = "tracemaker_unavailable"
+                if tm_detect_error is not None:
+                    cause = (
+                        "router='tracemaker' was requested but TraceMaker "
+                        f"detection failed: {tm_detect_error}."
+                    )
+                else:
+                    cause = (
+                        "router='tracemaker' was requested but no TraceMaker "
+                        "runtime was detected."
+                    )
+                report["message"] = (
+                    f"{cause} Point the MCP at one via "
+                    "KICAD_MCP_TRACEMAKER_DISTRO (WSL distro name) or "
+                    "KICAD_MCP_TRACEMAKER_BIN (binary path), and make sure "
+                    "KICAD_MCP_NO_TRACEMAKER is not set."
+                )
+                return json.dumps(report, indent=2)
+        selected_router = "tracemaker" if tm_runtime is not None else "freerouting"
+
+        # Routing preflight (F13): surface which routing engine + runtime this
+        # run resolved, and how — so the router version is never a silent guess.
+        if tm_runtime is not None:
+            report["steps"].append({
+                "step": "routing_preflight",
+                "status": "info",
+                "router": "tracemaker",
+                "router_resolution": {
+                    "mode": tm_runtime.mode,
+                    "distro": tm_runtime.distro,
+                    "binary": tm_runtime.binary,
+                    "version": tm_runtime.version,
+                },
+            })
+        else:
+            report["steps"].append({
+                "step": "routing_preflight",
+                "status": "info",
+                "router": "freerouting",
+                **_resolve_routing_runtime(config, freerouting_jar, java_path),
+            })
+
+        # Step 1a: Clear existing routes (F16) — idempotent re-route. Routed
+        # tracks survive the clean step below (it removes only net-less
+        # tracks), and the SES import ADDS tracks (LC-1: 477 -> 746 on an
+        # already-routed board), so without this a re-run stacks a second copy
+        # of every route (observed live: 222 -> 413).
+        if clear_routed_tracks:
+            try:
+                clear_result = _clear_routes_for_reroute(p, backend, change_log)
+            except Exception as exc:
+                report["status"] = "error"
+                report["message"] = f"Pre-route clearing failed: {exc}"
+                return json.dumps(report, indent=2)
+            report["steps"].append({
+                "step": "clear_routes",
+                "status": "success",
+                "tracks_removed": clear_result.get("tracks_removed", 0),
+                "vias_removed": clear_result.get("vias_removed", 0),
+                "backup_path": clear_result.get("backup_path"),
+            })
+        else:
+            # Warning-only detection; text-scan approximation is acceptable.
+            import re as _re
+            try:
+                board_text = p.read_text(encoding="utf-8")
+            except OSError:
+                board_text = ""
+            existing = len(_re.findall(r"\(segment[\s(]", board_text)) + len(
+                _re.findall(r"\(via[\s(]", board_text))
+            if existing:
+                report["steps"].append({
+                    "step": "clear_routes",
+                    "status": "skipped",
+                    "existing_tracks": existing,
+                    "warning": (
+                        f"{existing} existing routed track/via item(s) retained — "
+                        "the imported result may stack on top of them; pass "
+                        "clear_routed_tracks=True (default) for a clean re-route."
+                    ),
+                })
+
         # Step 1: Clean board (optional)
         if clean_board:
             result_json = _impl_clean_board_for_routing(
@@ -1207,115 +1908,61 @@ def register_tools(
                 report["message"] = f"Board cleanup failed: {result.get('message', '')}"
                 return json.dumps(report, indent=2)
 
-        # Step 2: Export DSN — routes to plugin bridge (reads live in-memory board),
-        # falling back to subprocess pcbnew when the bridge is unreachable or
-        # reachable-but-boardless (#13C).
-        try:
-            dsn_result = _export_dsn_with_fallback(backend, p, dsn)
-            # Inject NPTH keepout zones so FreeRouting avoids routing through drill holes
-            try:
-                npth_pads = _extract_npth_pads(p)
-                if npth_pads:
-                    expansion = _read_hole_clearance_from_pro(p)
-                    n_keepouts = _inject_npth_keepouts_into_dsn(dsn, npth_pads, expansion)
-                    dsn_result["npth_keepouts_injected"] = n_keepouts
-            except Exception as npth_exc:
-                logger.warning("NPTH keepout injection failed (non-fatal): %s", npth_exc)
-            report["steps"].append({"step": "export_dsn", "status": "success", **dsn_result})
-        except Exception as exc:
-            report["status"] = "error"
-            report["message"] = f"DSN export failed: {exc}"
-            return json.dumps(report, indent=2)
-
-        # Step 3: Run FreeRouting. On v2.x, auto-tune the via cost across the
-        # ladder and keep the best-complete result (REQ-FR-6); v1.x runs once.
-        temp_ses: list[Path] = []  # every SES written this run, for cleanup
-        is_v2 = _detect_freerouting_is_v2(config, freerouting_jar, java_path)
-        route_complete = False
-        route_unrouted: int | None = None
-
-        if is_v2 and adaptive_via_cost:
-            ladder = via_cost_ladder or _VIA_COST_LADDER
-            rungs: list[dict[str, Any]] = []
-            for vc in ladder:
-                ses_vc = p.parent / f"freerouting_vc{vc}.ses"
-                temp_ses.append(ses_vc)
-                rj = json.loads(_impl_run_freerouter(
-                    str(dsn), str(ses_vc), max_passes, freerouting_jar,
-                    java_path, config, change_log, via_costs=vc,
-                ))
-                report["steps"].append({"step": "run_freerouter", **rj})
-                if ses_vc.exists():
-                    rungs.append({
-                        "via_costs": vc,
-                        "unrouted": rj.get("unrouted"),
-                        "vias": rj.get("vias"),
-                        "track_length": _parse_freerouting_track_length(ses_vc),
-                        "ses_path": str(ses_vc),
-                    })
-                if rj.get("status") == "timeout":
-                    break  # a stall won't improve at higher costs — stop laddering
-
-            if not rungs:
-                report["status"] = "error"
-                report["message"] = "FreeRouting produced no session on any via-cost rung"
-                dsn.unlink(missing_ok=True)
-                for s in temp_ses:
-                    s.unlink(missing_ok=True)
-                return json.dumps(report, indent=2)
-
-            winner, route_complete = _select_via_ladder_winner(rungs)
-            ses = Path(winner["ses_path"])
-            route_unrouted = winner.get("unrouted")
-            report["via_ladder"] = {
-                "tried": [r["via_costs"] for r in rungs],
-                "selected_via_cost": winner["via_costs"],
-                "complete": route_complete,
-                "vias": winner.get("vias"),
-                "unrouted": route_unrouted,
-            }
-        else:
-            rj = json.loads(_impl_run_freerouter(
-                str(dsn), str(ses), max_passes, freerouting_jar, java_path,
-                config, change_log,
-            ))
-            report["steps"].append({"step": "run_freerouter", **rj})
-            temp_ses.append(ses)
-            if rj.get("status") in ("error", "timeout") or not ses.exists():
-                report["status"] = "error"
-                report["message"] = f"FreeRouting failed: {rj.get('message', '')}"
-                dsn.unlink(missing_ok=True)
-                return json.dumps(report, indent=2)
-            route_unrouted = rj.get("unrouted")
-            # unrouted 0 → complete; None → v1.x can't report (treat as complete,
-            # its optimizer is strong); >0 → partial.
-            route_complete = route_unrouted in (0, None)
-
-        # Step 4: Import SES — routes to plugin bridge (updates live in-memory board + saves),
-        # falling back to a headless subprocess that loads the board fresh from disk when the
-        # bridge is unreachable, boardless, or stale (#7 — preserves file-written Values).
-        try:
-            ses_result = _import_ses_with_fallback(backend, p, ses)
-            report["steps"].append({"step": "import_ses", "status": "success", **ses_result})
-        except Exception as exc:
-            report["status"] = "error"
-            report["message"] = f"SES import failed: {exc}"
-            for s in temp_ses:
-                s.unlink(missing_ok=True)
-            dsn.unlink(missing_ok=True)
-            return json.dumps(report, indent=2)
-
-        new_tracks = ses_result.get("new_tracks", 0)
-        if route_complete:
-            report["status"] = "success"
-            report["message"] = f"Auto-routing complete: {new_tracks} tracks routed"
-        else:
-            report["status"] = "partial"
-            report["message"] = (
-                f"Auto-routing incomplete: {new_tracks} tracks routed, "
-                f"{route_unrouted} connection(s) still unrouted — raise "
-                "max_passes or review placement."
+        # Steps 2–4: route with the selected engine. Both pipelines mutate
+        # the report (steps, via_ladder, final success/partial status +
+        # message) and return new_tracks, or None on a structured failure.
+        new_tracks_opt: int | None
+        if selected_router == "tracemaker" and tm_runtime is not None:
+            new_tracks_opt = _route_with_tracemaker(
+                report, p, backend, config, change_log, tm_runtime,
+                allow_fallback=(router == "auto"),
+                freerouting_jar=freerouting_jar, java_path=java_path,
+                max_passes=max_passes, adaptive_via_cost=adaptive_via_cost,
+                via_cost_ladder=via_cost_ladder,
             )
+        else:
+            new_tracks_opt = _route_with_freerouting(
+                report, p, backend, config, change_log,
+                freerouting_jar, java_path, max_passes,
+                adaptive_via_cost, via_cost_ladder,
+            )
+        if new_tracks_opt is None:
+            return json.dumps(report, indent=2)
+        new_tracks = new_tracks_opt
+
+        # Step 4b (spec-zones Z6, F-ECC2): refill zones between SES import and
+        # the post-route DRC — imported tracks invalidate pre-route fills, and
+        # stale fills otherwise count as DRC errors. Zoneless boards get no
+        # extra step.
+        refill_skipped_msg: str | None = None
+        try:
+            from kicad_mcp.backends.file_backend import parse_board_zones
+            from kicad_mcp.tools.board import _impl_refill_zones
+            has_zones = bool(parse_board_zones(p.read_text(encoding="utf-8")))
+        except Exception as zone_exc:
+            has_zones = False
+            logger.warning("autoroute: zone count check failed: %s", zone_exc)
+        if has_zones:
+            try:
+                refill_result = _impl_refill_zones(p, backend)
+            except Exception as refill_exc:
+                refill_result = {"status": "error", "message": str(refill_exc)}
+            if refill_result.get("status") in ("ok", "success"):
+                report["steps"].append({
+                    "step": "zone_refill",
+                    "status": "ok",
+                    "zones_filled": refill_result.get("zones_filled", 0),
+                })
+            else:
+                refill_skipped_msg = str(
+                    refill_result.get("message")
+                    or refill_result.get("reason") or "refill unavailable"
+                )
+                report["steps"].append({
+                    "step": "zone_refill",
+                    "status": "skipped",
+                    "message": refill_skipped_msg,
+                })
 
         # Step 5: Post-route DRC (best-effort; flags shorts/errors without blocking).
         try:
@@ -1323,13 +1970,20 @@ def register_tools(
             drc_result = drc_ops.run_drc(p, None)
             drc_passed = drc_result.get("passed", False)
             error_count = drc_result.get("error_count", 0)
-            report["steps"].append({
+            drc_step: dict[str, Any] = {
                 "step": "post_route_drc",
                 "status": "success",
                 "passed": drc_passed,
                 "error_count": error_count,
                 "warning_count": drc_result.get("warning_count", 0),
-            })
+            }
+            if refill_skipped_msg is not None:
+                drc_step["message"] = (
+                    drc_step.get("message", "")
+                    + " (zone fills may be stale; re-run run_drc after "
+                      "refill_zones)"
+                ).strip()
+            report["steps"].append(drc_step)
             if not drc_passed and report["status"] == "success":
                 report["status"] = "success_with_drc_errors"
                 report["message"] = (
@@ -1337,16 +1991,15 @@ def register_tools(
                     f"{error_count} error(s) — inspect board before fabrication."
                 )
         except Exception as drc_exc:
+            drc_msg = f"Post-route DRC skipped: {drc_exc}"
+            if refill_skipped_msg is not None:
+                drc_msg += (" (zone fills may be stale; re-run run_drc after "
+                            "refill_zones)")
             report["steps"].append({
                 "step": "post_route_drc",
                 "status": "unavailable",
-                "message": f"Post-route DRC skipped: {drc_exc}",
+                "message": drc_msg,
             })
-
-        # Clean up temp files (dsn + every rung's SES)
-        dsn.unlink(missing_ok=True)
-        for s in temp_ses:
-            s.unlink(missing_ok=True)
 
         change_log.record("autoroute", {"path": path, "max_passes": max_passes})
         return json.dumps(report, indent=2)

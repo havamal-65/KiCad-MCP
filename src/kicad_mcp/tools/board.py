@@ -1,8 +1,9 @@
-"""PCB board tools - 12 tools."""
+"""PCB board tools - 15 tools."""
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from fastmcp import FastMCP
 from kicad_mcp.backends.base import BackendProtocol
 from kicad_mcp.backends.placement_guard import DuplicateRefError
 from kicad_mcp.logging_config import get_logger
+from kicad_mcp.models.errors import ValidationError
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
 from kicad_mcp.utils.validation import (
@@ -201,6 +203,259 @@ def _board_size_refusal_message(cached: dict[str, Any]) -> str:
     return msg
 
 
+# ── FD (KIR3 S4): silkscreen tidy helpers ────────────────────────────────────
+# Pure geometry/classification helpers for tidy_silkscreen. The tool relocates a
+# reference designator off pads/copper first (industry best practice) and hides a
+# small-passive refdes only as the dense-board fallback — never an IC/connector.
+
+# DRC violation types that mark a reference-text placement problem.
+_SILK_TYPES = frozenset({"silk_overlap", "silk_over_copper", "silk_edge_clearance"})
+# Prefixes hideable as a fallback (small passives assembly reads from the fab
+# drawing / centroid, not the board). Deny wins over allow.
+_SILK_HIDE_ALLOW = frozenset({"R", "C", "L", "D", "LED", "FB", "TP", "MH"})
+# Never hidden — the parts a person needs to read on the board (REQ-FD-5).
+_SILK_HIDE_DENY = frozenset({"U", "J", "P", "Q", "K", "SW", "Y", "X", "F", "RN"})
+# KiCad names the refdes-text object "Reference field of <REF>" in DRC items
+# (confirmed live on a KiCad-10 DRC report, 2026-08). Only that ref's designator
+# is relocatable by this tool — the paired item in a silk violation is a pad or a
+# footprint's own body-silk segment, which we must not misattribute to.
+# The <REF> shape is deliberately annotation-strict (letters then digits): text-
+# label pseudo-footprints (e.g. KiBuzzard's "kibuzzard-67EBAC4C") also carry a
+# Reference field, but that field IS the placed artwork — it must never be
+# relocated or hidden (confirmed on the KiCad-10 cm5_minima demo board).
+_REF_FIELD_RE = re.compile(r"[Rr]eference field of ([A-Za-z]+\d+)\b")
+
+# Axis-aligned box: (x0, y0, x1, y1) in mm, board coordinates.
+_Box = tuple[float, float, float, float]
+
+
+def _ref_prefix(reference: str) -> str:
+    """Leading-letter prefix of a reference designator, upper-cased (R5 → R)."""
+    m = re.match(r"^([A-Za-z]+)", reference)
+    return m.group(1).upper() if m else ""
+
+
+def _is_small_passive(reference: str, fp_w: float, fp_h: float,
+                      max_size_mm: float) -> bool:
+    """True if *reference* is a small passive eligible for the hide fallback.
+
+    Both must hold: the prefix is in the allowlist and not the denylist
+    (ICs/connectors are never hidden), and the footprint's *narrow* body axis
+    fits the size ceiling. The narrow axis is used because the pcbnew body bbox
+    includes silkscreen graphics — measured live, a 0603 chip reads ~3.0 mm on
+    its long axis but ~1.5 mm across, so the short axis is the reliable "is this
+    a chip component" signal (default 2.0 mm passes 0402/0603/0805 R/C/LED,
+    rejects SOD-123, SOT-23, and everything larger).
+    """
+    prefix = _ref_prefix(reference)
+    if prefix in _SILK_HIDE_DENY or prefix not in _SILK_HIDE_ALLOW:
+        return False
+    return min(fp_w, fp_h) <= max_size_mm
+
+
+def _ref_box_at(cx: float, cy: float, w: float, h: float) -> _Box:
+    """Reference-text bounding box centered at (cx, cy)."""
+    return (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+
+
+def _boxes_clear(a: _Box, b: _Box, clearance: float) -> bool:
+    """True if boxes *a* and *b* are separated by at least *clearance* on some
+    axis (the axis-aligned separation test, expanded by clearance)."""
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return (ax1 + clearance <= bx0 or bx1 + clearance <= ax0
+            or ay1 + clearance <= by0 or by1 + clearance <= ay0)
+
+
+def _inside_board(box: _Box, board_rect: _Box, margin: float) -> bool:
+    """True if *box* sits fully inside *board_rect* inset by *margin*."""
+    x0, y0, x1, y1 = box
+    bx0, by0, bx1, by1 = board_rect
+    return (x0 >= bx0 + margin and y0 >= by0 + margin
+            and x1 <= bx1 - margin and y1 <= by1 - margin)
+
+
+def _find_clear_spot(w: float, h: float, fp_bbox: _Box,
+                     obstacles: list[_Box], clearance: float,
+                     board_rect: _Box | None = None,
+                     steps: int = 4) -> tuple[float, float] | None:
+    """Bounded ring search for a clear spot for a refdes next to its footprint.
+
+    Tries positions above / below / right / left of the footprint body (then the
+    four diagonals) at increasing offset, returning the first center whose
+    reference-text box clears every obstacle by *clearance* AND — when
+    *board_rect* is known — sits fully on the board with the same margin
+    (relocating text off the board edge just trades an overlap warning for a
+    silk_edge_clearance one; caught live on an edge-adjacent part). None if the
+    bounded search finds nothing (dense board → hide fallback for small
+    passives).
+    """
+    fx0, fy0, fx1, fy1 = fp_bbox
+    cx = (fx0 + fx1) / 2.0
+    cy = (fy0 + fy1) / 2.0
+    for ring in range(steps):
+        pad = clearance + ring * (h + clearance)
+        n = fy0 - pad - h / 2.0
+        s = fy1 + pad + h / 2.0
+        e = fx1 + pad + w / 2.0
+        wst = fx0 - pad - w / 2.0
+        candidates = [
+            (cx, n), (cx, s), (e, cy), (wst, cy),
+            (e, n), (e, s), (wst, n), (wst, s),
+        ]
+        for nx, ny in candidates:
+            box = _ref_box_at(nx, ny, w, h)
+            if board_rect is not None and not _inside_board(box, board_rect, clearance):
+                continue
+            if all(_boxes_clear(box, ob, clearance) for ob in obstacles):
+                return (nx, ny)
+    return None
+
+
+def _implicated_refs(violation: dict[str, Any],
+                     known_refs: set[str]) -> list[str]:
+    """References whose designator this tool can relocate to clear the violation.
+
+    The offending refdes-text object is named "Reference field of <REF>"; only
+    those refs are attributed. The paired item (a pad, or a footprint's own body
+    silk "Segment"/"Polygon") is deliberately not attributed — moving a refdes
+    would not clear a body-silk overlap. A violation with no reference field
+    (pure body silk) returns an empty list and is reported as residual, not
+    misattributed. Live check confirmed this wording is reliable on KiCad 10.
+    """
+    refs: set[str] = set()
+    for item in violation.get("items", []):
+        for m in _REF_FIELD_RE.finditer(str(item.get("description", ""))):
+            r = m.group(1).upper()
+            if r in known_refs:
+                refs.add(r)
+    return sorted(refs)
+
+
+def _silk_counts(drc: dict[str, Any]) -> dict[str, Any]:
+    """Silkscreen-warning tally from a DRC result: total + per-type breakdown."""
+    by_type: dict[str, int] = {t: 0 for t in sorted(_SILK_TYPES)}
+    total = 0
+    for v in drc.get("violations", []):
+        t = str(v.get("type", ""))
+        if t in _SILK_TYPES:
+            by_type[t] += 1
+            total += 1
+    return {"total": total, "by_type": by_type}
+
+
+def _plan_silk_tidy(records: list[dict[str, Any]], violations: list[dict[str, Any]],
+                    mode: str, clearance_mm: float,
+                    max_passive_size_mm: float,
+                    board_rect: _Box | None = None) -> dict[str, Any]:
+    """Plan the refdes edits that clear the silk warnings — pure, no side effects.
+
+    Maps each silk violation to its Reference-field owner, then for each: tries a
+    clear relocation spot next to the part (modes auto/relocate); failing that,
+    hides a small passive (modes auto/hide) or leaves an IC/connector in place.
+    Returns ``{relocated, hidden, skipped, implicated}`` — the same partition the
+    tool applies and reports. Kept module-level so it can be exercised directly
+    against real board geometry, not only through the live bridge.
+    """
+    by_ref: dict[str, dict[str, Any]] = {r["reference"]: r for r in records}
+    known: set[str] = set(by_ref)
+    fp_boxes: dict[str, _Box] = {
+        r["reference"]: (float(r["fp_x0"]), float(r["fp_y0"]),
+                         float(r["fp_x1"]), float(r["fp_y1"]))
+        for r in records
+    }
+    ref_boxes: dict[str, _Box] = {
+        r["reference"]: _ref_box_at(float(r["ref_x"]), float(r["ref_y"]),
+                                    float(r["ref_w"]), float(r["ref_h"]))
+        for r in records
+    }
+
+    implicated: dict[str, int] = {}
+    for v in violations:
+        if v.get("type") not in _SILK_TYPES:
+            continue
+        for ref in _implicated_refs(v, known):
+            implicated[ref] = implicated.get(ref, 0) + 1
+
+    all_fp_boxes: list[_Box] = list(fp_boxes.values())
+    relocated: list[dict[str, Any]] = []
+    hidden: list[str] = []
+    skipped: list[dict[str, Any]] = []
+
+    for ref in sorted(implicated):
+        rec = by_ref.get(ref)
+        if rec is None:
+            skipped.append({"ref": ref, "reason": "no reference-text record"})
+            continue
+        fp_box = fp_boxes[ref]
+        fp_w = fp_box[2] - fp_box[0]
+        fp_h = fp_box[3] - fp_box[1]
+        w, h = float(rec["ref_w"]), float(rec["ref_h"])
+        # Obstacles: all footprint bodies + every OTHER refdes text box.
+        obstacles = all_fp_boxes + [b for rr, b in ref_boxes.items() if rr != ref]
+
+        if mode in ("auto", "relocate"):
+            spot = _find_clear_spot(w, h, fp_box, obstacles, clearance_mm, board_rect)
+            if spot is not None:
+                relocated.append({
+                    "ref": ref,
+                    "from": [round(float(rec["ref_x"]), 4), round(float(rec["ref_y"]), 4)],
+                    "to": [round(spot[0], 4), round(spot[1], 4)],
+                })
+                continue
+
+        if mode in ("auto", "hide") and _is_small_passive(
+                ref, fp_w, fp_h, max_passive_size_mm):
+            hidden.append(ref)
+        elif mode == "relocate":
+            skipped.append({"ref": ref, "reason": "no clear spot within search radius"})
+        else:
+            skipped.append({
+                "ref": ref,
+                "reason": "no clear spot and not a hideable small passive "
+                          "(IC/connector or oversized) — left in place",
+            })
+
+    return {"relocated": relocated, "hidden": hidden, "skipped": skipped,
+            "implicated": sorted(implicated)}
+
+
+# ── spec-zones Z5/Z6 — refill body shared by the tool and autoroute ──────────
+
+def _impl_refill_zones(path: Path, backend: BackendProtocol) -> dict[str, Any]:
+    """The Z5 refill body: router-resolved ops, structured refusals.
+
+    Module-level (same pattern as routing's ``_impl_clear_routes``) so the
+    ``autoroute`` closure can refill between SES import and post-route DRC
+    (Z6) — tools cannot call each other's closures.
+    """
+    from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
+    from kicad_mcp.models.errors import SafeRefuseError
+
+    try:
+        ops = backend.get_zone_refill_ops()
+        if ops is None:
+            return {
+                "status": "unavailable",
+                "reason": "refill_zones requires KiCad running with IPC",
+            }
+        return ops.refill_zones(path)
+    except IPCStaleBoardError as exc:
+        return {
+            "status": "error",
+            "error_code": "stale_board",
+            "message": str(exc),
+            "remedy": exc.remedy,
+        }
+    except SafeRefuseError as exc:
+        return {
+            "status": "error",
+            "error_code": "kicad_running_no_live_path",
+            "message": str(exc),
+            "remedy": exc.remedy,
+        }
+
+
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
     """Register PCB board tools on the MCP server."""
 
@@ -211,7 +466,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         Args:
             path: Path to .kicad_pcb file.
             include: Optional list of sections to return. Omit for all sections.
-                     Valid values: components, nets, tracks, vias, zones.
+                     Valid values: components, nets, tracks, vias, zones, pads.
+                     "pads" is opt-in (only when explicitly listed): it attaches a
+                     per-pad net map to each component ([{"pad", "net"}, ...]) so a
+                     full netlist can be reconstructed from one call, without a
+                     get_net_connections fan-out (F7). Pad nets are read from the
+                     .kicad_pcb on disk, so save the board first for live edits.
                      The "info" section is always returned regardless of this filter.
 
         Returns:
@@ -221,10 +481,26 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_board_ops()
         result = ops.read_board(p)
 
-        VALID = {"components", "nets", "tracks", "vias", "zones"}
+        VALID = {"components", "nets", "tracks", "vias", "zones", "pads"}
+        want_pads = include is not None and "pads" in include
         if include:
             keep = set(include) & VALID
+            if want_pads:
+                keep.add("components")  # per-pad nets attach to components
             result = {k: v for k, v in result.items() if k == "info" or k in keep}
+
+        if want_pads and isinstance(result.get("components"), list):
+            from kicad_mcp.utils.placement_metrics import read_board_pads
+            content = p.read_text(encoding="utf-8")
+            by_ref: dict[str, list[dict[str, str]]] = {}
+            for pr in read_board_pads(content):
+                by_ref.setdefault(pr["ref"], []).append(
+                    {"pad": pr["pad"], "net": pr["net_name"]}
+                )
+            components: list[Any] = result["components"]
+            for comp in components:
+                if isinstance(comp, dict):
+                    comp["pads"] = by_ref.get(comp.get("reference", ""), [])
 
         change_log.record("read_board", {"path": path})
         return json.dumps({"status": "success", **limit_response(result)}, indent=2)
@@ -322,6 +598,147 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             backup_path=str(backup) if backup else None,
         )
         return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def tidy_silkscreen(
+        path: str,
+        mode: str = "auto",
+        clearance_mm: float = 0.15,
+        max_passive_size_mm: float = 2.0,
+        dry_run: bool = False,
+    ) -> str:
+        """Reduce silkscreen DRC warnings by tidying reference-designator text.
+
+        Best practice, applied in order: RELOCATE each clipped/overlapping refdes
+        off pads and copper to the nearest clear spot next to its part (≥
+        clearance_mm), then — only for a small passive with nowhere clear to go —
+        HIDE its refdes (assembly reads it from the fab drawing / centroid). IC
+        and connector references are never hidden. Re-runs DRC and reports the
+        silkscreen-warning count before and after. Live-board tool (needs the
+        bridge + an open PCB editor).
+
+        Args:
+            path: Path to .kicad_pcb file.
+            mode: 'auto' (relocate then hide-fallback), 'relocate' (never hide),
+                or 'hide' (hide small passives only).
+            clearance_mm: Min silk-to-copper clearance for a "clear" spot
+                (default 0.15 mm / 6 mil, the industry minimum).
+            max_passive_size_mm: Narrow-axis body ceiling for the hide fallback
+                (default 2.0 mm passes 0402/0603/0805 chip R/C/LED, excludes
+                SOD-123, SOT-23, and larger).
+            dry_run: Compute the plan and report it without changing the board.
+
+        Returns:
+            JSON with mode, silk_before/silk_after counts, and the relocated /
+            hidden / skipped / residual partition.
+        """
+        p = validate_kicad_path(path, ".kicad_pcb")
+        if mode not in ("auto", "relocate", "hide"):
+            return json.dumps({
+                "status": "error",
+                "message": f"mode must be 'auto', 'relocate', or 'hide' (got {mode!r}).",
+            }, indent=2)
+
+        # Baseline DRC (also the before/after measure) — save first so the CLI
+        # reads current board state.
+        try:
+            backend.save_board(p)
+            drc_ops = backend.get_drc_ops()
+            before = drc_ops.run_drc(p, None)
+        except Exception as exc:
+            return json.dumps({
+                "status": "error",
+                "message": f"tidy_silkscreen needs DRC for its before/after measure, "
+                           f"but run_drc failed: {exc}. Requires kicad-cli.",
+            }, indent=2)
+
+        silk_before = _silk_counts(before)
+
+        # Snapshot every footprint's Reference-field geometry in one bridge read.
+        ops = backend.get_board_modify_ops()
+        try:
+            snap = ops.get_reference_texts(p)
+        except Exception as exc:
+            return json.dumps({
+                "status": "error",
+                "message": f"tidy_silkscreen needs the reference-text bridge handler "
+                           f"(bridge ≥ 2.5.0-silk), but the call failed: {exc}. "
+                           "Reinstall the bridge and reopen the PCB editor.",
+            }, indent=2)
+
+        records: list[dict[str, Any]] = list(snap.get("references", []))
+        known: set[str] = {r["reference"] for r in records}
+
+        # Board outline constrains relocation spots — text moved off the board
+        # edge just trades an overlap for a silk_edge_clearance warning. The
+        # board was saved above, so the file matches the live state.
+        from kicad_mcp.tools.drc import _parse_board_bbox
+        board_rect = _parse_board_bbox(p.read_text(encoding="utf-8"))
+
+        plan = _plan_silk_tidy(records, before.get("violations", []),
+                               mode, clearance_mm, max_passive_size_mm,
+                               board_rect)
+        relocated = plan["relocated"]
+        hidden = plan["hidden"]
+        skipped = plan["skipped"]
+
+        # Apply the plan on the live board (unless previewing).
+        applied = False
+        after = before
+        silk_after = silk_before
+        if not dry_run and (relocated or hidden):
+            backup = create_backup(p)
+            try:
+                for item in relocated:
+                    ops.set_reference_text(p, item["ref"],
+                                           x=item["to"][0], y=item["to"][1])
+                for ref in hidden:
+                    ops.set_reference_text(p, ref, visible=False)
+            except Exception as exc:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"tidy_silkscreen applied part of the plan then failed: {exc}. "
+                               f"Board backed up at {backup}.",
+                    "relocated": relocated,
+                    "hidden": hidden,
+                }, indent=2)
+            change_log.record(
+                "tidy_silkscreen",
+                {"path": path, "mode": mode,
+                 "relocated": [i["ref"] for i in relocated], "hidden": hidden},
+                file_modified=path,
+                backup_path=str(backup) if backup else None,
+            )
+            applied = True
+            backend.save_board(p)
+            after = drc_ops.run_drc(p, None)
+            silk_after = _silk_counts(after)
+
+        # Residual silk warnings after the run (e.g. a hidden-but-unmovable small
+        # passive can still carry a mask-clip warning — KiCad #15052, not fixed in
+        # 10; reported, not suppressed).
+        residual: list[dict[str, Any]] = []
+        if applied:
+            for v in after.get("violations", []):
+                if v.get("type") in _SILK_TYPES:
+                    residual.append({
+                        "type": v.get("type"),
+                        "refs": _implicated_refs(v, known),
+                    })
+
+        return json.dumps({
+            "status": "success",
+            "mode": mode,
+            "dry_run": dry_run,
+            "applied": applied,
+            "silk_before": silk_before,
+            "silk_after": silk_after,
+            "drc_errors_after": after.get("error_count", before.get("error_count", 0)),
+            "relocated": relocated,
+            "hidden": hidden,
+            "skipped": skipped,
+            "residual_warnings": residual,
+        }, indent=2)
 
     @mcp.tool()
     def place_at_edge(
@@ -525,7 +942,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """Refill all copper pour zones on a PCB board.
 
         Recalculates copper fill for all zones after component placement or
-        routing changes. Requires KiCad to be running (IPC backend).
+        routing changes. Serves live-first (IPC/bridge with KiCad open); with
+        KiCad closed the fill runs out-of-process via KiCad's own bundled
+        Python. A zoneless board is a successful no-op that does not touch
+        the file.
 
         Args:
             path: Path to the .kicad_pcb file.
@@ -534,14 +954,245 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             JSON with refill status.
         """
         board_path = validate_kicad_path(path, ".kicad_pcb")
-        ops = backend.get_zone_refill_ops()
-        if ops is None:
+        result = _impl_refill_zones(board_path, backend)
+        if result.get("status") in ("ok", "success"):
+            change_log.record("refill_zones", {"path": path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def add_zone(
+        path: str,
+        net: str,
+        layer: str = "F.Cu",
+        outline: list[dict[str, float]] | None = None,
+        follow_board_outline: bool = False,
+        outline_margin_mm: float = 0.5,
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> str:
+        """Add a copper pour zone to a PCB board (e.g. a GND plane).
+
+        The zone outline is either an explicit polygon (absolute board
+        coordinates in mm) or, with follow_board_outline, a rectangle derived
+        from the Edge.Cuts bounding box inset by outline_margin_mm on all
+        sides (a deterministic bbox rule — not a polygon trace of the
+        outline). The net must already exist on the board — sync the
+        schematic first.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+            net: Net to pour (e.g. "GND"); must already exist on the board.
+            layer: Copper layer name (e.g. "F.Cu", "B.Cu").
+            outline: [{"x": mm, "y": mm}, ...] polygon points (≥ 3), absolute
+                board coordinates. Exactly one of outline /
+                follow_board_outline.
+            follow_board_outline: Derive the outline from Edge.Cuts instead.
+            outline_margin_mm: Inset from the board bbox when following.
+            clearance_mm: Zone clearance to other copper.
+            min_thickness_mm: Minimum fill sliver width.
+            pad_connection: "thermal", "solid", or "none".
+            thermal_gap_mm: Thermal relief gap.
+            thermal_spoke_width_mm: Thermal relief spoke width.
+            name: Optional zone name.
+            refill: Fill the zone after creation (default True).
+
+        Returns:
+            JSON with the created zone (uuid, fill state, serving path).
+        """
+        from kicad_mcp.backends.file_backend import (
+            BoardOpenInKiCadError,
+            _edge_cuts_bbox,
+        )
+        from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
+        from kicad_mcp.models.errors import SafeRefuseError
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+
+        if pad_connection not in ("thermal", "solid", "none"):
             return json.dumps({
-                "status": "unavailable",
-                "reason": "refill_zones requires KiCad running with IPC",
+                "status": "error",
+                "error_code": "invalid_pad_connection",
+                "message": "pad_connection must be one of: thermal, solid, none",
+            }, indent=2)
+        if outline is not None and follow_board_outline:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_conflict",
+                "message": "provide either outline or follow_board_outline, "
+                           "not both",
+            }, indent=2)
+        if outline is None and not follow_board_outline:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_conflict",
+                "message": "provide outline points or set follow_board_outline",
+            }, indent=2)
+        if outline is not None and len(outline) < 3:
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_outline_invalid",
+                "message": "zone outline needs at least 3 points",
+            }, indent=2)
+
+        if follow_board_outline:
+            bbox = _edge_cuts_bbox(board_path.read_text(encoding="utf-8"))
+            if bbox is None:
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "no_board_outline",
+                    "message": "board has no Edge.Cuts geometry to follow; "
+                               "add a board outline first or pass outline "
+                               "points explicitly",
+                }, indent=2)
+            min_x, min_y, max_x, max_y = bbox
+            m = outline_margin_mm
+            outline = [
+                {"x": round(min_x + m, 4), "y": round(min_y + m, 4)},
+                {"x": round(max_x - m, 4), "y": round(min_y + m, 4)},
+                {"x": round(max_x - m, 4), "y": round(max_y - m, 4)},
+                {"x": round(min_x + m, 4), "y": round(max_y - m, 4)},
+            ]
+        # The guards above force exactly one source, so outline is set here.
+        assert outline is not None
+
+        try:
+            ops = backend.get_zone_create_ops()
+            if ops is None:
+                return json.dumps({
+                    "status": "unavailable",
+                    "reason": "no backend can create zones in this session",
+                }, indent=2)
+            result = ops.add_zone(
+                board_path, net, layer, outline,
+                clearance_mm=clearance_mm,
+                min_thickness_mm=min_thickness_mm,
+                pad_connection=pad_connection,
+                thermal_gap_mm=thermal_gap_mm,
+                thermal_spoke_width_mm=thermal_spoke_width_mm,
+                name=name,
+                refill=refill,
+            )
+        except IPCStaleBoardError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "stale_board",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except SafeRefuseError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "kicad_running_no_live_path",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
+
+        if result.get("status") == "success":
+            change_log.record("add_zone", {
+                "path": path, "net": net, "layer": layer,
+                "zone_uuid": result.get("zone_uuid"),
             })
-        result = ops.refill_zones(board_path)
-        change_log.record("refill_zones", {"path": path})
+        return json.dumps(result, indent=2)
+
+    @mcp.tool()
+    def list_zones(path: str) -> str:
+        """List every zone on a PCB board, including rule (keep-out) areas.
+
+        Reads the saved .kicad_pcb file directly — a deliberate deviation
+        from the live-first convention so the answer is always file truth:
+        unsaved KiCad edits are not visible; save in KiCad first.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+
+        Returns:
+            JSON with zones (name, net, layers, is_rule_area, filled,
+            outline_points, uuid) and zone_count.
+        """
+        from kicad_mcp.backends.file_backend import parse_board_zones
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+        zones = parse_board_zones(board_path.read_text(encoding="utf-8"))
+        return json.dumps({
+            "status": "success",
+            "zones": zones,
+            "zone_count": len(zones),
+            "source": "file",
+        }, indent=2)
+
+    @mcp.tool()
+    def delete_zone(path: str, name: str = "", uuid: str = "") -> str:
+        """Delete one copper zone from a PCB board, by name or uuid.
+
+        Exactly one selector must be given. Rule (keep-out) areas are
+        refused — use the keep-out tools for those. Get names/uuids from
+        list_zones.
+
+        Args:
+            path: Path to the .kicad_pcb file.
+            name: Zone name to delete (must match exactly one zone).
+            uuid: Zone uuid to delete.
+
+        Returns:
+            JSON with the deleted zone or a structured error.
+        """
+        from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
+        from kicad_mcp.backends.ipc_connection import IPCStaleBoardError
+        from kicad_mcp.models.errors import SafeRefuseError
+
+        board_path = validate_kicad_path(path, ".kicad_pcb")
+
+        if bool(name) == bool(uuid):
+            return json.dumps({
+                "status": "error",
+                "error_code": "zone_selector_invalid",
+                "message": "provide exactly one of name or uuid",
+            }, indent=2)
+
+        try:
+            ops = backend.get_zone_create_ops()
+            if ops is None:
+                return json.dumps({
+                    "status": "unavailable",
+                    "reason": "no backend can delete zones in this session",
+                }, indent=2)
+            result = ops.delete_zone(board_path, name=name, uuid=uuid)
+        except IPCStaleBoardError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "stale_board",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except SafeRefuseError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "kicad_running_no_live_path",
+                "message": str(exc),
+                "remedy": exc.remedy,
+            }, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_open_in_kicad",
+                "message": str(exc),
+            }, indent=2)
+
+        if result.get("status") == "success":
+            change_log.record("delete_zone", {
+                "path": path, "deleted": result.get("deleted"),
+            })
         return json.dumps(result, indent=2)
 
     @mcp.tool()
@@ -572,11 +1223,15 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         preset: str = "class2",
         differential_pairs: list[dict[str, Any]] | None = None,
         length_matching: list[dict[str, Any]] | None = None,
+        netclass_values: dict[str, float] | None = None,
+        rule_values: dict[str, float] | None = None,
     ) -> str:
-        """Write IPC-2221 design rules into a board's setup section.
+        """Write design rules into the sibling .kicad_pro project file.
 
-        Encodes manufacturing-enforceable design constraints so DRC catches
-        real violations rather than using KiCad's permissive defaults.
+        Encodes manufacturing-enforceable design constraints so DRC and the
+        router use real limits rather than KiCad's permissive defaults. Only
+        the ``.kicad_pro`` (and, for length matching, the ``.kicad_dru``) is
+        written — the ``.kicad_pcb`` file is not modified.
 
         Preset "class2" applies IPC-2221 Class 2 / IPC-7351 Level B values:
           min_clearance   0.20 mm  (IPC-2221 Table 6-1, ≤30 V)
@@ -584,11 +1239,30 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
           via_min_drill   0.30 mm  (IPC-2221 / common fab minimum)
           via_min_size    0.60 mm  (annular ring ≥ 0.15 mm → pad ≥ 0.60 mm)
           via_min_annulus 0.15 mm  (IPC-2221)
-          hole_clearance  0.25 mm  (IPC-2221)
+          hole_clearance  0.22 mm  (IPC-2221)
           courtyard_offset 0.25 mm (IPC-7351 Level B)
 
         Preset "fab_jlcpcb" applies JLCPCB 2-layer standard design rules
-        (tighter than IPC-2221 Class 2 in some parameters).
+        (tighter than IPC-2221 Class 2 in some parameters). Preset ``""``
+        skips the preset entirely (values-only call).
+
+        Explicit values (F-DV4): ``netclass_values`` sets Default-netclass
+        values directly and wins over the preset, e.g.::
+
+            netclass_values={"clearance_mm": 0.4, "track_width_mm": 0.8,
+                             "via_diameter_mm": 1.2, "via_drill_mm": 0.6}
+
+        Allowed keys: clearance_mm, track_width_mm, via_diameter_mm,
+        via_drill_mm, microvia_diameter_mm, microvia_drill_mm,
+        diff_pair_width_mm, diff_pair_gap_mm, diff_pair_via_gap_mm (all > 0).
+        Diff-pair classes created in the same call inherit the overridden
+        Default. ``rule_values`` sets DRC minimums
+        (board.design_settings.rules) directly: min_clearance_mm,
+        min_track_width_mm, min_via_diameter_mm, min_via_annular_width_mm,
+        min_through_hole_diameter_mm, min_hole_clearance_mm,
+        min_copper_edge_clearance_mm, min_hole_to_hole_mm (all >= 0).
+        A Default value below an effective minimum is reported in a
+        non-blocking ``warnings`` list, not refused.
 
         Differential pairs (§6.4): pass ``differential_pairs`` to declare named
         netclasses with controlled width/gap and assign their nets, e.g.::
@@ -612,15 +1286,21 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Args:
             path: Path to .kicad_pcb file.
-            preset: Rule preset — "class2" (default) or "fab_jlcpcb".
+            preset: Rule preset — "class2" (default), "fab_jlcpcb", or ""
+                to skip the preset.
             differential_pairs: Optional diff-pair declarations (see above).
             length_matching: Optional length-match groups (see above).
+            netclass_values: Optional explicit Default-netclass values.
+            rule_values: Optional explicit DRC minimums.
 
         Returns:
-            JSON with applied preset name and rule values, plus
-            ``differential_pairs_applied`` / ``length_matching_applied`` when
-            supplied. On invalid input, ``{"status": "error", ...}`` and
-            nothing is written.
+            JSON with applied preset name and rule values (no
+            ``rules_applied`` key when preset is ""), plus
+            ``differential_pairs_applied`` / ``length_matching_applied`` /
+            ``netclass_values_applied`` / ``rule_values_applied`` when
+            supplied, ``pro_backup_path``, and ``warnings`` when any Default
+            value sits below an effective minimum. On invalid input,
+            ``{"status": "error", ...}`` and nothing is written.
         """
         # ── Validation (REQ-API-003) — before any write ──────────────────────
         try:
@@ -657,17 +1337,41 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     raise ValueError(
                         f"{lm.get('group')}: tolerance_mm must be >= 0 when given"
                     )
+            from kicad_mcp.backends.file_backend import FileBoardOps
+            for key, value in (netclass_values or {}).items():
+                if key not in FileBoardOps._NETCLASS_VALUE_KEYS:
+                    raise ValueError(
+                        f"netclass_values: unknown key '{key}' (allowed: "
+                        f"{sorted(FileBoardOps._NETCLASS_VALUE_KEYS)})"
+                    )
+                if value <= 0:
+                    raise ValueError(f"netclass_values: {key} must be > 0")
+            for key, value in (rule_values or {}).items():
+                if key not in FileBoardOps._RULE_VALUE_KEYS:
+                    raise ValueError(
+                        f"rule_values: unknown key '{key}' (allowed: "
+                        f"{sorted(FileBoardOps._RULE_VALUE_KEYS)})"
+                    )
+                if value < 0:
+                    raise ValueError(f"rule_values: {key} must be >= 0")
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)}, indent=2)
 
         p = validate_kicad_path(path, ".kicad_pcb")
         backup = create_backup(p)
-        from kicad_mcp.backends.file_backend import FileBoardOps
-        result = FileBoardOps().set_board_design_rules(
-            p, preset,
-            differential_pairs=differential_pairs,
-            length_matching=length_matching,
-        )
+        # Backend failures (unknown preset, missing .kicad_pro, effective
+        # via_drill >= via_diameter) return the same structured error shape
+        # instead of escaping as raw exceptions (spec N4).
+        try:
+            result = FileBoardOps().set_board_design_rules(
+                p, preset,
+                differential_pairs=differential_pairs,
+                length_matching=length_matching,
+                netclass_values=netclass_values,
+                rule_values=rule_values,
+            )
+        except (ValueError, FileNotFoundError, ValidationError) as exc:
+            return json.dumps({"status": "error", "message": str(exc)}, indent=2)
         change_log.record(
             "set_board_design_rules",
             {
@@ -675,6 +1379,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 "preset": preset,
                 "differential_pairs": differential_pairs,
                 "length_matching": length_matching,
+                "netclass_values": netclass_values,
+                "rule_values": rule_values,
             },
             file_modified=path,
             backup_path=str(backup) if backup else None,

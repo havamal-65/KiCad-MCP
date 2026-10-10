@@ -26,6 +26,7 @@ class BackendCapability(Enum):
     NETLIST_GENERATE = auto()
     REAL_TIME_SYNC = auto()
     ZONE_REFILL = auto()
+    ZONE_CREATE = auto()
     BOARD_STACKUP = auto()
     BOARD_ROUTE = auto()
 
@@ -102,6 +103,53 @@ class BoardOps(ABC):
         """Refill all copper zones (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support zone refill")
 
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        """Add a copper zone with the given absolute outline (mm)."""
+        raise NotImplementedError("This backend does not support zone creation")
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        """Delete one copper zone selected by name or uuid."""
+        raise NotImplementedError("This backend does not support zone deletion")
+
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        """Bulk-read every footprint's reference-designator field geometry
+        (position, size, visibility, and body bbox) — requires a live bridge."""
+        raise NotImplementedError("This backend does not support reference-text reads")
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        """Move and/or show-hide a footprint's reference-designator field
+        (requires a live pcbnew bridge backend)."""
+        raise NotImplementedError("This backend does not support reference-text edits")
+
+    def set_footprint_value(self, path: Path, reference: str, value: str) -> dict[str, Any]:
+        """Set a footprint's Value text on the board."""
+        raise NotImplementedError("This backend does not support value edits")
+
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Set a footprint's KIID sheet path and/or named text fields."""
+        raise NotImplementedError("This backend does not support footprint metadata")
+
     def get_stackup(self, path: Path) -> dict[str, Any]:
         """Return the board's layer stackup (requires a live pcbnew/IPC backend)."""
         raise NotImplementedError("This backend does not support stackup queries")
@@ -157,6 +205,20 @@ class BoardOps(ABC):
         """Import Specctra SES routing into live in-memory board."""
         raise NotImplementedError("This backend does not support import_ses")
 
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed segments/vias to the live in-memory board.
+
+        TraceMaker seam: the router worked on a temp copy, so the new copper
+        is re-applied here as an atomic batch (mm floats, layer names, net
+        NAMES). A failed batch never modifies the board file.
+        """
+        raise NotImplementedError("This backend does not support add_routed_tracks")
+
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
         """Remove all routed tracks and vias from the board file."""
         raise NotImplementedError("This backend does not support clear_routes")
@@ -178,8 +240,18 @@ class SchematicOps(ABC):
         x: float, y: float, rotation: float = 0.0,
         mirror: str | None = None, footprint: str = "",
         properties: dict[str, str] | None = None,
+        unit: int = 1,
+        in_bom: bool = True, on_board: bool = True,
+        dnp: bool = False, exclude_from_sim: bool = False,
     ) -> dict[str, Any]:
-        """Add a component symbol to the schematic."""
+        """Add a component symbol to the schematic.
+
+        ``unit`` places one unit of a multi-unit symbol; placing another unit
+        is another call with the same reference and lib_id (RW-S1 C1).
+        ``in_bom`` / ``on_board`` / ``dnp`` / ``exclude_from_sim`` author the
+        symbol's bare attribute flags (F-DV12); the defaults reproduce
+        today's output byte for byte.
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def add_wire(
@@ -216,15 +288,25 @@ class SchematicOps(ABC):
         """Add a junction dot at the given position."""
         raise NotImplementedError("This backend does not support schematic modification")
 
-    def remove_component(self, path: Path, reference: str) -> dict[str, Any]:
-        """Remove a placed component symbol from the schematic by reference designator."""
+    def remove_component(
+        self, path: Path, reference: str, unit: int | None = None,
+    ) -> dict[str, Any]:
+        """Remove a placed component symbol from the schematic by reference designator.
+
+        ``unit=None`` removes every unit block of the reference (whole
+        component); an integer removes that unit's block only (RW-S1 C4).
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def move_component(
         self, path: Path, reference: str, x: float, y: float,
-        rotation: float | None = None,
+        rotation: float | None = None, unit: int = 1,
     ) -> dict[str, Any]:
-        """Move a schematic symbol to a new position, optionally updating rotation."""
+        """Move a schematic symbol to a new position, optionally updating rotation.
+
+        For multi-unit symbols ``unit`` selects which unit's block moves;
+        without it, unit 1 moves (RW-S1 C4).
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def update_component_property(
@@ -232,6 +314,20 @@ class SchematicOps(ABC):
         property_name: str, property_value: str,
     ) -> dict[str, Any]:
         """Update or add a property on a placed schematic symbol."""
+        raise NotImplementedError("This backend does not support schematic modification")
+
+    def set_symbol_attributes(
+        self, path: Path, reference: str, *,
+        in_bom: bool | None = None,
+        on_board: bool | None = None,
+        dnp: bool | None = None,
+        exclude_from_sim: bool | None = None,
+    ) -> dict[str, Any]:
+        """Set the bare symbol attribute flags on a placed symbol (F-DV12).
+
+        The flags are not (property ...) clauses — update_component_property
+        cannot reach them. ``None`` leaves a flag unchanged.
+        """
         raise NotImplementedError("This backend does not support schematic modification")
 
     def remove_wire(
@@ -295,7 +391,8 @@ class SchematicOps(ABC):
 
         components: list of dicts matching add_component's parameters
                     (lib_id, reference, value, x, y, optional rotation,
-                    mirror, footprint, properties).
+                    mirror, footprint, properties, in_bom, on_board, dnp,
+                    exclude_from_sim).
         Returns {"placed": [...], "failed": [...]}.
         """
         raise NotImplementedError("This backend does not support add_components_bulk")
@@ -400,6 +497,14 @@ class ExportOps(ABC):
         """Export 3D VRML model."""
         raise NotImplementedError("This backend does not support VRML export")
 
+    def render_board(
+        self, board_path: Path, output_path: Path, *,
+        side: str = "top", width: int = 1600, height: int = 900,
+        zoom: float | None = None, rotate: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the board to a PNG/JPEG image (3D top-down by default)."""
+        raise NotImplementedError("This backend does not support board rendering")
+
 
 class DRCOps(ABC):
     """Abstract interface for design rule checks."""
@@ -411,6 +516,12 @@ class DRCOps(ABC):
     def run_erc(self, schematic_path: Path, output: Path | None = None) -> dict[str, Any]:
         """Run Electrical Rules Check on a schematic."""
         raise NotImplementedError("This backend does not support ERC")
+
+    def generate_netlist(
+        self, schematic_path: Path, output: Path, fmt: str = "kicadsexpr",
+    ) -> dict[str, Any]:
+        """Generate a netlist from a schematic (kicad-cli backends)."""
+        raise NotImplementedError("This backend does not support netlist generation")
 
 
 class LibraryOps(ABC):
@@ -483,8 +594,14 @@ class LibraryManageOps(ABC):
     @abstractmethod
     def import_footprint(
         self, source_lib: str, footprint_name: str, target_lib_path: str,
+        overwrite: bool = False,
     ) -> dict[str, Any]:
-        """Copy a .kicad_mod file from a source .pretty dir to a target .pretty dir."""
+        """Copy a .kicad_mod file from a source .pretty dir to a target .pretty dir.
+
+        ``${KIPRJMOD}``-relative 3D model assets referenced by the footprint
+        are carried into the target project (F-DV8); ``overwrite`` replaces
+        an existing target footprint instead of refusing.
+        """
 
     @abstractmethod
     def register_project_library(
@@ -583,6 +700,9 @@ class BackendProtocol:
     def get_zone_refill_ops(self) -> BoardOps | None:
         return None
 
+    def get_zone_create_ops(self) -> BoardOps | None:
+        return None
+
     def get_board_stackup_ops(self) -> BoardOps | None:
         return None
 
@@ -618,6 +738,19 @@ class BackendProtocol:
         otherwise subprocess pcbnew). Raises on failure.
         """
         raise NotImplementedError("This backend does not support SES import")
+
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed segments/vias (TraceMaker seam).
+
+        Routes to the live BOARD_ROUTE backend (plugin bridge). Raises on
+        failure; a failed batch never modifies the board file.
+        """
+        raise NotImplementedError("This backend does not support add_routed_tracks")
 
     def reload_board(self, path: Path) -> bool:
         """Reload pcbnew in-memory board from disk after an external write.

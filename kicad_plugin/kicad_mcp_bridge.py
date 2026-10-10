@@ -25,6 +25,8 @@ Write (all run on the wxPython main thread to avoid pcbnew GUI crashes):
   add_via            → add a through/blind/buried via
   assign_net         → assign a net to a specific pad
   refill_zones       → fill all copper zones
+  add_zone           → create a copper zone (outline in absolute mm)
+  delete_zone        → remove one copper zone by name or uuid
 
 Installation (Windows):
     Copy to %APPDATA%\\kicad\\9.0\\scripting\\plugins\\
@@ -51,7 +53,10 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.4.1-k10s2"
+# 2.8.0-tracemaker: add_routed_tracks — atomic batch import of externally
+#           routed segments/vias (TraceMaker seam); all-or-nothing, no save on
+#           failure.
+_BRIDGE_VERSION = "2.8.0-tracemaker"
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1156,153 @@ def _handle_set_footprint_value(path: str, reference: str, value: str) -> dict[s
     return _run_on_main_thread(_do)
 
 
+def _handle_set_footprint_metadata(
+    path: str, reference: str, sheet_path: str = None, fields: dict = None,
+) -> dict[str, Any]:
+    """Set a footprint's KIID sheet path and/or named text fields (KIR4 NS).
+
+    Replaces sync's file-side sheet-path/ClusterId injection — the last board
+    writes that happened behind the bridge's back. SetPath(KIID_PATH) and
+    SetField verified on KiCad 9.0.7 and 10.0.4 (NS probes P8).
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        if sheet_path is None and not fields:
+            return {
+                "reference": reference,
+                "sheet_path_set": False,
+                "fields_set": [],
+            }
+        if sheet_path is not None:
+            fp.SetPath(pcbnew.KIID_PATH(sheet_path))
+        for k, v in (fields or {}).items():
+            fp.SetField(k, v)
+        _save_and_refresh(board)
+        return {
+            "reference": reference,
+            "sheet_path_set": sheet_path is not None,
+            "fields_set": sorted((fields or {}).keys()),
+        }
+    return _run_on_main_thread(_do)
+
+
+# --- Reference-text (silkscreen refdes) handlers (FD / KIR3 S4) -------------
+# The bridge previously only knew whole-footprint moves (SetPosition) and
+# reference renames (SetReference). tidy_silkscreen needs to move and hide the
+# footprint's Reference *field* (a PCB_FIELD / EDA_TEXT) — a distinct object
+# with its own position and visibility. These three handlers are the primitive.
+
+def _ref_text_record(fp) -> dict[str, Any]:
+    """Geometry of one footprint's Reference field, in mm, board coordinates.
+
+    Positions come from the PCB_FIELD directly (absolute board frame). Bounding
+    boxes are wrapped defensively — a KiCad API drift on GetBoundingBox degrades
+    to a text-height estimate rather than crashing the whole bulk read (risk #5).
+    """
+    import pcbnew
+    ref_field = fp.Reference()
+    rpos = ref_field.GetPosition()
+    # Reference-text bbox (silkscreen footprint of the refdes).
+    try:
+        rbb = ref_field.GetBoundingBox()
+        ref_w = pcbnew.ToMM(rbb.GetWidth())
+        ref_h = pcbnew.ToMM(rbb.GetHeight())
+    except Exception:
+        th = pcbnew.ToMM(ref_field.GetTextHeight())
+        ref_h = th
+        ref_w = th * max(1, len(fp.GetReference())) * 0.75
+    # Footprint body/pad bbox with text excluded (two-arg form: no text, no
+    # invisible text) — the obstacle the refdes must sit clear of.
+    try:
+        fbb = fp.GetBoundingBox(False, False)
+        fp_x0 = pcbnew.ToMM(fbb.GetLeft())
+        fp_y0 = pcbnew.ToMM(fbb.GetTop())
+        fp_x1 = pcbnew.ToMM(fbb.GetRight())
+        fp_y1 = pcbnew.ToMM(fbb.GetBottom())
+    except Exception:
+        c = fp.GetPosition()
+        cx, cy = pcbnew.ToMM(c.x), pcbnew.ToMM(c.y)
+        fp_x0, fp_y0, fp_x1, fp_y1 = cx - 0.5, cy - 0.5, cx + 0.5, cy + 0.5
+    return {
+        "reference": fp.GetReference(),
+        "visible": bool(ref_field.IsVisible()),
+        "layer": fp.GetLayerName(),
+        "ref_x": pcbnew.ToMM(rpos.x),
+        "ref_y": pcbnew.ToMM(rpos.y),
+        "ref_w": ref_w,
+        "ref_h": ref_h,
+        "fp_x0": fp_x0, "fp_y0": fp_y0, "fp_x1": fp_x1, "fp_y1": fp_y1,
+    }
+
+
+def _handle_get_reference_text(path: str, reference: str) -> dict[str, Any]:
+    def _do():
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        return _ref_text_record(fp)
+    return _run_on_main_thread(_do)
+
+
+def _handle_get_reference_texts(path: str) -> dict[str, Any]:
+    """Bulk read: one Reference-field record per footprint, one dispatch.
+
+    tidy_silkscreen plans against this single snapshot (obstacle map + current
+    refdes positions) instead of one round-trip per footprint (risk #4).
+    """
+    def _do():
+        board = _get_open_board(path)
+        refs = [_ref_text_record(fp) for fp in board.GetFootprints()]
+        return {"references": refs}
+    return _run_on_main_thread(_do)
+
+
+def _handle_set_reference_text(path: str, reference: str,
+                                x: float | None = None, y: float | None = None,
+                                dx: float | None = None, dy: float | None = None,
+                                visible: bool | None = None) -> dict[str, Any]:
+    """Move and/or show/hide a footprint's Reference field on the live board.
+
+    Absolute ``(x, y)`` takes precedence over relative ``(dx, dy)``; either may
+    be combined with a ``visible`` toggle. Only the Reference field is touched —
+    never nets, the footprint body, or the Value field.
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        fp = board.FindFootprintByReference(reference)
+        if fp is None:
+            raise ValueError(f"Component {reference!r} not found on board")
+        ref_field = fp.Reference()
+        bpos = ref_field.GetPosition()
+        before = {
+            "x": pcbnew.ToMM(bpos.x), "y": pcbnew.ToMM(bpos.y),
+            "visible": bool(ref_field.IsVisible()),
+        }
+        if visible is not None:
+            ref_field.SetVisible(bool(visible))
+        if x is not None and y is not None:
+            ref_field.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
+        elif dx is not None or dy is not None:
+            cur = ref_field.GetPosition()
+            ref_field.SetPosition(
+                pcbnew.VECTOR2I(cur.x + _mm(dx or 0.0), cur.y + _mm(dy or 0.0)))
+        _save_and_refresh(board)
+        apos = ref_field.GetPosition()
+        after = {
+            "x": pcbnew.ToMM(apos.x), "y": pcbnew.ToMM(apos.y),
+            "visible": bool(ref_field.IsVisible()),
+        }
+        return {"status": "ok", "reference": reference,
+                "before": before, "after": after}
+    return _run_on_main_thread(_do)
+
+
 def _handle_refill_zones(path: str) -> dict[str, Any]:
     def _do():
         import pcbnew
@@ -1160,8 +1312,124 @@ def _handle_refill_zones(path: str) -> dict[str, Any]:
         if zone_count > 0:
             filler = pcbnew.ZONE_FILLER(board)
             filler.Fill(zones)
+            # Save only when something was actually refilled — a zoneless
+            # no-op must not dirty the file mtime (spec-zones Z5).
+            _save_and_refresh(board)
+            return {"status": "ok", "zones_filled": zone_count}
+        return {"status": "ok", "zones_filled": 0, "note": "board has no zones"}
+    return _run_on_main_thread(_do)
+
+
+def _handle_add_zone(
+    path: str, net: str, layer: str, outline: list,
+    clearance_mm: float = 0.5, min_thickness_mm: float = 0.25,
+    pad_connection: str = "thermal", thermal_gap_mm: float = 0.5,
+    thermal_spoke_width_mm: float = 0.5, name: str = "",
+    refill: bool = True,
+) -> dict[str, Any]:
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+
+        layer_id = board.GetLayerID(layer)
+        if layer_id < 0:
+            return {"status": "error", "error_code": "invalid_layer",
+                    "message": "unknown layer '%s'" % layer}
+        netinfo = board.FindNet(net)
+        if netinfo is None or (net and netinfo.GetNetCode() <= 0):
+            return {
+                "status": "error",
+                "error_code": "net_not_found",
+                "message": "net '%s' not found on board; "
+                           "run sync_schematic_to_pcb first" % net,
+            }
+
+        connection_map = {
+            "thermal": pcbnew.ZONE_CONNECTION_THERMAL,
+            "solid": pcbnew.ZONE_CONNECTION_FULL,
+            "none": pcbnew.ZONE_CONNECTION_NONE,
+        }
+
+        zone = pcbnew.ZONE(board)
+        zone.SetLayer(layer_id)
+        zone.SetNetCode(netinfo.GetNetCode())
+        shape = zone.Outline()
+        shape.NewOutline()
+        for pt in outline:
+            shape.Append(pcbnew.VECTOR2I(_mm(pt["x"]), _mm(pt["y"])))
+        zone.SetLocalClearance(_mm(clearance_mm))
+        zone.SetMinThickness(_mm(min_thickness_mm))
+        zone.SetPadConnection(connection_map.get(
+            pad_connection, pcbnew.ZONE_CONNECTION_THERMAL))
+        zone.SetThermalReliefGap(_mm(thermal_gap_mm))
+        zone.SetThermalReliefSpokeWidth(_mm(thermal_spoke_width_mm))
+        if name:
+            zone.SetZoneName(name)
+        board.Add(zone)
+
+        filled = False
+        filled_area_mm2 = None
+        if refill:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+            filled = zone.IsFilled()
+            try:
+                # IU are nm, so area comes back in nm² → mm² is /1e12.
+                filled_area_mm2 = round(zone.GetFilledArea() / 1e12, 3)
+            except Exception:
+                filled_area_mm2 = None
         _save_and_refresh(board)
-        return {"status": "ok", "zones_filled": zone_count}
+        return {
+            "status": "success",
+            "zone_name": name,
+            "zone_uuid": zone.m_Uuid.AsString(),
+            "layer": layer,
+            "net": net,
+            "outline_points": len(outline),
+            "filled": filled,
+            "filled_area_mm2": filled_area_mm2,
+            "via": "bridge",
+            "warnings": [],
+        }
+    return _run_on_main_thread(_do)
+
+
+def _handle_delete_zone(path: str, name: str = "", uuid: str = "") -> dict[str, Any]:
+    def _do():
+        board = _get_open_board(path)
+        matches = []
+        for zone in board.Zones():
+            zone_uuid = zone.m_Uuid.AsString()
+            if (uuid and zone_uuid == uuid) or \
+                    (name and zone.GetZoneName() == name):
+                matches.append(zone)
+
+        selector = uuid or name
+        if not matches:
+            return {"status": "error", "error_code": "zone_not_found",
+                    "message": "no zone matching %s" % selector}
+        if len(matches) > 1:
+            return {"status": "error", "error_code": "zone_ambiguous",
+                    "message": "name '%s' matches %d zones; use uuid"
+                               % (name, len(matches))}
+
+        zone = matches[0]
+        if zone.GetIsRuleArea():
+            return {"status": "error", "error_code": "zone_is_rule_area",
+                    "message": "'%s' is a rule area; use the keep-out tools"
+                               % (zone.GetZoneName() or zone.m_Uuid.AsString())}
+
+        deleted_uuid = zone.m_Uuid.AsString()
+        deleted_name = zone.GetZoneName()
+        net_name = zone.GetNetname()
+        board.RemoveNative(zone)  # not Remove() — see remove_component (#14A)
+        _save_and_refresh(board)
+        return {
+            "status": "success",
+            "deleted": deleted_uuid,
+            "zone_name": deleted_name,
+            "net": net_name,
+            "via": "bridge",
+        }
     return _run_on_main_thread(_do)
 
 
@@ -1382,6 +1650,121 @@ def _handle_import_ses(path: str, ses_path: str) -> dict[str, Any]:
     return _run_on_main_thread(_do)
 
 
+def _handle_add_routed_tracks(path: str, segments: list, vias: list) -> dict[str, Any]:
+    """Add a batch of externally routed segments and through vias atomically.
+
+    TraceMaker seam (spec: tracemaker-default-routing Stage 1): the router
+    operated on a temp COPY of the board, so the new copper must be re-applied
+    to the LIVE in-memory board here (KiCad 9 cannot reload a board in place).
+
+    Payload shapes (mm floats, layer NAMES, net NAMES — never numeric codes):
+      segments: [{"start_x","start_y","end_x","end_y","width","layer","net"}]
+      vias:     [{"x","y","size","drill","net","layers":[front,back]}]
+
+    All-or-nothing: every item is constructed and added first; if ANY item
+    fails (unresolvable layer, or a non-empty net name the board does not
+    have), every already-added item is removed again with ``RemoveNative``
+    (never ``Remove()`` — #14A SWIG ownership landmine) and a structured error
+    naming all offenders is returned WITHOUT saving. Same safety contract as
+    import_ses: a failed import never modifies the board file.
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        # Capture before mutation (#14A) — in-place mutations can detach the
+        # board's filename mid-handler.
+        filename = board.GetFileName()
+
+        added: list = []        # items already board.Add()ed, for rollback
+        offenders: list = []    # human-readable per-item failure descriptions
+
+        def _resolve_net(net_name: str, what: str):
+            """Board NETINFO_ITEM for *net_name*, or record an offender."""
+            if not net_name:
+                return None  # unnetted copper is legal — leave net unset
+            netinfo = board.FindNet(net_name)
+            if netinfo is None:
+                offenders.append(f"{what}: net {net_name!r} not found on board")
+            return netinfo
+
+        def _resolve_layer(layer_name: str, what: str):
+            try:
+                return _layer_id(board, layer_name)
+            except Exception as exc:
+                offenders.append(f"{what}: {exc}")
+                return None
+
+        def _rollback() -> None:
+            # Roll back every item added before the failure was noticed — the
+            # board must be exactly as it was, and nothing is saved.
+            for item in added:
+                board.RemoveNative(item)  # not Remove() — see remove_component (#14A)
+
+        tracks_added = 0
+        vias_added = 0
+        try:
+            for i, seg in enumerate(segments):
+                what = f"segment[{i}]"
+                lid = _resolve_layer(seg["layer"], what)
+                netinfo = _resolve_net(seg.get("net", ""), what)
+                if offenders:
+                    continue  # keep scanning so the error lists ALL offenders
+                track = pcbnew.PCB_TRACK(board)
+                track.SetStart(pcbnew.VECTOR2I(_mm(seg["start_x"]), _mm(seg["start_y"])))
+                track.SetEnd(pcbnew.VECTOR2I(_mm(seg["end_x"]), _mm(seg["end_y"])))
+                track.SetWidth(_mm(seg["width"]))
+                track.SetLayer(lid)
+                if netinfo is not None:
+                    track.SetNet(netinfo)
+                board.Add(track)
+                added.append(track)
+                tracks_added += 1
+
+            for i, via_data in enumerate(vias):
+                what = f"via[{i}]"
+                layers = via_data.get("layers", ["F.Cu", "B.Cu"])
+                if not isinstance(layers, (list, tuple)) or len(layers) != 2:
+                    # Structured offender, not an IndexError: the whole batch
+                    # must report ALL bad items in one refusal.
+                    offenders.append(
+                        f"{what}: layers must be [front, back], got {layers!r}"
+                    )
+                    continue
+                front_id = _resolve_layer(layers[0], what)
+                back_id = _resolve_layer(layers[1], what)
+                netinfo = _resolve_net(via_data.get("net", ""), what)
+                if offenders:
+                    continue
+                via = pcbnew.PCB_VIA(board)
+                via.SetPosition(pcbnew.VECTOR2I(_mm(via_data["x"]), _mm(via_data["y"])))
+                via.SetWidth(_mm(via_data["size"]))
+                via.SetDrill(_mm(via_data["drill"]))
+                via.SetViaType(pcbnew.VIATYPE_THROUGH)  # through vias only (Stage 1)
+                via.SetLayerPair(front_id, back_id)
+                if netinfo is not None:
+                    via.SetNet(netinfo)
+                board.Add(via)
+                added.append(via)
+                vias_added += 1
+        except Exception:
+            # Unexpected mid-batch failure (e.g. malformed payload dict): the
+            # live board must not keep a partial batch either — it would be
+            # silently persisted by the NEXT save of anything.
+            _rollback()
+            raise
+
+        if offenders:
+            _rollback()
+            raise ValueError(
+                "add_routed_tracks failed — no items were kept and the board "
+                "file was not modified: " + "; ".join(offenders)
+            )
+
+        _save_and_refresh(board, filename)
+        return {"status": "ok", "tracks_added": tracks_added, "vias_added": vias_added}
+    return _run_on_main_thread(_do)
+
+
 def _handle_reload_board(path: str) -> dict[str, Any]:
     """Reload the board from disk into pcbnew, then refresh the GUI.
 
@@ -1457,7 +1840,30 @@ _DISPATCH = {
     "set_footprint_value": lambda req: _handle_set_footprint_value(
         req["path"], req["reference"], req["value"],
     ),
+    "set_footprint_metadata": lambda req: _handle_set_footprint_metadata(
+        req["path"], req["reference"],
+        req.get("sheet_path"), req.get("fields"),
+    ),
+    "get_reference_text": lambda req: _handle_get_reference_text(
+        req["path"], req["reference"],
+    ),
+    "get_reference_texts": lambda req: _handle_get_reference_texts(req["path"]),
+    "set_reference_text": lambda req: _handle_set_reference_text(
+        req["path"], req["reference"],
+        req.get("x"), req.get("y"), req.get("dx"), req.get("dy"),
+        req.get("visible"),
+    ),
     "refill_zones":       lambda req: _handle_refill_zones(req["path"]),
+    "add_zone":           lambda req: _handle_add_zone(
+        req["path"], req["net"], req["layer"], req["outline"],
+        req.get("clearance_mm", 0.5), req.get("min_thickness_mm", 0.25),
+        req.get("pad_connection", "thermal"), req.get("thermal_gap_mm", 0.5),
+        req.get("thermal_spoke_width_mm", 0.5), req.get("name", ""),
+        req.get("refill", True),
+    ),
+    "delete_zone":        lambda req: _handle_delete_zone(
+        req["path"], req.get("name", ""), req.get("uuid", ""),
+    ),
     "save_board":         lambda req: _handle_save_board(req["path"]),
     "clear_routes":       lambda req: _handle_clear_routes(
         req["path"], req.get("backup", True),
@@ -1474,6 +1880,9 @@ _DISPATCH = {
     ),
     "export_dsn":         lambda req: _handle_export_dsn(req["path"], req["dsn_path"]),
     "import_ses":         lambda req: _handle_import_ses(req["path"], req["ses_path"]),
+    "add_routed_tracks":  lambda req: _handle_add_routed_tracks(
+        req["path"], req.get("segments", []), req.get("vias", []),
+    ),
 }
 
 
@@ -1485,8 +1894,11 @@ _DISPATCH = {
 _MUTATING_METHODS = frozenset({
     "place_component", "place_components_bulk", "move_component",
     "remove_component", "add_track", "add_via", "assign_net",
-    "set_footprint_value", "refill_zones", "save_board", "clear_routes",
-    "add_board_outline", "auto_place", "import_ses",
+    "set_footprint_value", "set_footprint_metadata", "refill_zones",
+    "add_zone", "delete_zone",
+    "save_board", "clear_routes",
+    "add_board_outline", "auto_place", "import_ses", "add_routed_tracks",
+    "set_reference_text",
 })
 
 

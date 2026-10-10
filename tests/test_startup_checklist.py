@@ -23,9 +23,15 @@ def _run(**overrides):
                      document exists but is still loading; None means no board
       ipc_enabled    (bool, default True)  — KICAD_MCP_IPC_ENABLED state
       recent_launch  (bool, default False) — #20/R1: server just launched pcbnew
+      coherence_mismatch (str|None|Exception, default None) — patched onto
+                     kicad_mcp.backends.ipc_backend._coherence_mismatch; a str
+                     is the mismatch description, None is coherent, an
+                     Exception instance is raised by the check (F-DV11-R2)
     """
     kicad_running = overrides.get("kicad_running", True)
+    coherence_mismatch = overrides.get("coherence_mismatch", None)
     bridge_pong = overrides.get("bridge_pong", True)
+    bridge_version = overrides.get("bridge_version", "2.7.0-zones")
     bridge_error = overrides.get("bridge_error", None)
     active_board = overrides.get("active_board", "/board.kicad_pcb")
     cli_path = overrides.get("cli_path", "/usr/bin/kicad-cli")
@@ -38,12 +44,16 @@ def _run(**overrides):
         if bridge_error:
             raise bridge_error
         if method == "ping":
-            return {"pong": bridge_pong}
-        if method == "get_info":
-            return {"version": "2.0.0"}
+            # Real bridge ping payload shape: bridge_version, never a
+            # separate "version" field and no get_info method (RW-S4 §7 —
+            # the old stub invented both, masking the method-name drift).
+            payload = {"pong": bridge_pong}
+            if bridge_version is not None:
+                payload["bridge_version"] = bridge_version
+            return payload
         if method == "get_active_project":
             return {"board_path": active_board}
-        return {}
+        raise RuntimeError(f"Unknown method: '{method}'")
 
     class FakeIPCConn:
         def ping(self):
@@ -56,7 +66,14 @@ def _run(**overrides):
             import types
             return types.SimpleNamespace(name=ipc_board)
 
+    def fake_coherence_mismatch(board, path):
+        if isinstance(coherence_mismatch, Exception):
+            raise coherence_mismatch
+        return coherence_mismatch
+
     with patch("kicad_mcp.utils.platform_helper.is_kicad_running", return_value=kicad_running), \
+         patch("kicad_mcp.backends.ipc_backend._coherence_mismatch",
+               side_effect=fake_coherence_mismatch), \
          patch("kicad_mcp.utils.platform_helper.find_kicad_cli",
                return_value=(MagicMock(__str__=lambda s: cli_path) if cli_path else None)), \
          patch("kicad_mcp.backends.plugin_backend._tcp_call", side_effect=fake_tcp_call), \
@@ -156,8 +173,73 @@ def test_bridge_not_reachable():
     assert result["ready_for_pcb"] is False
     statuses = {item["item"]: item["status"] for item in result["checklist"]}
     assert statuses["bridge_reachable"] == "FAIL"
+    # RW-S4 §7: the version item mirrors bridge_reachable when down.
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "FAIL"
+    assert "Skipped" in items["bridge_version_ok"]["detail"]
     assert any("bridge" in action.lower() or "PCB editor" in action
                for action in result["required_actions"])
+
+
+# ---------------------------------------------------------------------------
+# RW-S4 §7 — bridge_version_ok reports the REAL version (from the ping
+# payload; the old get_info method never existed in the bridge dispatch)
+# ---------------------------------------------------------------------------
+
+def test_bridge_version_from_ping_payload():
+    # The stub serves the real ping payload shape and raises on any other
+    # method (get_active_project aside) — so a get_info regression would
+    # surface as an exception-detail here, not a silent PASS.
+    result = _run(bridge_version="9.9.9-test")
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "PASS"
+    assert items["bridge_version_ok"]["detail"] == "Bridge version: 9.9.9-test."
+
+
+def test_bridge_version_missing_warns():
+    """A reachable bridge whose ping payload has no bridge_version (pre-2.x)."""
+    result = _run(bridge_version=None)
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_version_ok"]["status"] == "WARN"
+    assert "reported no version" in items["bridge_version_ok"]["detail"]
+    # Non-blocking: everything else is up.
+    assert result["ready_for_pcb"] is True
+
+
+def test_bridge_version_socket_fallback_warns(monkeypatch):
+    """plugin_backend unavailable → bridge reached by raw socket; the version
+    stays unknown by design and the item says which case this is."""
+    import types
+
+    from kicad_mcp.backends import plugin_backend
+
+    monkeypatch.delattr(plugin_backend, "_tcp_call")
+
+    class FakeSock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    with patch("kicad_mcp.utils.platform_helper.is_kicad_running", return_value=True), \
+         patch("kicad_mcp.utils.platform_helper.find_kicad_cli", return_value=None), \
+         patch("socket.create_connection", return_value=FakeSock()), \
+         patch("kicad_mcp.backends.ipc_connection.IPCConnection") as ipc_cls, \
+         patch("kicad_mcp.backends.ipc_connection.ipc_enabled", return_value=True), \
+         patch("kicad_mcp.utils.startup_state.recent_launch", return_value=False), \
+         patch("kicad_mcp.backends.ipc_connection.connection_remedy",
+               return_value="Enable the IPC API server."):
+        ipc_cls.return_value.ping.return_value = True
+        ipc_cls.return_value.board.return_value = types.SimpleNamespace(
+            name="b.kicad_pcb")
+        from kicad_mcp.tools.project import run_startup_checklist
+        result = run_startup_checklist()
+
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["bridge_reachable"]["status"] == "PASS"
+    assert items["bridge_version_ok"]["status"] == "WARN"
+    assert "plugin_backend unavailable" in items["bridge_version_ok"]["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -272,15 +354,81 @@ def test_recent_launch_does_not_override_a_ready_board():
 
 
 # ---------------------------------------------------------------------------
+# F-DV11-R2 — board_file_coherent surfaces live-vs-disk incoherence
+# ---------------------------------------------------------------------------
+
+def test_checklist_board_coherent_pass():
+    result = _run(ipc_reachable=True, ipc_board="board.kicad_pcb",
+                  active_board="/board.kicad_pcb", coherence_mismatch=None)
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["board_file_coherent"]["status"] == "PASS"
+    assert items["board_file_coherent"]["detail"] == \
+        "Live board matches board.kicad_pcb on disk."
+
+
+def test_checklist_board_coherent_warns_on_mismatch_and_stays_ready():
+    mismatch = "track count 0 live vs 34 in the file"
+    result = _run(ipc_reachable=True, ipc_board="board.kicad_pcb",
+                  active_board="/board.kicad_pcb", coherence_mismatch=mismatch)
+    items = {item["item"]: item for item in result["checklist"]}
+    item = items["board_file_coherent"]
+    assert item["status"] == "WARN"
+    assert item["mismatch"] == mismatch
+    assert "STALE" in item["detail"] and mismatch in item["detail"]
+    assert any("stale" in action and "reopen" in action
+               for action in result["required_actions"])
+    # Reads are legal on a stale board — a WARN must never block the gate.
+    assert result["ready_for_pcb"] is True
+
+
+def test_checklist_board_coherent_skipped_without_ipc_board():
+    result = _run()  # IPC down: bridge-only session, no kipy board to compare
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["board_file_coherent"]["status"] == "PASS"
+    assert items["board_file_coherent"]["detail"] == \
+        "Skipped (no live IPC board to compare)."
+
+
+def test_checklist_board_coherent_skipped_without_bridge_path():
+    # IPC board ready, but the bridge serves no board_path — the full path
+    # only comes from the bridge, so the check cannot run.
+    result = _run(ipc_reachable=True, ipc_board="board.kicad_pcb",
+                  active_board="")
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["board_file_coherent"]["status"] == "PASS"
+    assert "full board path unavailable" in items["board_file_coherent"]["detail"]
+
+
+def test_checklist_board_coherent_skipped_on_board_name_disagreement():
+    result = _run(ipc_reachable=True, ipc_board="other.kicad_pcb",
+                  active_board="/board.kicad_pcb")
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["board_file_coherent"]["status"] == "PASS"
+    assert items["board_file_coherent"]["detail"] == \
+        "Skipped (live paths disagree on the open board)."
+
+
+def test_checklist_board_coherent_skipped_when_check_errors():
+    result = _run(ipc_reachable=True, ipc_board="board.kicad_pcb",
+                  active_board="/board.kicad_pcb",
+                  coherence_mismatch=RuntimeError("boom"))
+    items = {item["item"]: item for item in result["checklist"]}
+    assert items["board_file_coherent"]["status"] == "PASS"
+    assert items["board_file_coherent"]["detail"] == \
+        "Skipped (coherence check errored: boom)."
+    assert result["ready_for_pcb"] is True
+
+
+# ---------------------------------------------------------------------------
 # Checklist structure
 # ---------------------------------------------------------------------------
 
-def test_checklist_contains_seven_items():
+def test_checklist_contains_eight_items():
     result = _run()
-    assert len(result["checklist"]) == 7
+    assert len(result["checklist"]) == 8
     items = [entry["item"] for entry in result["checklist"]]
     assert items == ["kicad_running", "ipc_server_reachable", "bridge_reachable",
-                     "bridge_version_ok", "pcb_editor_open",
+                     "bridge_version_ok", "pcb_editor_open", "board_file_coherent",
                      "kicad_cli_available", "project_loaded"]
 
 

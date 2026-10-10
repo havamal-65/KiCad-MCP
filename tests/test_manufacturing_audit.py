@@ -270,3 +270,102 @@ def test_tool_registered_and_returns_json(tmp_path, monkeypatch):
     parsed = json.loads(out)
     assert parsed["ready_to_ship"] is True
     assert "checks" in parsed and "artifacts" in parsed
+
+
+# ── F-DV13 — partial STEP is an advisory, never a blocker ────────────────────
+
+_STEP_PARTIAL = {
+    "success": False,
+    "partial": True,
+    "output_file": "model.step",
+    "file_size_bytes": 60578,
+    "stderr": "Cannot use VRML models when exporting to non-mesh formats.\n",
+    "message": (
+        "STEP exported partially: kicad-cli exited 2 but wrote a valid STEP "
+        "file; some 3D models are absent from it."
+    ),
+}
+
+_STEP_PARTIAL_REMEDY = (
+    "The STEP file on disk is valid and usable; it omits the models listed in "
+    "excluded_models. To get a complete export, provide a STEP/STP version of "
+    "each omitted model next to its .wrl (kicad-cli --subst-models picks up "
+    "same-name siblings), or accept the partial file."
+)
+
+
+def test_audit_partial_step_is_advisory_not_blocking(tmp_path, monkeypatch):
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    ops.export_step.return_value = dict(_STEP_PARTIAL)
+    backend = _backend(_DRC_PASS, export_ops=ops)
+
+    result = run_manufacturing_readiness_audit(backend, _board(tmp_path), tmp_path / "out")
+
+    step = next(a for a in result["artifacts"] if a["name"] == "step")
+    assert step["generated"] is True
+    assert step["partial"] is True
+    assert step["output_path"] == "model.step"
+    assert step["detail"]["stderr"] == _STEP_PARTIAL["stderr"]
+    advs = [a for a in result["advisories"] if a["type"] == "partial_step"]
+    assert len(advs) == 1
+    assert advs[0]["artifact"] == "step"
+    assert advs[0]["stderr"] == _STEP_PARTIAL["stderr"]
+    assert advs[0]["remedy"] == _STEP_PARTIAL_REMEDY
+    assert "excluded_models" in advs[0]
+    assert not any(b.get("artifact") == "step" for b in result["blocking_issues"])
+
+
+def test_audit_partial_step_ready_to_ship_true(tmp_path, monkeypatch):
+    """Q1 semantics, unit-pinned: all checks green + a valid partial STEP →
+    the audit still ships (the condition is advisory, board-content-inherent)."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    ops.export_step.return_value = dict(_STEP_PARTIAL)
+    backend = _backend(_DRC_PASS, export_ops=ops)
+
+    result = run_manufacturing_readiness_audit(backend, _board(tmp_path), tmp_path / "out")
+
+    assert result["ready_to_ship"] is True, result
+    assert result["blocking_issues"] == []
+
+
+def test_audit_partial_step_survives_excluded_models_failure(tmp_path, monkeypatch):
+    """RB-RES2: a crash in the step_excluded_models advisory helper must not
+    abort the audit — the advisory still lands, with excluded_models None."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    ops.export_step.return_value = dict(_STEP_PARTIAL)
+    backend = _backend(_DRC_PASS, export_ops=ops)
+
+    def _boom(_path):
+        raise RuntimeError("parse exploded")
+
+    monkeypatch.setattr("kicad_mcp.tools.export.step_excluded_models", _boom)
+
+    result = run_manufacturing_readiness_audit(backend, _board(tmp_path), tmp_path / "out")
+
+    advs = [a for a in result["advisories"] if a["type"] == "partial_step"]
+    assert len(advs) == 1
+    assert advs[0]["excluded_models"] is None
+    assert advs[0]["remedy"] == _STEP_PARTIAL_REMEDY
+    assert result["ready_to_ship"] is True
+    assert result["blocking_issues"] == []
+
+
+def test_audit_bare_step_failure_still_blocks(tmp_path, monkeypatch):
+    """Regression pin: a bare failure (no partial key) keeps today's behavior —
+    generated False, blocking issue, ready_to_ship False."""
+    _patch_checks(monkeypatch)
+    ops = _export_ok()
+    ops.export_step.return_value = {"success": False, "output_file": None,
+                                    "message": "Failed to load board"}
+    backend = _backend(_DRC_PASS, export_ops=ops)
+
+    result = run_manufacturing_readiness_audit(backend, _board(tmp_path), tmp_path / "out")
+
+    step = next(a for a in result["artifacts"] if a["name"] == "step")
+    assert step["generated"] is False
+    assert "partial" not in step
+    assert any(b.get("artifact") == "step" for b in result["blocking_issues"])
+    assert result["ready_to_ship"] is False

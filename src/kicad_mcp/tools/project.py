@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ def run_startup_checklist() -> dict[str, Any]:
     ipc_still_loading = False
     ipc_board_name = ""
     ipc_detail = ""
+    conn: Any = None  # hoisted so the board_file_coherent item can reuse it
     try:
         from kicad_mcp.backends.ipc_connection import (
             IPCConnection,
@@ -100,11 +102,17 @@ def run_startup_checklist() -> dict[str, Any]:
 
     bridge_ok = False
     bridge_detail = ""
+    # RW-S4 §7: the ping payload already carries bridge_version — read it
+    # here (zero extra round-trips). The socket fallback below leaves it
+    # empty by design (plugin_backend unavailable = no payload to read).
+    version = ""
     if _tcp_call is not None:
         try:
             result = _tcp_call("ping", ping_timeout)
             bridge_ok = isinstance(result, dict) and result.get("pong") is True
             bridge_detail = "Bridge responded to ping." if bridge_ok else "Bridge ping check returned unexpected value."
+            if isinstance(result, dict):
+                version = str(result.get("bridge_version", "") or "")
         except Exception as exc:
             bridge_detail = f"Bridge not reachable: {exc}"
     else:
@@ -138,25 +146,29 @@ def run_startup_checklist() -> dict[str, Any]:
         )
 
     # ── 4. Bridge version check ──────────────────────────────────────────────
-    bridge_version_detail = ""
-    if bridge_ok and _tcp_call is not None:
-        try:
-            info = _tcp_call("get_info", ping_timeout)
-            if isinstance(info, dict):
-                version = info.get("version", "")
-                bridge_version_detail = f"Bridge version: {version or 'unknown'}."
-            else:
-                bridge_version_detail = "Bridge reachable; version field not returned."
-        except Exception as exc:
-            bridge_version_detail = f"Version check skipped: {exc}"
+    # RW-S4 §7: the version comes from the ping payload above (the old
+    # get_info method never existed in the bridge dispatch, so this item
+    # was always "PASS, version check skipped" — never a real version).
+    if bridge_ok and version:
+        bridge_version_status = "PASS"
+        bridge_version_detail = f"Bridge version: {version}."
+    elif bridge_ok and _tcp_call is not None:
+        bridge_version_status = "WARN"
+        bridge_version_detail = (
+            "Bridge reachable but reported no version (pre-2.x bridge?)."
+        )
     elif bridge_ok:
-        bridge_version_detail = "Bridge reachable; version not checked (plugin_backend unavailable)."
+        bridge_version_status = "WARN"
+        bridge_version_detail = (
+            "Bridge reachable; version unknown (plugin_backend unavailable)."
+        )
     else:
+        bridge_version_status = bridge_status  # mirrors bridge_reachable when down
         bridge_version_detail = "Skipped (bridge not reachable)."
 
     checklist.append({
         "item": "bridge_version_ok",
-        "status": "PASS" if bridge_ok else bridge_status,  # mirrors bridge_reachable when down
+        "status": bridge_version_status,
         "detail": bridge_version_detail,
     })
 
@@ -205,7 +217,63 @@ def run_startup_checklist() -> dict[str, Any]:
         else:
             required_actions.append("Open a .kicad_pcb file in the KiCad PCB editor.")
 
-    # ── 6. kicad-cli on PATH ─────────────────────────────────────────────────
+    # ── 6. Live board coherent with the file on disk (F-DV11-R2) ────────────
+    # Needs BOTH live paths: the kipy board object (IPC) for the comparison
+    # and the full .kicad_pcb path (bridge get_active_project — IPC only
+    # yields the bare filename). A coherence item that cannot run must not
+    # block or alarm: every skip is a PASS with a skip detail, and a real
+    # mismatch is a WARN (reads are legal on a stale board), never a FAIL.
+    coherent_status = "PASS"
+    coherent_mismatch: str | None = None
+    try:
+        if not ipc_board_ready or conn is None:
+            coherent_detail = "Skipped (no live IPC board to compare)."
+        else:
+            coherent_board_path = ""
+            if bridge_ok and _tcp_call is not None:
+                active = _tcp_call("get_active_project", ping_timeout)
+                if isinstance(active, dict):
+                    coherent_board_path = str(active.get("board_path", "") or "")
+            if not coherent_board_path:
+                coherent_detail = (
+                    "Skipped (full board path unavailable — bridge not "
+                    "serving get_active_project)."
+                )
+            elif (os.path.normcase(Path(coherent_board_path).name)
+                    != os.path.normcase(ipc_board_name)):
+                coherent_detail = "Skipped (live paths disagree on the open board)."
+            else:
+                from kicad_mcp.backends.ipc_backend import _coherence_mismatch
+                mismatch = _coherence_mismatch(conn.board(), Path(coherent_board_path))
+                if mismatch is None:
+                    coherent_detail = f"Live board matches {ipc_board_name} on disk."
+                else:
+                    coherent_status = "WARN"
+                    coherent_mismatch = mismatch
+                    coherent_detail = (
+                        f"Live board is STALE vs {ipc_board_name} on disk — "
+                        f"{mismatch}. Reads are safe; writes will be refused "
+                        f"(stale_board)."
+                    )
+                    required_actions.append(
+                        "Live board is stale vs the file on disk. Close and "
+                        "reopen the board in KiCad's PCB editor before any "
+                        "board write (reads are safe)."
+                    )
+    except Exception as exc:  # noqa: BLE001 — never let the coherence item block
+        coherent_status = "PASS"
+        coherent_mismatch = None
+        coherent_detail = f"Skipped (coherence check errored: {exc})."
+    coherent_item: dict[str, Any] = {
+        "item": "board_file_coherent",
+        "status": coherent_status,
+        "detail": coherent_detail,
+    }
+    if coherent_mismatch is not None:
+        coherent_item["mismatch"] = coherent_mismatch
+    checklist.append(coherent_item)
+
+    # ── 7. kicad-cli on PATH ─────────────────────────────────────────────────
     cli_path_str = shutil.which("kicad-cli")
     if not cli_path_str:
         cli = find_kicad_cli()
@@ -221,7 +289,7 @@ def run_startup_checklist() -> dict[str, Any]:
         ),
     })
 
-    # ── 7. Active project loaded ─────────────────────────────────────────────
+    # ── 8. Active project loaded ─────────────────────────────────────────────
     checklist.append({
         "item": "project_loaded",
         "status": "PASS" if pcb_editor_ok else "FAIL",
@@ -270,11 +338,14 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
              vs still-loading vs no board (WARN when down: the bridge may serve)
           3. bridge_reachable — kicad_mcp_bridge answers (WARN when the IPC API
              already serves the open board; FAIL when NO live path is up)
-          4. bridge_version_ok — bridge version info (mirrors bridge_reachable when down)
+          4. bridge_version_ok — the real bridge version from the ping payload
+             (WARN when reachable but version unknown; mirrors bridge_reachable when down)
           5. pcb_editor_open  — a board is READY (loaded, not still-loading) on a
              live path (FAIL blocks PCB ops)
-          6. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
-          7. project_loaded   — an active board path was resolved (FAIL blocks PCB ops)
+          6. board_file_coherent — live board matches the .kicad_pcb on disk (WARN
+             when stale: writes will refuse; close + reopen the board first)
+          7. kicad_cli_available — kicad-cli is on PATH (WARN: exports will fail without it)
+          8. project_loaded   — an active board path was resolved (FAIL blocks PCB ops)
 
         Returns:
             JSON with ready_for_pcb bool, checklist, and required_actions list.
@@ -753,6 +824,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         title: str = "",
         revision: str = "",
         design_rules_preset: str = "fab_jlcpcb",
+        target_format: str = "kicad9",
     ) -> str:
         """Create a new KiCad project with blank schematic and PCB files.
 
@@ -777,6 +849,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             revision: Optional revision string (e.g. "1.0").
             design_rules_preset: Fab preset applied at creation — "fab_jlcpcb"
                 (default), "class2", or "" to skip.
+            target_format: "kicad9" (default) or "kicad10". KiCad 9 is the safe
+                cross-version default (v9 files open in both 9 and 10). Choose
+                "kicad10" when the project needs the KiCad-10 variant tools — the
+                files are generated in v9 form and then upgraded in place via
+                kicad-cli, so the result is real KiCad-10 format. Requires a
+                KiCad-10 kicad-cli; the call refuses (writing nothing) if one is
+                not available.
 
         Returns:
             JSON with status, paths to all created files, and the design rules
@@ -784,6 +863,22 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """
         from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
         from kicad_mcp.utils.platform_helper import find_kicad_template_dir
+
+        if target_format not in ("kicad9", "kicad10"):
+            return json.dumps({
+                "status": "error",
+                "message": f"target_format must be 'kicad9' or 'kicad10', got {target_format!r}",
+            })
+
+        # Resolve the v10 upgrade capability BEFORE writing anything, so a v10
+        # request without a v10 CLI refuses cleanly instead of silently leaving
+        # v9 files behind.
+        upgrade_cli = None
+        if target_format == "kicad10":
+            from kicad_mcp.tools.format_upgrade import v10_cli_gate
+            upgrade_cli, refusal = v10_cli_gate()
+            if refusal is not None:
+                return refusal
 
         proj_dir = Path(project_dir).resolve()
         proj_dir.mkdir(parents=True, exist_ok=True)
@@ -826,6 +921,17 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         # --- .kicad_pcb ---
         FileBoardOps().create_board(pcb_path, title=title, revision=revision)
 
+        # Upgrade the v9-format files to KiCad 10 if requested, before design
+        # rules so those edit the upgraded files.
+        upgrade_report = None
+        if target_format == "kicad10":
+            from kicad_mcp.tools.format_upgrade import upgrade_project_files
+            from kicad_mcp.utils.variant_files import resolve_project
+            assert upgrade_cli is not None  # v10_cli_gate resolved it above
+            upgrade_report = upgrade_project_files(resolve_project(pro_path), upgrade_cli)
+            if upgrade_report.get("status") == "error":
+                return json.dumps(upgrade_report, indent=2)
+
         # Apply design rules immediately so constraints are set before any
         # schematic or footprint work begins.
         applied_preset = None
@@ -846,17 +952,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                     },
                 })
 
-        result = {
-            "status": "success",
-            "project": {
-                "name": stem,
-                "directory": str(proj_dir),
-                "pro_file": str(pro_path),
-                "schematic_file": str(sch_path),
-                "board_file": str(pcb_path),
-                "design_rules_preset": applied_preset or "none (defaults)",
-            },
+        project_info: dict[str, Any] = {
+            "name": stem,
+            "directory": str(proj_dir),
+            "pro_file": str(pro_path),
+            "schematic_file": str(sch_path),
+            "board_file": str(pcb_path),
+            "design_rules_preset": applied_preset or "none (defaults)",
+            "target_format": target_format,
         }
+        if upgrade_report is not None:
+            project_info["format_upgrade"] = upgrade_report
+        result = {"status": "success", "project": project_info}
         change_log.record("create_project", {"name": stem, "dir": project_dir, "preset": applied_preset})
         return json.dumps(result, indent=2)
 

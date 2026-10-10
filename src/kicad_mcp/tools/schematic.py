@@ -9,6 +9,7 @@ from typing import Any, cast
 from fastmcp import FastMCP
 
 from kicad_mcp.backends.base import BackendProtocol, BoardOps
+from kicad_mcp.backends.file_backend import BoardOpenInKiCadError
 from kicad_mcp.logging_config import get_logger
 from kicad_mcp.utils.change_log import ChangeLog, create_backup
 from kicad_mcp.utils.response_limit import limit_response
@@ -43,6 +44,18 @@ def _format_validator_refusal_message(sf: dict[str, Any]) -> str:
         f"{summary}. Run validate_symbol_footprint_pairs to see all issues, then "
         f"fix the symbol's Footprint field or pick a different footprint."
     )
+
+
+def _schematic_write_refusal(exc: BoardOpenInKiCadError) -> str:
+    """Structured refusal for a schematic write while KiCad holds the file
+    open (RW-S4 §9); mirrors routing.py's board_open_in_kicad shape."""
+    return json.dumps({
+        "status": "error",
+        "error_code": "schematic_open_in_kicad",
+        "lock_file": str(exc.lock_file),
+        "lock_holder": exc.lock_holder,
+        "message": str(exc),
+    }, indent=2)
 
 
 def suggest_footprint_candidates(
@@ -161,22 +174,71 @@ def _attempt_footprint_swap(
         }
 
     removed = mutate_ops.remove_component(pcb_p, ref)
-    mutate_ops.place_component(
-        pcb_p, ref, new_fp,
-        removed["position"]["x"], removed["position"]["y"],
-        layer=removed.get("layer") or "F.Cu",
-        rotation=removed.get("rotation", 0.0),
-    )
+    placed = False
+    try:
+        mutate_ops.place_component(
+            pcb_p, ref, new_fp,
+            removed["position"]["x"], removed["position"]["y"],
+            layer=removed.get("layer") or "F.Cu",
+            rotation=removed.get("rotation", 0.0),
+        )
+        placed = True
 
-    unmatched_pads: list[dict[str, str]] = []
-    for pad_name, net in sorted(old_pad_nets.items()):
-        if new_pad_names and pad_name not in new_pad_names:
-            unmatched_pads.append({"pad": pad_name, "net": net})
-            continue
-        try:
-            mutate_ops.assign_net(pcb_p, ref, pad_name, net)
-        except ValueError:
-            unmatched_pads.append({"pad": pad_name, "net": net})
+        unmatched_pads: list[dict[str, str]] = []
+        for pad_name, net in sorted(old_pad_nets.items()):
+            if new_pad_names and pad_name not in new_pad_names:
+                unmatched_pads.append({"pad": pad_name, "net": net})
+                continue
+            try:
+                mutate_ops.assign_net(pcb_p, ref, pad_name, net)
+            except ValueError:
+                unmatched_pads.append({"pad": pad_name, "net": net})
+    except Exception as exc:
+        # SW-1 C4: a failure after a successful file-side remove would
+        # otherwise delete the part from the board — restore the captured
+        # block verbatim. Bridge-leg exceptions propagate exactly as before
+        # (OQ2 carve-out: no raw_block there).
+        raw_block = removed.get("raw_block")
+        if via == "file" and raw_block:
+            if placed:
+                # RB-RES1: the new footprint block already landed in the
+                # file — remove it first, or the verbatim restore below
+                # would re-insert the old block ALONGSIDE it (duplicate
+                # reference). If this cleanup fails, report rollback
+                # failure rather than create the duplicate.
+                try:
+                    file_ops.remove_component(pcb_p, ref)
+                except Exception as cleanup_exc:  # noqa: BLE001 — reported, never raised
+                    return {
+                        "applied": False,
+                        "reason": (
+                            f"swap failed: {exc}; ROLLBACK FAILED: could not"
+                            f" remove the half-placed new footprint:"
+                            f" {cleanup_exc} — restore {ref} from the sync"
+                            f" backup"
+                        ),
+                        "restored": False,
+                    }
+            try:
+                file_ops.restore_footprint_block(pcb_p, raw_block)
+            except Exception as restore_exc:  # noqa: BLE001 — reported, never raised
+                return {
+                    "applied": False,
+                    "reason": (
+                        f"swap failed: {exc}; ROLLBACK FAILED: {restore_exc}"
+                        f" — restore {ref} from the sync backup"
+                    ),
+                    "restored": False,
+                }
+            return {
+                "applied": False,
+                "reason": (
+                    f"swap failed: {exc}; original footprint restored "
+                    f"(rollback)"
+                ),
+                "restored": True,
+            }
+        raise
 
     return {
         "applied": True,
@@ -191,91 +253,6 @@ def _attempt_footprint_swap(
             "unmatched_pads": unmatched_pads,
         },
     }
-
-
-def _inject_footprint_sheet_path(pcb_path: Path, reference: str, sheet_path: str) -> None:
-    """Add a ``(path "<sheet_path>")`` clause to a placed footprint block.
-
-    The clause is inserted right after the footprint's ``(uuid "...")`` line
-    (matching KiCad's native sync output position). Idempotent — if the
-    footprint already has a (path ...) clause, it is overwritten. Phase 6.3.3.
-    """
-    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
-
-    content = pcb_path.read_text(encoding="utf-8")
-    located = find_footprint_block_by_reference(content, reference)
-    if located is None:
-        raise ValueError(f"footprint {reference} not found in {pcb_path}")
-    start, end = located
-    block = content[start : end + 1]
-
-    import re as _re
-    if _re.search(r'\(path\s+"[^"]*"\)', block):
-        new_block = _re.sub(
-            r'\(path\s+"[^"]*"\)',
-            f'(path "{sheet_path}")',
-            block,
-            count=1,
-        )
-    else:
-        # Insert after the (uuid "...") line. Match KiCad's tabbed indentation.
-        new_block = _re.sub(
-            r'(\(uuid\s+"[^"]+"\)\n)',
-            rf'\1\t\t(path "{sheet_path}")\n',
-            block,
-            count=1,
-        )
-        if new_block == block:
-            raise ValueError(
-                f"could not find (uuid ...) anchor in footprint {reference}"
-            )
-
-    pcb_path.write_text(content[:start] + new_block + content[end + 1:], encoding="utf-8")
-
-
-def _inject_footprint_property(
-    pcb_path: Path, reference: str, prop_name: str, prop_value: str,
-) -> None:
-    """Add (or update) a ``(property NAME VALUE ...)`` clause on a placed footprint.
-
-    Idempotent — if the property already exists with a different value, it's
-    overwritten. Used by sync to attach PlacementIntent-derived metadata
-    (e.g. ClusterId) onto placed footprints so downstream tools like
-    auto_place can read it. Phase 6.3.2 + 6.3.3.
-    """
-    from kicad_mcp.utils.sexp_parser import find_footprint_block_by_reference
-
-    content = pcb_path.read_text(encoding="utf-8")
-    located = find_footprint_block_by_reference(content, reference)
-    if located is None:
-        raise ValueError(f"footprint {reference} not found in {pcb_path}")
-    start, end = located
-    block = content[start : end + 1]
-
-    import re as _re
-    prop_pattern = _re.compile(
-        rf'\(property\s+"{_re.escape(prop_name)}"\s+"[^"]*"[^)]*\)'
-    )
-    if prop_pattern.search(block):
-        new_block = prop_pattern.sub(
-            f'(property "{prop_name}" "{prop_value}")',
-            block,
-            count=1,
-        )
-    else:
-        # Insert after the (uuid "...") line. Match KiCad's tabbed indentation.
-        new_block = _re.sub(
-            r'(\(uuid\s+"[^"]+"\)\n)',
-            rf'\1\t\t(property "{prop_name}" "{prop_value}")\n',
-            block,
-            count=1,
-        )
-        if new_block == block:
-            raise ValueError(
-                f"could not find (uuid ...) anchor in footprint {reference}"
-            )
-
-    pcb_path.write_text(content[:start] + new_block + content[end + 1:], encoding="utf-8")
 
 
 def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog) -> None:
@@ -361,6 +338,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.create_schematic(p, title=title, revision=revision)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -385,6 +364,11 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         mirror: str | None = None,
         footprint: str = "",
         properties: dict[str, str] | None = None,
+        unit: int = 1,
+        in_bom: bool = True,
+        on_board: bool = True,
+        dnp: bool = False,
+        exclude_from_sim: bool = False,
     ) -> str:
         """Add a component symbol to the schematic.
 
@@ -399,6 +383,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mirror: Mirror axis - 'x' or 'y', or None for no mirror.
             footprint: Footprint lib_id (e.g. 'Resistor_SMD:R_0402_1005Metric').
             properties: Additional properties dict (e.g. {'Datasheet': '...', 'MPN': '...'}).
+            unit: Which unit of a multi-unit symbol to place (default 1).
+                  To place another unit of the same component, call again with
+                  the SAME reference and lib_id and a different unit — e.g. a
+                  dual op-amp is U1 unit 1 plus U1 unit 2. The same
+                  (reference, unit) twice, a unit beyond the symbol's unit
+                  count, or one reference across two lib_ids is refused.
+            in_bom: Symbol appears in the bill of materials (default True).
+            on_board: Symbol has a board footprint (default True).
+            dnp: Do-not-populate flag (default False).
+            exclude_from_sim: Ignored by the simulator (default False).
 
         Returns:
             JSON with placed component details and UUID.
@@ -408,14 +402,23 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_component(
-            p, lib_id, reference, value, x, y,
-            rotation=rotation, mirror=mirror,
-            footprint=footprint, properties=properties,
-        )
+        try:
+            result = ops.add_component(
+                p, lib_id, reference, value, x, y,
+                rotation=rotation, mirror=mirror,
+                footprint=footprint, properties=properties,
+                unit=unit,
+                in_bom=in_bom, on_board=on_board,
+                dnp=dnp, exclude_from_sim=exclude_from_sim,
+            )
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
             "add_component",
-            {"path": path, "lib_id": lib_id, "reference": reference, "value": value},
+            {"path": path, "lib_id": lib_id, "reference": reference,
+             "value": value, "unit": unit},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -445,7 +448,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_wire(p, start_x, start_y, end_x, end_y)
+        try:
+            result = ops.add_wire(p, start_x, start_y, end_x, end_y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_wire",
             {"path": path, "start": [start_x, start_y], "end": [end_x, end_y]},
@@ -485,7 +491,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_label(p, text, x, y, label_type)
+        try:
+            result = ops.add_label(p, text, x, y, label_type)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_label",
             {"path": path, "text": text, "x": x, "y": y, "label_type": label_type},
@@ -516,6 +525,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 backup_path=str(backup) if backup else None,
             )
             return json.dumps({"status": "success", **result}, indent=2)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "info",
@@ -543,10 +554,27 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             change_log.record("generate_netlist", {"path": path, "output": output})
             return json.dumps({"status": "success", **result}, indent=2)
         except NotImplementedError:
-            return json.dumps({
-                "status": "info",
-                "message": "Netlist generation requires kicad-cli or KiCad IPC.",
-            })
+            # The schematic-ops backend can't generate a netlist (KiCad 9 has no
+            # eeschema Python API). Fall back to on-PATH kicad-cli, mirroring how
+            # run_erc already does (F6).
+            from kicad_mcp.utils.platform_helper import find_kicad_cli
+            cli = find_kicad_cli()
+            if cli is None:
+                return json.dumps({
+                    "status": "info",
+                    "message": "Netlist generation requires kicad-cli or KiCad IPC; "
+                               "kicad-cli was not found on PATH.",
+                })
+            from kicad_mcp.backends.cli_backend import CLIDRCOps
+            res = CLIDRCOps(cli).generate_netlist(p, out)
+            if not res.get("generated"):
+                return json.dumps({
+                    "status": "error",
+                    "message": "kicad-cli ran but produced no netlist file.",
+                    **res,
+                }, indent=2)
+            change_log.record("generate_netlist", {"path": path, "output": output})
+            return json.dumps({"status": "success", **res}, indent=2)
 
     @mcp.tool()
     def get_symbol_pin_positions(
@@ -570,9 +598,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                         are needed.
 
         Returns:
-            Single mode: JSON with pin_positions mapping pin numbers to {x, y} coordinates.
-            Batch mode:  JSON with batch dict keyed by reference, each value containing
-                         the same pin_positions structure.
+            Single mode: JSON with pin_positions mapping pin numbers to
+                         {x, y, unit} coordinates, plus units_placed,
+                         unit_positions (per-unit {x, y, rotation}), and
+                         common_pin_positions — pins shared by all units of a
+                         multi-unit symbol, one entry per placed unit
+                         ({unit, x, y}); such pins appear ONLY there, not in
+                         pin_positions. Single-unit symbols: units_placed is
+                         [1] and common_pin_positions is empty.
+            Batch mode:  JSON with batch dict keyed by reference, each value
+                         containing the same structure.
         """
         p = validate_kicad_path(path, ".kicad_sch")
         ops = backend.get_schematic_ops()
@@ -616,7 +651,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_no_connect(p, x, y)
+        try:
+            result = ops.add_no_connect(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_no_connect",
             {"path": path, "x": x, "y": y},
@@ -652,7 +690,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_power_symbol(p, name, x, y, rotation)
+        try:
+            result = ops.add_power_symbol(p, name, x, y, rotation)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_power_symbol",
             {"path": path, "name": name, "x": x, "y": y, "rotation": rotation},
@@ -674,17 +715,26 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             mirror ('x' or 'y', optional)
             footprint (e.g. 'Resistor_SMD:R_0402_1005Metric', optional)
             properties (dict[str, str], optional)
+            unit (int, default 1 — one batch may place several units of one
+                  multi-unit reference, one entry per unit)
+            in_bom (bool, default true — symbol appears in the BOM)
+            on_board (bool, default true — symbol has a board footprint)
+            dnp (bool, default false — do-not-populate flag)
+            exclude_from_sim (bool, default false — ignored by the simulator)
 
         Reads the schematic file once, caches every unique lib_id once, builds
         all symbol blocks in memory, and writes once — collapsing N round-trips
         and N file reads into 1.
 
-        Per-item failures (missing fields, unresolvable lib_id) do NOT abort the
-        batch — successful entries still get placed.
+        Per-item failures (missing fields, unresolvable lib_id, unit out of
+        range, (reference, unit) already placed) do NOT abort the batch —
+        successful entries still get placed. Exception: a (reference, unit)
+        pair repeated WITHIN the input list refuses the whole batch with the
+        file untouched ({"status": "refused"}).
 
         Returns:
             JSON {"status": "success", "placed": [...], "failed": [...]}.
-            placed entries: {reference, lib_id, uuid, position}.
+            placed entries: {reference, lib_id, uuid, position, unit}.
             failed entries: {index, reference, reason}.
         """
         p = validate_kicad_path(path, ".kicad_sch")
@@ -697,6 +747,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_components_bulk(p, components)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -738,6 +790,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_power_symbols_bulk(p, symbols)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -779,11 +833,25 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         The schematic must NOT be open in eeschema while this runs — eeschema
         does not auto-reload after file writes, and you'll see stale content.
 
+        Multi-unit symbols: a pin belonging to unit N connects at unit N's
+        placed block. A COMMON pin (unit 0, e.g. a dual op-amp's V+ ) gets a
+        wire+label at EVERY placed unit — netting fewer than all instances is
+        an ERC different_unit_net error. A pin whose owning unit is not placed
+        fails with "belongs to unit N, which is not placed".
+
         Returns:
             JSON {"status": "success", "connected": [...], "failed": [...]}.
             connected entries: {pin, reference, pin_number, x, y,
-                                label_uuid, wire_uuid (null if stub_length=0)}.
-            failed entries: {pin, reason}.
+                                label_uuid, wire_uuid (null if stub_length=0),
+                                instances}. x/y/uuids describe the lowest-unit
+            placement; common pins with instances > 1 add "placements":
+            [{unit, x, y, label_uuid, wire_uuid}, ...] — one per placed unit.
+            failed entries: {pin, reason}. If the pin is missing because of a
+            known KiCad 9->10 symbol pin rename (e.g. the USB-C shield pin
+            S1 -> SH) and the renamed pin exists on the symbol, the failure
+            also carries {known_rename, suggested_pin} and a
+            {type: "pin_rename_9_to_10"} warning naming the new pin — the
+            connection is NOT auto-substituted; re-run with the suggested pin.
             May include "warnings": each stub is collision-checked against every
             other pin; if the preferred direction would short onto a neighbour
             the stub is rerouted, shortened, or (last resort) terminated on the
@@ -797,6 +865,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.connect_pins_bulk(p, pins, net, stub_length=stub_length)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -833,6 +903,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.add_no_connects_bulk(p, points)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -856,7 +928,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         """Move multiple schematic components in one call.
 
         Each entry: {"reference": str, "x": float, "y": float,
-                     "rotation": float | None (optional)}.
+                     "rotation": float | None (optional),
+                     "unit": int (optional, default 1 — which unit's block
+                     moves for a multi-unit symbol)}.
         Property labels (Reference, Value, Footprint, etc.) shift by the
         same delta so they stay aligned with the symbol body.
 
@@ -884,6 +958,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.move_components_bulk(p, moves)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except NotImplementedError:
             return json.dumps({
                 "status": "error",
@@ -901,13 +977,16 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         )
         return json.dumps({"status": "success", **result}, indent=2)
 
-    def _remove_schematic_component(sch_p: Path, reference: str) -> dict[str, Any]:
+    def _remove_schematic_component(
+        sch_p: Path, reference: str, unit: int | None = None,
+    ) -> dict[str, Any]:
         backup = create_backup(sch_p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.remove_component(sch_p, reference)
+        result = ops.remove_component(sch_p, reference, unit=unit)
         change_log.record(
             "remove_component",
-            {"path": str(sch_p), "reference": reference, "scope": "schematic"},
+            {"path": str(sch_p), "reference": reference, "scope": "schematic",
+             "unit": unit},
             file_modified=str(sch_p),
             backup_path=str(backup) if backup else None,
         )
@@ -932,12 +1011,18 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         return result
 
     @mcp.tool()
-    def remove_component(path: str, reference: str, scope: str = "schematic") -> str:
+    def remove_component(
+        path: str, reference: str, scope: str = "schematic",
+        unit: int | None = None,
+    ) -> str:
         """Remove a component from the schematic and/or PCB by reference designator.
 
         scope="schematic" (default) removes the symbol instance block from the
         .kicad_sch file. This does NOT remove associated wires or labels.
         Power symbols such as #PWR001 or #FLG01 can also be removed.
+        For multi-unit symbols, ``unit`` (schematic scope only) removes just
+        that unit's block; the default None removes every unit of the
+        reference — the whole component.
 
         scope="pcb" removes the footprint from the .kicad_pcb file (live board
         when the bridge is up, file edit otherwise) and returns the captured
@@ -967,7 +1052,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         if scope == "schematic":
             sch_p = validate_kicad_path(path, ".kicad_sch")
             try:
-                result = _remove_schematic_component(sch_p, reference)
+                result = _remove_schematic_component(sch_p, reference, unit)
+            except BoardOpenInKiCadError as exc:
+                return _schematic_write_refusal(exc)
             except ValueError as exc:
                 return json.dumps({"status": "error", "message": str(exc)})
             return json.dumps({"status": "success", **result}, indent=2)
@@ -976,6 +1063,13 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             pcb_p = validate_kicad_path(path, ".kicad_pcb")
             try:
                 result = _remove_board_component(pcb_p, reference)
+            except BoardOpenInKiCadError as exc:
+                # KIR4 NS invariant: never edit the board file behind KiCad.
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "board_open_in_kicad",
+                    "message": str(exc),
+                }, indent=2)
             except ValueError as exc:
                 return json.dumps({"status": "error", "message": str(exc)})
             return json.dumps({"status": "success", **result}, indent=2)
@@ -989,6 +1083,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         errors = 0
         try:
             sides["schematic"] = _remove_schematic_component(sch_p, reference)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             sides["schematic"] = {"error": str(exc)}
             errors += 1
@@ -1030,6 +1126,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_wire(p, start_x, start_y, end_x, end_y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1061,6 +1159,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_no_connect(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1097,6 +1197,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.remove_label(p, x, y, text=text)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1136,6 +1238,8 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.set_label_text(p, x, y, new_text, old_text=old_text)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
@@ -1153,6 +1257,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         x: float,
         y: float,
         rotation: float | None = None,
+        unit: int = 1,
     ) -> str:
         """Move a schematic component to a new position.
 
@@ -1168,6 +1273,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             x: New X position in schematic units (mm).
             y: New Y position in schematic units (mm).
             rotation: New rotation in degrees (0, 90, 180, 270). Leave None to keep current.
+            unit: Which unit's block to move for a multi-unit symbol
+                  (default 1) — moving a multi-unit reference without unit
+                  moves unit 1 only.
 
         Returns:
             JSON with new position and rotation.
@@ -1178,12 +1286,15 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
         try:
-            result = ops.move_component(p, reference, x, y, rotation=rotation)
+            result = ops.move_component(p, reference, x, y, rotation=rotation, unit=unit)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
             "move_schematic_component",
-            {"path": path, "reference": reference, "x": x, "y": y, "rotation": rotation},
+            {"path": path, "reference": reference, "x": x, "y": y,
+             "rotation": rotation, "unit": unit},
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -1200,6 +1311,9 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         Can modify Value, Footprint, Datasheet, MPN, or any custom property.
         If the property does not exist on the component, it will be added (hidden by default).
+        The symbol attribute flags (in_bom / on_board / dnp /
+        exclude_from_sim) are not properties — use set_symbol_attributes
+        for those.
 
         Args:
             path: Path to .kicad_sch file.
@@ -1217,12 +1331,73 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         ops = backend.get_schematic_modify_ops()
         try:
             result = ops.update_component_property(p, reference, property_name, property_value)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         except ValueError as exc:
             return json.dumps({"status": "error", "message": str(exc)})
         change_log.record(
             "update_component_property",
             {"path": path, "reference": reference,
              "property": property_name, "value": property_value},
+            file_modified=path,
+            backup_path=str(backup) if backup else None,
+        )
+        return json.dumps({"status": "success", **result}, indent=2)
+
+    @mcp.tool()
+    def set_symbol_attributes(
+        path: str,
+        reference: str,
+        in_bom: bool | None = None,
+        on_board: bool | None = None,
+        dnp: bool | None = None,
+        exclude_from_sim: bool | None = None,
+    ) -> str:
+        """Set the bare symbol attribute flags on a placed schematic symbol.
+
+        The four flags are bare s-expression tokens KiCad stores on every
+        placed symbol — not (property ...) clauses, so
+        update_component_property cannot reach them. Every unit block of the
+        reference is edited; omitted (None) flags stay as they are. At least
+        one flag must be passed.
+
+        Args:
+            path: Path to .kicad_sch file.
+            reference: Reference designator of the component (e.g. 'P5', 'U3').
+            in_bom: Symbol appears in the bill of materials.
+            on_board: Symbol has a board footprint.
+            dnp: Do-not-populate flag.
+            exclude_from_sim: Ignored by the simulator.
+
+        Returns:
+            JSON with reference, units_updated, and the final effective
+            attributes re-read from the edited file.
+        """
+        p = validate_kicad_path(path, ".kicad_sch")
+        validate_reference(reference)
+
+        backup = create_backup(p)
+        ops = backend.get_schematic_modify_ops()
+        try:
+            result = ops.set_symbol_attributes(
+                p, reference,
+                in_bom=in_bom, on_board=on_board,
+                dnp=dnp, exclude_from_sim=exclude_from_sim,
+            )
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
+        except ValueError as exc:
+            return json.dumps({"status": "error", "message": str(exc)})
+        params: dict[str, Any] = {"path": path, "reference": reference}
+        for name, flag in (
+            ("in_bom", in_bom), ("on_board", on_board),
+            ("dnp", dnp), ("exclude_from_sim", exclude_from_sim),
+        ):
+            if flag is not None:
+                params[name] = flag
+        change_log.record(
+            "set_symbol_attributes",
+            params,
             file_modified=path,
             backup_path=str(backup) if backup else None,
         )
@@ -1421,22 +1596,17 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         schematic_path: str, board_path: str,
         apply_footprint_changes: bool = False,
     ) -> str:
-        """Synchronize schematic components to the PCB board.
+        """Synchronize the schematic to the PCB using KiCad's own netlist (KIR4 NS).
 
-        Reads the schematic and PCB, compares them, and applies safe
-        automatic changes:
-        - Components missing from PCB are placed at auto-positioned locations.
-        - Value mismatches are updated on the PCB side.
-        - Pin-to-net assignments are propagated from schematic connectivity to PCB pads.
-        - Extra PCB components are reported as warnings (manual review).
-        - Footprint mismatches: warned by default; with
-          apply_footprint_changes=True the PCB footprint is swapped for the
-          schematic's one, preserving position, rotation, layer, and pad
-          nets (matched by pad name). Ambiguous cases — locked footprints,
-          unresolvable new footprints, fully incompatible pad names,
-          multi-unit symbols whose units disagree on footprint — are
-          skipped with a reason, never guessed. Swaps edit the board file
-          directly: if the board is open in pcbnew, reload it afterwards.
+        KiCad computes the truth: components (ref/value/footprint) and the
+        pad→net map come from `kicad-cli sch export netlist` — never from
+        MCP-side connectivity analysis. Board mutations go through the live
+        path router (IPC → bridge; loud refusal instead of file writes while
+        KiCad is open). Steps: netlist → footprint gate (blocked with ranked
+        candidates when unresolvable) → bulk placement (pcbnew loads geometry
+        natively — no stubs) → sheet-path/ClusterId metadata + PlacementIntent
+        anchors → footprint swaps (opt-in) → values → pad nets → a verify pass
+        comparing board pads against the netlist.
 
         Args:
             schematic_path: Path to .kicad_sch file.
@@ -1445,94 +1615,34 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                 the schematic (default False reports them as warnings only).
 
         Returns:
-            JSON with summary of actions taken, footprint changes
-            applied/skipped, and warnings.
+            JSON {status, summary, actions, verified, footprint_changes_*,
+            warnings}. Error payloads carry error_code: one of
+            netlist_generation_failed, netlist_parse_failed, board_read_failed,
+            live_path_required, placement_failed. Genuinely-unconnected pads
+            stay netless (KiCad's own updater would give them unconnected-*
+            nets) — a named representational difference, not a defect.
         """
         sch_p = validate_kicad_path(schematic_path, ".kicad_sch")
         pcb_p = validate_kicad_path(board_path, ".kicad_pcb")
+        project_dir = pcb_p.parent
 
-        # §6.2 precondition: refuse before any PCB work when a symbol's Footprint
-        # is unresolvable or its pin set isn't a subset of the footprint's pads —
-        # otherwise sync silently produces a board with unassigned pads.
-        from kicad_mcp.tools.drc import run_validate_symbol_footprint_pairs
-        sf = run_validate_symbol_footprint_pairs(sch_p)
-        if not sf["passed"]:
-            # §6.8: enrich each unresolvable footprint with ranked replacement
-            # candidates so recovery is one call, not a search loop. Purely
-            # additive — only the new `candidates` key is added (REQ-WIRE-003).
-            unresolvable = sf["unresolvable"]
-            if unresolvable:
-                from kicad_mcp.backends.file_backend import FileLibraryOps
-                lib_ops = FileLibraryOps(project_dir=str(sch_p.parent))
-                for entry in unresolvable:
-                    entry["candidates"] = suggest_footprint_candidates(
-                        entry["footprint"], library_ops=lib_ops, limit=5,
-                    )
-            msg = _format_validator_refusal_message(sf)
-            if any(e.get("candidates") for e in unresolvable):
-                msg += ("\nRanked replacement footprints are attached per "
-                        "unresolvable symbol (`candidates`).")
-            return json.dumps({
-                "status": "blocked",
-                "reason": "symbol_footprint_validator_failed",
-                "mismatches": sf["mismatches"],
-                "unresolvable": unresolvable,
-                "message": msg,
-            }, indent=2)
-
-        from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
-
-        # Try the configured backend first; fall back to file ops if IPC times out
-        # (common when KiCad is running but the board/schematic isn't open in the editor).
-        try:
-            sch_ops = backend.get_schematic_ops()
-            sch_data = sch_ops.read_schematic(sch_p)
-        except Exception:
-            sch_ops = FileSchematicOps()
-            sch_data = sch_ops.read_schematic(sch_p)
-
-        try:
-            pcb_ops = backend.get_board_ops()
-            pcb_data = pcb_ops.read_board(pcb_p)
-        except Exception:
-            pcb_ops = FileBoardOps()
-            pcb_data = pcb_ops.read_board(pcb_p)
-
-        # Build dicts keyed by reference, filtering out power symbols.
-        # Multi-unit components appear once per unit; merge so the footprint
-        # from whichever unit carries it is preserved.
-        sch_by_ref: dict[str, dict[str, Any]] = {}
-        conflicting_fp_refs: set[str] = set()
-        for sym in sch_data.get("symbols", []):
-            ref = sym.get("reference", "")
-            if not ref or ref.startswith("#"):
-                continue
-            if sym.get("is_power"):
-                continue
-            if ref not in sch_by_ref:
-                sch_by_ref[ref] = sym
-            elif sym.get("footprint") and not sch_by_ref[ref].get("footprint"):
-                sch_by_ref[ref]["footprint"] = sym["footprint"]
-            elif (sym.get("footprint") and sch_by_ref[ref].get("footprint")
-                  and sym["footprint"] != sch_by_ref[ref]["footprint"]):
-                # Multi-unit symbol whose units disagree on footprint —
-                # ambiguous for the swap path, skip-with-reason there.
-                conflicting_fp_refs.add(ref)
-
-        pcb_by_ref: dict[str, dict[str, Any]] = {}
-        for comp in pcb_data.get("components", []):
-            ref = comp.get("reference", "")
-            if ref:
-                pcb_by_ref[ref] = comp
+        from kicad_mcp.backends.file_backend import FileBoardOps, FileLibraryOps
+        from kicad_mcp.models.errors import (
+            CapabilityNotSupportedError,
+            SafeRefuseError,
+        )
+        from kicad_mcp.utils.fp_lib_table import get_footprint_library_map
+        from kicad_mcp.utils.gates import warn_if_ungated
+        from kicad_mcp.utils.netlist_model import (
+            NetlistParseError,
+            parse_kicad_netlist,
+        )
+        from kicad_mcp.utils.placement_metrics import read_board_pads
 
         actions: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
 
-        # §6.3 soft gate: nudge (don't block — sync is iterative) when the
-        # schematic hasn't passed validate_schematic_for_pcb against its current
-        # content. The §6.2 footprint check above is the hard gate; this surfaces
-        # the broader ERC/connectivity validation the user may have skipped.
-        from kicad_mcp.utils.gates import warn_if_ungated
+        # Step 2 — soft gate (unchanged): nudge, don't block.
         gate_warning = warn_if_ungated(
             sch_p, "validate_schematic_for_pcb", "sync_schematic_to_pcb",
             fix_hint="Run validate_schematic_for_pcb(schematic_path) and resolve blocking issues.",
@@ -1540,177 +1650,348 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         if gate_warning is not None:
             warnings.append(gate_warning)
 
-        # Select board modify ops based on whether the earlier read succeeded via the
-        # plugin backend.  If the read had to fall back to FileBoardOps (bridge down or
-        # board not open in KiCad), use FileBoardOps for mutations too — that is safe
-        # when the PCB was just created and has not been opened in the PCB editor yet.
-        # This avoids the previous bug where get_board_modify_ops() always succeeded
-        # (it returns an ops object without probing the bridge), then every individual
-        # place_component / assign_net call failed with [WinError 10061] and was
-        # silently turned into a warning, producing status:"success" with 0 placements.
-        board_modify_ops: BoardOps
-        if isinstance(pcb_ops, FileBoardOps):
-            board_modify_ops = FileBoardOps()
-        else:
+        # Step 3 — KiCad computes the truth (REQ-NS-1).
+        try:
+            drc_ops = backend.get_drc_ops()
+        except CapabilityNotSupportedError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "netlist_generation_failed",
+                "message": (
+                    f"kicad-cli is unavailable: {exc}. "
+                    "Sync requires KiCad's own netlist."
+                ),
+            }, indent=2)
+        netlist_out = pcb_p.parent / f".{pcb_p.stem}.sync_netlist.net"
+        try:
             try:
-                board_modify_ops = backend.get_board_modify_ops()
-            except Exception:
-                board_modify_ops = FileBoardOps()
+                nl_result = drc_ops.generate_netlist(sch_p, netlist_out)
+            except Exception as exc:  # A3: raising backends fail loudly too
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "netlist_generation_failed",
+                    "message": (
+                        f"kicad-cli netlist generation failed: {exc}. "
+                        "Sync requires KiCad's own netlist."
+                    ),
+                }, indent=2)
+            if (not nl_result.get("generated")
+                    or nl_result.get("returncode") not in (0, None)):
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "netlist_generation_failed",
+                    "message": (
+                        "kicad-cli netlist generation failed (returncode "
+                        f"{nl_result.get('returncode')}). Fix the schematic "
+                        "(run run_erc for details) and retry."
+                    ),
+                }, indent=2)
+            try:
+                model = parse_kicad_netlist(netlist_out)
+            except NetlistParseError as exc:
+                return json.dumps({
+                    "status": "error",
+                    "error_code": "netlist_parse_failed",
+                    "message": str(exc),
+                }, indent=2)
+        finally:
+            netlist_out.unlink(missing_ok=True)
 
-        # Auto-position grid for new components
-        place_x, place_y = 50.0, 50.0
-        place_step = 10.0
+        # Step 4 — footprint gate (REQ-NS-6): every footprint's library AND
+        # file must resolve project-aware before any mutation.
+        fp_map = get_footprint_library_map(project_dir)
+        unresolvable: list[dict[str, Any]] = []
+        for comp in model.components:
+            fp = comp.footprint
+            if not fp:
+                warnings.append({
+                    "type": "no_footprint",
+                    "reference": comp.reference,
+                    "message": (
+                        f"{comp.reference} has no footprint assigned in "
+                        "schematic, cannot place on PCB."
+                    ),
+                })
+                continue
+            nick, _, name = fp.partition(":")
+            if nick not in fp_map:
+                unresolvable.append({
+                    "ref": comp.reference, "footprint": fp,
+                    "reason": "footprint library not found",
+                })
+            elif not (Path(fp_map[nick]) / f"{name}.kicad_mod").exists():
+                unresolvable.append({
+                    "ref": comp.reference, "footprint": fp,
+                    "reason": f"footprint '{name}' not found in library '{nick}'",
+                })
+        if unresolvable:
+            lib_ops = FileLibraryOps(project_dir=str(sch_p.parent))
+            for entry in unresolvable:
+                entry["candidates"] = suggest_footprint_candidates(
+                    entry["footprint"], library_ops=lib_ops, limit=5,
+                )
+            return json.dumps({
+                "status": "blocked",
+                "reason": "footprint_unresolvable",
+                "unresolvable": unresolvable,
+                "message": (
+                    f"sync refused: {len(unresolvable)} footprint(s) "
+                    "unresolvable from the project's libraries. Fix the "
+                    "Footprint field or register the library, then retry."
+                ),
+            }, indent=2)
+
+        # Step 5 — router-served mutations only (REQ-NS-2).
+        try:
+            ops = backend.get_board_modify_ops()
+        except SafeRefuseError as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "live_path_required",
+                "message": (
+                    "KiCad is running but no live path (IPC or bridge) can "
+                    "serve board mutations. Sync will not write the board "
+                    "file behind KiCad's back. Open the board in the PCB "
+                    "editor (bridge) or close KiCad to allow file-mode sync."
+                ),
+                "detail": str(exc),
+            }, indent=2)
+
+        # Step 6 — board read, no silent fallback.
+        try:
+            components_now = backend.get_board_ops().get_components(pcb_p)
+        except Exception as exc:
+            return json.dumps({
+                "status": "error",
+                "error_code": "board_read_failed",
+                "detail": str(exc),
+                "message": (
+                    "could not read the board through the active backend; "
+                    "sync aborted before any mutation."
+                ),
+            }, indent=2)
+        pcb_by_ref: dict[str, dict[str, Any]] = {
+            c["reference"]: c for c in components_now if c.get("reference")
+        }
+
+        # Step 7 — schematic metadata read: sheet paths, PlacementIntent, and
+        # multi-unit footprint-conflict detection for the swap path.
+        meta_by_ref: dict[str, tuple[str, str]] = {}
+        conflicting_fp_refs: set[str] = set()
+        metadata_available = True
+        try:
+            sch_syms = backend.get_schematic_ops().read_schematic(sch_p).get(
+                "symbols", [])
+            for sym in sch_syms:
+                ref = sym.get("reference", "")
+                if not ref or ref.startswith("#") or sym.get("is_power"):
+                    continue
+                if ref not in meta_by_ref:
+                    meta_by_ref[ref] = (
+                        sym.get("sheet_path", "") or "",
+                        (sym.get("properties") or {}).get(
+                            "PlacementIntent", "") or "",
+                    )
+                # The reader merges multi-unit blocks to one row and records
+                # any footprint disagreement between units on that row.
+                if sym.get("footprint_conflict"):
+                    conflicting_fp_refs.add(ref)
+        except Exception as exc:
+            metadata_available = False
+            warnings.append({
+                "type": "metadata_source_unavailable",
+                "message": str(exc),
+            })
+
+        fp_by_ref = {c.reference: c for c in model.components}
+        target = model.pad_net_map()
         placed_refs: set[str] = set()
-        # True if any applied footprint swap edited the .kicad_pcb file directly
-        # (file backend) rather than the live bridge board — drives the
-        # board_reload_required warning (#2/B3).
+        swapped_refs: set[str] = set()
+        footprint_changes_applied: list[dict[str, Any]] = []
+        footprint_changes_skipped: list[dict[str, Any]] = []
         swaps_used_file_path = False
 
-        for ref in sorted(sch_by_ref):
-            if ref not in pcb_by_ref:
-                # Missing from PCB → place it
-                sym = sch_by_ref[ref]
-                footprint = sym.get("footprint", "")
-                if not footprint:
-                    warnings.append({
-                        "type": "no_footprint",
-                        "reference": ref,
-                        "message": f"{ref} has no footprint assigned in schematic, cannot place on PCB.",
+        def _partial_error(code: str, message: str) -> str:
+            return json.dumps({
+                "status": "error",
+                "error_code": code,
+                "message": message,
+                "partial": {"actions": actions, "warnings": warnings},
+            }, indent=2)
+
+        # A1: one backup before the first board mutation.
+        create_backup(pcb_p)
+
+        try:
+            # Step 8 — placement: one bulk call; pcbnew loads geometry
+            # natively inside KiCad (no stubs, loud per-item failures).
+            missing = [
+                c for c in model.components
+                if c.reference not in pcb_by_ref and c.footprint
+            ]
+            if missing:
+                batch: list[dict[str, Any]] = []
+                place_x, place_y = 50.0, 50.0
+                for comp in missing:
+                    batch.append({
+                        "reference": comp.reference,
+                        "footprint": comp.footprint,
+                        "x": place_x, "y": place_y,
                     })
-                    continue
+                    place_x += 10.0
+                    if place_x > 200.0:
+                        place_x = 50.0
+                        place_y += 10.0
+                positions = {b["reference"]: (b["x"], b["y"]) for b in batch}
+                try:
+                    bulk = ops.place_components_bulk(pcb_p, batch)
+                except SafeRefuseError:
+                    raise
+                except Exception as exc:
+                    return _partial_error("placement_failed", (
+                        f"bulk placement failed: {exc}. The board may be "
+                        "partially synced; sync is idempotent — placement "
+                        "skips existing refs and values/nets re-converge — "
+                        "fix the cause and re-run sync."
+                    ))
+                if bulk.get("status") == "refused":
+                    return _partial_error("placement_failed", (
+                        f"bulk placement refused: {bulk.get('reason', '')}. "
+                        "Fix the cause and re-run sync."
+                    ))
+                for ref in bulk.get("placed", []):
+                    px, py = positions[ref]
+                    actions.append({
+                        "type": "placed",
+                        "reference": ref,
+                        "footprint": fp_by_ref[ref].footprint,
+                        "position": {"x": px, "y": py},
+                    })
+                    placed_refs.add(ref)
+                for item in bulk.get("failed", []):
+                    warnings.append({
+                        "type": "place_failed",
+                        "reference": item.get("reference", ""),
+                        "message": item.get("reason", ""),
+                    })
 
-                if board_modify_ops is not None:
-                    backup = create_backup(pcb_p)
-                    try:
-                        result = board_modify_ops.place_component(
-                            pcb_p, ref, footprint, place_x, place_y,
-                        )
-                        actions.append({
-                            "type": "placed",
-                            "reference": ref,
-                            "footprint": footprint,
-                            "position": {"x": place_x, "y": place_y},
-                        })
-                        placed_refs.add(ref)
-                        place_x += place_step
-                        if place_x > 200.0:
-                            place_x = 50.0
-                            place_y += place_step
-
-                        # Phase 6.3.3 — propagate the schematic sheet path
-                        # onto the placed footprint so auto_place can cluster
-                        # components by their schematic hierarchy.
-                        sheet_path = sym.get("sheet_path", "")
-                        if sheet_path:
-                            try:
-                                _inject_footprint_sheet_path(pcb_p, ref, sheet_path)
-                            except Exception as inj_exc:
-                                warnings.append({
-                                    "type": "sheet_path_inject_failed",
-                                    "reference": ref,
-                                    "sheet_path": sheet_path,
-                                    "message": str(inj_exc),
-                                })
-
-                        # PlacementIntent (Phase 6.3.2): schematic-driven anchor
-                        # at a named board edge. Requires Edge.Cuts to exist —
-                        # surface as a deferred action otherwise.
-                        intent = (sym.get("properties") or {}).get("PlacementIntent", "")
-                        if intent.startswith("cluster:"):
-                            # Phase 6.3.2 + 6.3.3 — cluster:NAME overrides the
-                            # natural sheet_path clustering. Inject a ClusterId
-                            # property; auto_place reads it as the grouping key.
-                            cluster_name = intent.split(":", 1)[1].strip()
-                            try:
-                                _inject_footprint_property(
-                                    pcb_p, ref, "ClusterId", cluster_name,
-                                )
+            # Step 9 — metadata + PlacementIntent for freshly placed refs
+            # (skipped when the schematic read failed; sync continues).
+            if metadata_available:
+                for ref in sorted(placed_refs):
+                    sheet_path, intent = meta_by_ref.get(ref, ("", ""))
+                    cluster_name = ""
+                    if intent.startswith("cluster:"):
+                        cluster_name = intent.split(":", 1)[1].strip()
+                    if sheet_path or cluster_name:
+                        try:
+                            meta = ops.set_footprint_metadata(
+                                pcb_p, ref,
+                                sheet_path=sheet_path or None,
+                                fields=(
+                                    {"ClusterId": cluster_name}
+                                    if cluster_name else None
+                                ),
+                            )
+                            actions.append({
+                                "type": "metadata_set",
+                                "reference": ref,
+                                "sheet_path_set": meta.get(
+                                    "sheet_path_set", False),
+                                "fields_set": meta.get("fields_set", []),
+                            })
+                            if cluster_name:
                                 actions.append({
                                     "type": "cluster_assigned",
                                     "reference": ref,
                                     "cluster": cluster_name,
                                     "source": "PlacementIntent",
                                 })
-                            except Exception as inj_exc:
+                        except SafeRefuseError:
+                            raise
+                        except RuntimeError as exc:
+                            if "Unknown method" in str(exc):
                                 warnings.append({
-                                    "type": "cluster_inject_failed",
+                                    "type": "bridge_upgrade_required",
                                     "reference": ref,
-                                    "cluster": cluster_name,
-                                    "message": str(inj_exc),
+                                    "message": (
+                                        "bridge ≥ 2.6.0-sync required for "
+                                        "sheet-path/field metadata; reinstall "
+                                        "the bridge and reopen the PCB "
+                                        "editor. Metadata skipped; "
+                                        "placement/nets unaffected."
+                                    ),
                                 })
-                        if intent.startswith("edge:"):
-                            edge_name = intent.split(":", 1)[1].strip().lower()
-                            from kicad_mcp.tools.drc import compute_edge_placement
-                            plan = compute_edge_placement(pcb_p, ref, edge_name)
-                            if plan["status"] == "success":
-                                try:
-                                    board_modify_ops.move_component(
-                                        pcb_p, ref,
-                                        plan["target_x"], plan["target_y"],
-                                        plan["target_rotation"],
-                                    )
-                                    actions.append({
-                                        "type": "anchored_at_edge",
-                                        "reference": ref,
-                                        "edge": edge_name,
-                                        "rotation": plan["target_rotation"],
-                                        "source": "PlacementIntent",
-                                    })
-                                except Exception as anchor_exc:
-                                    warnings.append({
-                                        "type": "anchor_failed",
-                                        "reference": ref,
-                                        "edge": edge_name,
-                                        "message": str(anchor_exc),
-                                    })
                             else:
-                                # Deferred — typically no Edge.Cuts outline yet
                                 warnings.append({
-                                    "type": "placement_intent_deferred",
+                                    "type": "metadata_failed",
                                     "reference": ref,
-                                    "intent": intent,
-                                    "message": plan["message"],
+                                    "message": str(exc),
                                 })
-                    except Exception as exc:
-                        warnings.append({
-                            "type": "place_failed",
-                            "reference": ref,
-                            "message": str(exc),
-                        })
-                else:
+                        except Exception as exc:
+                            warnings.append({
+                                "type": "metadata_failed",
+                                "reference": ref,
+                                "message": str(exc),
+                            })
+                    if intent.startswith("edge:"):
+                        edge_name = intent.split(":", 1)[1].strip().lower()
+                        from kicad_mcp.tools.drc import compute_edge_placement
+                        plan = compute_edge_placement(pcb_p, ref, edge_name)
+                        if plan["status"] == "success":
+                            try:
+                                ops.move_component(
+                                    pcb_p, ref,
+                                    plan["target_x"], plan["target_y"],
+                                    plan["target_rotation"],
+                                )
+                                actions.append({
+                                    "type": "anchored_at_edge",
+                                    "reference": ref,
+                                    "edge": edge_name,
+                                    "rotation": plan["target_rotation"],
+                                    "source": "PlacementIntent",
+                                })
+                            except SafeRefuseError:
+                                raise
+                            except Exception as anchor_exc:
+                                warnings.append({
+                                    "type": "anchor_failed",
+                                    "reference": ref,
+                                    "edge": edge_name,
+                                    "message": str(anchor_exc),
+                                })
+                        else:
+                            warnings.append({
+                                "type": "placement_intent_deferred",
+                                "reference": ref,
+                                "intent": intent,
+                                "message": plan["message"],
+                            })
+
+            # Step 10 — extra-on-board + footprint swaps (opt-in).
+            for ref in sorted(pcb_by_ref):
+                if ref not in fp_by_ref:
                     warnings.append({
-                        "type": "missing_from_pcb",
+                        "type": "extra_in_pcb",
                         "reference": ref,
-                        "footprint": footprint,
-                        "message": f"{ref} missing from PCB (board modify not available).",
+                        "message": f"{ref} exists in PCB but not in schematic.",
                     })
-
-        for ref in sorted(pcb_by_ref):
-            if ref not in sch_by_ref:
-                warnings.append({
-                    "type": "extra_in_pcb",
-                    "reference": ref,
-                    "message": f"{ref} exists in PCB but not in schematic.",
-                })
-
-        # Check mismatches for pre-existing components, and update values for all
-        # (including newly placed, which start with the footprint name as Value).
-        footprint_changes_applied: list[dict[str, Any]] = []
-        footprint_changes_skipped: list[dict[str, Any]] = []
-        for ref in sorted(set(sch_by_ref) & (set(pcb_by_ref) | placed_refs)):
-            sch_sym = sch_by_ref[ref]
-            pcb_comp = pcb_by_ref.get(ref)
-
-            sch_fp = sch_sym.get("footprint", "")
-            pcb_fp = pcb_comp.get("footprint", "") if pcb_comp else ""
-            if sch_fp and pcb_fp and sch_fp != pcb_fp:
+            for ref in sorted(set(fp_by_ref) & set(pcb_by_ref)):
+                sch_fp = fp_by_ref[ref].footprint
+                pcb_fp = pcb_by_ref[ref].get("footprint", "")
+                if not (sch_fp and pcb_fp and sch_fp != pcb_fp):
+                    continue
                 if not apply_footprint_changes:
                     warnings.append({
                         "type": "footprint_mismatch",
                         "reference": ref,
                         "schematic_footprint": sch_fp,
                         "pcb_footprint": pcb_fp,
-                        "message": f"{ref} footprint mismatch: schematic={sch_fp}, pcb={pcb_fp}",
+                        "message": (
+                            f"{ref} footprint mismatch: schematic={sch_fp}, "
+                            f"pcb={pcb_fp}"
+                        ),
                     })
                 elif ref in conflicting_fp_refs:
                     footprint_changes_skipped.append({
@@ -1720,11 +2001,12 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                         "reason": "multi-unit symbol units disagree on footprint",
                     })
                 else:
-                    create_backup(pcb_p)
                     try:
                         swap = _attempt_footprint_swap(
-                            pcb_p, ref, sch_fp, board_ops=board_modify_ops,
+                            pcb_p, ref, sch_fp, board_ops=ops,
                         )
+                    except SafeRefuseError:
+                        raise
                     except Exception as exc:
                         swap = {"applied": False, "reason": f"swap failed: {exc}"}
                     if swap["applied"]:
@@ -1735,11 +2017,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                             "type": "footprint_swapped",
                             **swap["record"],
                         })
-                        # The freshly embedded footprint carries the .kicad_mod's
-                        # own Value text — blank the stale read so the value-update
-                        # pass below rewrites it to the schematic's value.
-                        if pcb_comp is not None:
-                            pcb_comp["value"] = ""
+                        swapped_refs.add(ref)
                     else:
                         footprint_changes_skipped.append({
                             "reference": ref,
@@ -1747,203 +2025,133 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
                             "new_footprint": sch_fp,
                             "reason": swap["reason"],
                         })
-
-            sch_val = sch_sym.get("value", "")
-            pcb_val = pcb_comp.get("value", "") if pcb_comp else ""
-            if sch_val and sch_val != pcb_val:
-                # Update the PCB footprint Value through board_modify_ops — the
-                # live bridge when one is open (so the value lands on the
-                # in-memory board, not just the file behind the bridge's back,
-                # which is the #7 revert root cause), else the file backend.
-                if board_modify_ops is not None:
-                    try:
-                        cast(FileBoardOps, board_modify_ops).set_footprint_value(
-                            pcb_p, ref, sch_val
-                        )
-                        actions.append({
-                            "type": "value_updated",
-                            "reference": ref,
-                            "old_value": pcb_val,
-                            "new_value": sch_val,
-                        })
-                    except ValueError as exc:
-                        warnings.append({
-                            "type": "value_mismatch",
-                            "reference": ref,
-                            "message": f"Could not update Value for {ref}: {exc}",
-                        })
-                    except Exception as exc:
-                        warnings.append({
-                            "type": "value_update_failed",
-                            "reference": ref,
-                            "message": str(exc),
-                        })
-                else:
-                    warnings.append({
-                        "type": "value_mismatch",
-                        "reference": ref,
-                        "schematic_value": sch_val,
-                        "pcb_value": pcb_val,
-                        "message": f"{ref} value mismatch (board modify not available).",
-                    })
-
-        # Propagate schematic pin nets to PCB pads.
-        # Use _build_connectivity to resolve all nets in one pass when available
-        # (avoids re-parsing the schematic file O(N×M) times via per-pin get_pin_net).
-        if board_modify_ops is not None:
-            if hasattr(sch_ops, "_build_connectivity"):
-                try:
-                    connectivity = sch_ops._build_connectivity(sch_p)
-                except Exception as conn_exc:
-                    connectivity = {}
-                    warnings.append({
-                        "type": "net_sync_failed",
-                        "message": f"Could not build schematic connectivity: {conn_exc}",
-                    })
-                seen_keys: set[tuple[str, str, str]] = set()
-                net_sync_aborted = False
-                for net_name, pins in connectivity.items():
-                    if net_sync_aborted:
-                        break
-                    if not net_name or net_name.strip().lower() == "none":
-                        continue
-                    for pin in pins:
-                        ref = pin.get("reference", "")
-                        pad = str(pin.get("pin_number", ""))
-                        if not ref or not pad or ref not in sch_by_ref:
-                            continue
-                        key = (ref, pad, net_name)
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-                        try:
-                            board_modify_ops.assign_net(pcb_p, ref, pad, net_name)
-                            actions.append({
-                                "type": "net_assigned",
+                        # SW-1 C4: a failed rollback left the part deleted —
+                        # loud, structured warning. A successful rollback
+                        # stays a plain skip (the part is intact).
+                        if swap.get("restored") is False:
+                            warnings.append({
+                                "type": "swap_rollback_failed",
                                 "reference": ref,
-                                "pad": pad,
-                                "net": net_name,
+                                "message": swap["reason"],
                             })
-                        except NotImplementedError:
-                            warnings.append({
-                                "type": "net_sync_not_supported",
-                                "message": "Board backend does not support assigning nets to pads.",
-                            })
-                            net_sync_aborted = True
-                            break
-                        except Exception as exc:
-                            warnings.append({
-                                "type": "net_assign_failed",
-                                "reference": ref,
-                                "pad": pad,
-                                "net": net_name,
-                                "message": str(exc),
-                            })
-            else:
-                # IPC backend: fall back to per-pin queries
-                net_assignments: list[dict[str, str]] = []
-                net_queries_supported = True
-
-                for ref in sorted(sch_by_ref):
-                    if ref not in pcb_by_ref and ref not in placed_refs:
-                        continue
-                    try:
-                        pin_info = sch_ops.get_symbol_pin_positions(sch_p, ref)
-                    except NotImplementedError:
-                        net_queries_supported = False
-                        break
-                    except Exception:
-                        continue
-                    if not isinstance(pin_info, dict):
-                        continue
-                    pin_positions = pin_info.get("pin_positions", {})
-                    if not isinstance(pin_positions, dict):
-                        continue
-                    for pin_number in sorted(pin_positions, key=lambda p: str(p)):
-                        pin_number_str = str(pin_number)
-                        try:
-                            pin_net = sch_ops.get_pin_net(sch_p, ref, pin_number_str)
-                        except NotImplementedError:
-                            net_queries_supported = False
-                            break
-                        except Exception:
-                            continue
-                        if not isinstance(pin_net, dict):
-                            continue
-                        net_name = pin_net.get("net_name", "")
-                        if not isinstance(net_name, str) or not net_name:
-                            continue
-                        if net_name.strip().lower() == "none":
-                            continue
-                        net_assignments.append({
-                            "reference": ref,
-                            "pad": pin_number_str,
-                            "net": net_name,
-                        })
-                    if not net_queries_supported:
-                        break
-
-                if not net_queries_supported:
-                    warnings.append({
-                        "type": "net_sync_not_supported",
-                        "message": "Schematic backend does not support pin/net connectivity queries.",
-                    })
-                else:
-                    seen_assignments: set[tuple[str, str, str]] = set()
-                    for assignment in net_assignments:
-                        key = (assignment["reference"], assignment["pad"], assignment["net"])
-                        if key in seen_assignments:
-                            continue
-                        seen_assignments.add(key)
-                        try:
-                            board_modify_ops.assign_net(
-                                pcb_p,
-                                assignment["reference"],
-                                assignment["pad"],
-                                assignment["net"],
-                            )
-                            actions.append({"type": "net_assigned", **assignment})
-                        except NotImplementedError:
-                            warnings.append({
-                                "type": "net_sync_not_supported",
-                                "message": "Board backend does not support assigning nets to pads.",
-                            })
-                            break
-                        except Exception as exc:
-                            warnings.append({
-                                "type": "net_assign_failed",
-                                "reference": assignment["reference"],
-                                "pad": assignment["pad"],
-                                "net": assignment["net"],
-                                "message": str(exc),
-                            })
-        else:
-            if any(ref in pcb_by_ref or ref in placed_refs for ref in sch_by_ref):
+            if swaps_used_file_path:
                 warnings.append({
-                    "type": "net_sync_unavailable",
-                    "message": "Board modify backend not available; schematic nets were not synced to PCB pads.",
+                    "type": "board_reload_required",
+                    "message": (
+                        "Footprint swaps edited the board file directly "
+                        "(KiCad closed); reload the board in pcbnew before "
+                        "further live-board operations."
+                    ),
                 })
 
-        # Swaps normally route through the live bridge (B1), so the in-memory
-        # board already matches disk and no reload is needed. Warn only when a
-        # swap actually fell back to the file path while a live pcbnew board is
-        # open (e.g. the bridge dropped mid-sync) — that is the only case where
-        # the in-memory board now diverges from disk (#2/B3).
-        if (footprint_changes_applied and swaps_used_file_path
-                and not isinstance(pcb_ops, FileBoardOps)):
-            warnings.append({
-                "type": "board_reload_required",
+            # Step 11 — values, AFTER swaps: netlist value is the truth;
+            # placed/swapped refs get it unconditionally (fresh footprints
+            # carry library-default Values).
+            for comp in model.components:
+                ref, value = comp.reference, comp.value
+                if not value:
+                    continue
+                if ref in placed_refs or ref in swapped_refs:
+                    old_value = ""
+                elif ref in pcb_by_ref:
+                    old_value = pcb_by_ref[ref].get("value", "")
+                    if old_value == value:
+                        continue
+                else:
+                    continue
+                try:
+                    ops.set_footprint_value(pcb_p, ref, value)
+                    actions.append({
+                        "type": "value_updated",
+                        "reference": ref,
+                        "old_value": old_value,
+                        "new_value": value,
+                    })
+                except SafeRefuseError:
+                    raise
+                except Exception as exc:
+                    warnings.append({
+                        "type": "value_update_failed",
+                        "reference": ref,
+                        "message": str(exc),
+                    })
+
+            # Step 12 — pad nets from KiCad's netlist only (REQ-NS-1).
+            board_pads = {
+                (p["ref"], p["pad"]): p["net_name"]
+                for p in read_board_pads(pcb_p.read_text(encoding="utf-8"))
+            }
+            for (ref, pad), net in sorted(target.items()):
+                if board_pads.get((ref, pad)) == net:
+                    continue
+                try:
+                    ops.assign_net(pcb_p, ref, pad, net)
+                    actions.append({
+                        "type": "net_assigned",
+                        "reference": ref,
+                        "pad": pad,
+                        "net": net,
+                    })
+                except SafeRefuseError:
+                    raise
+                except Exception as exc:
+                    warnings.append({
+                        "type": "net_assign_failed",
+                        "reference": ref,
+                        "pad": pad,
+                        "net": net,
+                        "message": str(exc),
+                    })
+        except SafeRefuseError as exc:
+            # A2: the router can refuse at call-time too — same loud payload.
+            return json.dumps({
+                "status": "error",
+                "error_code": "live_path_required",
                 "message": (
-                    "Footprint swaps fell back to editing the board file directly; "
-                    "reload the board in pcbnew (reload_board) before further "
-                    "live-board operations."
+                    "KiCad is running but no live path (IPC or bridge) can "
+                    "serve board mutations. Sync will not write the board "
+                    "file behind KiCad's back. Open the board in the PCB "
+                    "editor (bridge) or close KiCad to allow file-mode sync."
                 ),
-            })
+                "detail": str(exc),
+                "partial": {"actions": actions, "warnings": warnings},
+            }, indent=2)
+
+        # Step 13 — verify: the board's pads against KiCad's netlist.
+        verified: dict[str, Any]
+        try:
+            pads_after = {
+                (p["ref"], p["pad"]): p["net_name"]
+                for p in read_board_pads(pcb_p.read_text(encoding="utf-8"))
+            }
+            mismatches: list[dict[str, Any]] = []
+            matched = 0
+            for (ref, pad), net in sorted(target.items()):
+                actual = pads_after.get((ref, pad))
+                if actual == net:
+                    matched += 1
+                else:
+                    mismatches.append({
+                        "reference": ref, "pad": pad,
+                        "expected": net, "actual": actual,
+                    })
+            verified = {
+                "pads_expected": len(target),
+                "pads_matched": matched,
+                "mismatches": mismatches[:25],
+                "mismatches_total": len(mismatches),
+            }
+        except Exception as exc:
+            verified = {
+                "error": str(exc),
+                "message": "verification read failed; treat sync as UNVERIFIED",
+            }
 
         summary = {
             "components_placed": sum(1 for a in actions if a["type"] == "placed"),
             "values_updated": sum(1 for a in actions if a["type"] == "value_updated"),
             "nets_assigned": sum(1 for a in actions if a["type"] == "net_assigned"),
+            "metadata_set": sum(1 for a in actions if a["type"] == "metadata_set"),
             "footprint_changes_applied": len(footprint_changes_applied),
             "footprint_changes_skipped": len(footprint_changes_skipped),
             "warnings": len(warnings),
@@ -1963,6 +2171,7 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
             **limit_response({
                 "summary": summary,
                 "actions": actions,
+                "verified": verified,
                 "footprint_changes_applied": footprint_changes_applied,
                 "footprint_changes_skipped": footprint_changes_skipped,
                 "warnings": warnings,
@@ -1988,7 +2197,10 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
 
         backup = create_backup(p)
         ops = backend.get_schematic_modify_ops()
-        result = ops.add_junction(p, x, y)
+        try:
+            result = ops.add_junction(p, x, y)
+        except BoardOpenInKiCadError as exc:
+            return _schematic_write_refusal(exc)
         change_log.record(
             "add_junction",
             {"path": path, "x": x, "y": y},

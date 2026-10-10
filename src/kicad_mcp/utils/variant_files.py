@@ -755,9 +755,11 @@ def check_format_versions(files: ProjectFiles) -> dict[str, Any] | None:
                 "found": stamp,
                 "required": minimum,
                 "hint": (
-                    "This file predates KiCad 10's variant format. Upgrade it "
-                    "headlessly (schematics: `kicad-cli sch upgrade --force`; "
-                    "boards: open + save once in KiCad 10), then retry."
+                    "This file predates KiCad 10's variant format. Run the "
+                    "upgrade_project_format tool on this project (it backs up every "
+                    "file, then upgrades the schematic and board in place), then "
+                    "retry. Note: KiCad 9 cannot open upgraded files — the v9 "
+                    "backups in .kicad_mcp_backups/ are your only rollback."
                 ),
             }
     return None
@@ -882,6 +884,23 @@ class VariantWriteSession:
                                    "session — aborted, no files replaced. Re-read "
                                    "and retry.",
                     })
+
+            # RW-S4 §9: refuse while KiCad holds any staged file open — the
+            # replace below bypasses the per-operation write guards.
+            from kicad_mcp.backends.file_backend import (  # local: avoid cycle
+                BoardOpenInKiCadError,
+                _refuse_if_open_in_kicad,
+            )
+            for path in self._staged:
+                try:
+                    _refuse_if_open_in_kicad(path)
+                except BoardOpenInKiCadError as exc:
+                    raise VariantWriteError("file open in KiCad", {
+                        "error": "schematic_open_in_kicad",
+                        "lock_file": str(exc.lock_file),
+                        "lock_holder": exc.lock_holder,
+                        "message": str(exc),
+                    }) from exc
 
             for path in self._staged:
                 os.replace(scratch / "new" / path.name, path)

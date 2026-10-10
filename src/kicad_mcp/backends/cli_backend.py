@@ -46,6 +46,27 @@ def _expected_outputs(output: Path, variant: str | list[str] | None) -> list[Pat
     return [Path(str(output).replace("${VARIANT}", v)) for v in names]
 
 
+def _valid_step_file(path: Path) -> bool:
+    """True iff *path* is a complete STEP file: exists, non-empty, first bytes
+    start with ``ISO-10303-21;`` and the last 64 bytes (right-stripped of ASCII
+    whitespace) end with ``END-ISO-10303-21;``. Both markers are mandated by
+    the ISO-10303-21 standard; the trailer check is what distinguishes a
+    complete write from a truncated one. Any read error → False."""
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(64)
+            if not head.startswith(b"ISO-10303-21;"):
+                return False
+            fh.seek(max(0, size - 64))
+            tail = fh.read(64)
+        return tail.rstrip().endswith(b"END-ISO-10303-21;")
+    except OSError:
+        return False
+
+
 def _variant_calls(
     output: Path, variant: str | list[str] | None,
 ) -> list[tuple[list[str], Path]]:
@@ -259,16 +280,60 @@ class CLIExportOps(ExportOps):
 
 
     def export_step(self, board_path: Path, output_path: Path) -> dict[str, Any]:
-        """Export 3D STEP model via kicad-cli pcb export step."""
+        """Export 3D STEP model via kicad-cli pcb export step.
+
+        F-DV13: kicad-cli exits nonzero when a footprint's only 3D model is a
+        VRML mesh, yet still writes a valid STEP containing everything else.
+        A nonzero exit whose output file was written by THIS run and passes
+        ``_valid_step_file`` is reported as structured partial success
+        (``success: False, partial: True``); any other nonzero exit keeps the
+        legacy bare-failure payload.
+        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Pre-run snapshot (stale-file guard): after a nonzero exit, the file
+        # counts as written by this run only if it did not exist before or its
+        # (st_size, st_mtime_ns) changed — a leftover STEP from an earlier
+        # successful export must not be misreported as this run's partial output.
+        try:
+            pre = output_path.stat()
+            pre_stat: tuple[int, int] | None = (pre.st_size, pre.st_mtime_ns)
+        except OSError:
+            pre_stat = None
         result = self._run(
             ["pcb", "export", "step", "--output", str(output_path), str(board_path)],
             timeout=EXPORT_3D_TIMEOUT,
         )
+        if result.returncode == 0:
+            return {
+                "success": True,
+                "output_file": str(output_path),
+                "message": "STEP exported",
+            }
+        try:
+            post = output_path.stat()
+            post_stat: tuple[int, int] | None = (post.st_size, post.st_mtime_ns)
+        except OSError:
+            post_stat = None
+        if (
+            post_stat is not None
+            and post_stat != pre_stat
+            and _valid_step_file(output_path)
+        ):
+            return {
+                "success": False,
+                "partial": True,
+                "output_file": str(output_path),
+                "file_size_bytes": post_stat[0],
+                "stderr": result.stderr,
+                "message": (
+                    f"STEP exported partially: kicad-cli exited {result.returncode} "
+                    "but wrote a valid STEP file; some 3D models are absent from it."
+                ),
+            }
         return {
-            "success": result.returncode == 0,
-            "output_file": str(output_path) if result.returncode == 0 else None,
-            "message": result.stderr if result.returncode != 0 else "STEP exported",
+            "success": False,
+            "output_file": None,
+            "message": result.stderr,
         }
 
     def export_vrml(self, board_path: Path, output_path: Path) -> dict[str, Any]:
@@ -282,6 +347,38 @@ class CLIExportOps(ExportOps):
             "success": result.returncode == 0,
             "output_file": str(output_path) if result.returncode == 0 else None,
             "message": result.stderr if result.returncode != 0 else "VRML exported",
+        }
+
+    def render_board(
+        self, board_path: Path, output_path: Path, *,
+        side: str = "top", width: int = 1600, height: int = 900,
+        zoom: float | None = None, rotate: str | None = None,
+    ) -> dict[str, Any]:
+        """Render the board to an image via kicad-cli pcb render (KiCad 9+).
+
+        --background is fixed to opaque: the PNG default is transparent,
+        which renders illegibly in dark-themed viewers. A zero exit with
+        stderr noise (e.g. missing board outline) is still a success.
+        """
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            "pcb", "render",
+            "--output", str(output_path),
+            "--side", side,
+            "--width", str(width),
+            "--height", str(height),
+            "--background", "opaque",
+        ]
+        if zoom is not None:
+            args += ["--zoom", str(zoom)]
+        if rotate is not None:
+            args += ["--rotate", rotate]
+        args.append(str(board_path))
+        result = self._run(args, timeout=EXPORT_3D_TIMEOUT)
+        return {
+            "success": result.returncode == 0,
+            "output_file": str(output_path) if result.returncode == 0 else None,
+            "message": result.stderr if result.returncode != 0 else "Board rendered",
         }
 
 
@@ -341,13 +438,21 @@ class CLIDRCOps(DRCOps):
             "violations": [],
             "error_count": 0,
             "warning_count": 0,
+            "unconnected_count": 0,
         }
 
         if output.exists():
             try:
                 report = json.loads(output.read_text(encoding="utf-8"))
                 violations = report.get("violations", [])
-                for v in violations:
+                # F-DV7 (DV build 2026-10-05): kicad-cli reports missing
+                # connections in a SEPARATE top-level "unconnected_items"
+                # array, not under "violations" — ignoring it declared a
+                # completely unrouted board DRC-clean. They are DRC
+                # violations (type "unconnected_items", severity per the
+                # board's rule_severities) and count like any other.
+                unconnected = report.get("unconnected_items", [])
+                for v in violations + unconnected:
                     severity = v.get("severity", "error")
                     if severity == "error":
                         drc_result["error_count"] += 1
@@ -355,10 +460,11 @@ class CLIDRCOps(DRCOps):
                         drc_result["warning_count"] += 1
                     drc_result["violations"].append({
                         "severity": severity,
-                        "type": v.get("type", ""),
+                        "type": v.get("type", "unconnected_items"),
                         "description": v.get("description", ""),
                         "items": v.get("items", []),
                     })
+                drc_result["unconnected_count"] = len(unconnected)
                 drc_result["passed"] = drc_result["error_count"] == 0
             except (json.JSONDecodeError, OSError) as e:
                 logger.error("Failed to parse DRC report: %s", e)
@@ -408,6 +514,30 @@ class CLIDRCOps(DRCOps):
                 logger.error("Failed to parse ERC report: %s", e)
 
         return erc_result
+
+    def generate_netlist(
+        self, schematic_path: Path, output: Path, fmt: str = "kicadsexpr",
+    ) -> dict[str, Any]:
+        """Export a netlist from a schematic via ``kicad-cli sch export netlist``.
+
+        Used as the headless fallback when no live KiCad connection is available
+        but kicad-cli is on PATH (F6). ``fmt`` defaults to ``kicadsexpr`` (valid
+        on KiCad 9 and 10); other formats: kicadxml, spice, orcadpcb2, etc.
+        """
+        output.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            "sch", "export", "netlist",
+            "--output", str(output),
+            "--format", fmt,
+            str(schematic_path),
+        ]
+        result = self._run(args)
+        return {
+            "generated": output.exists(),
+            "output_file": str(output),
+            "format": fmt,
+            "returncode": result.returncode,
+        }
 
 
 class CLIBackend(KiCadBackend):

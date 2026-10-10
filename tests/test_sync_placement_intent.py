@@ -144,8 +144,11 @@ _PCB_NO_OUTLINE = textwrap.dedent("""\
 """)
 
 
-def _make_backend_with_file_ops():
-    """Return a backend whose modify ops are the real FileBoardOps + FileSchematicOps."""
+def _make_backend_with_file_ops(netlist_text: str):
+    """Backend with real File ops + a netlist stub (KIR4 NS: sync v2 consumes
+    KiCad's own netlist; CI has no kicad-cli)."""
+    from tests.netlist_stub import DrcOpsStub
+
     from kicad_mcp.backends.base import BackendProtocol
     from kicad_mcp.backends.file_backend import FileBoardOps, FileSchematicOps
 
@@ -162,27 +165,43 @@ def _make_backend_with_file_ops():
         def get_schematic_modify_ops(self):
             return FileSchematicOps()
 
+        def get_drc_ops(self):
+            return DrcOpsStub(netlist_text)
+
     return _Backend()
 
 
 def _call_sync(sch_path: Path, pcb_path: Path) -> dict:
     """Drive sync_schematic_to_pcb with _load_kicad_mod patched to return a
-    JST PH Horizontal stub. CI doesn't install KiCad's footprint libraries,
-    so without the patch place_component falls back to a stub without silk
-    geometry and identify_edge_facing_connectors can't detect the mating face.
+    JST PH Horizontal stub footprint TEXT (real pads/silk — CI doesn't install
+    KiCad's libraries), the footprint gate resolved against a tmp .pretty dir,
+    and generate_netlist stubbed (KIR4 NS).
     """
     import fastmcp
+    from tests.netlist_stub import render_netlist
+
     from kicad_mcp.tools import schematic
     from kicad_mcp.utils.change_log import ChangeLog
 
-    backend = _make_backend_with_file_ops()
+    netlist_text = render_netlist([{
+        "ref": "J1", "value": "BAT",
+        "footprint": "Connector_JST:JST_PH_S2B-PH-K_1x02_P2.00mm_Horizontal",
+    }])
+    backend = _make_backend_with_file_ops(netlist_text)
     change_log = ChangeLog(pcb_path.parent / "changes.json")
     mcp = fastmcp.FastMCP("test")
     schematic.register_tools(mcp, backend, change_log)
     tool_fn = next(
         t.fn for t in mcp._tool_manager._tools.values() if t.name == "sync_schematic_to_pcb"
     )
+    pretty = pcb_path.parent / "Connector_JST.pretty"
+    pretty.mkdir(exist_ok=True)
+    (pretty / "JST_PH_S2B-PH-K_1x02_P2.00mm_Horizontal.kicad_mod").write_text(
+        JST_PH_HORIZONTAL_MOD, encoding="utf-8")
     with patch(
+        "kicad_mcp.utils.fp_lib_table.get_footprint_library_map",
+        return_value={"Connector_JST": pretty},
+    ), patch(
         "kicad_mcp.backends.file_backend._load_kicad_mod",
         return_value=JST_PH_HORIZONTAL_MOD,
     ):

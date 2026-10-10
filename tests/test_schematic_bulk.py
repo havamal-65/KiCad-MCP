@@ -342,6 +342,34 @@ def test_add_power_symbols_bulk_resumes_from_existing_max(sch_with_existing_pwr:
     assert refs == ["#PWR008", "#PWR009"]
 
 
+def test_add_power_symbols_bulk_snaps_to_grid(sch_with_power_libs: Path):
+    """F9: off-grid power symbols are snapped to the 1.27 mm schematic grid so
+    their pin doesn't produce endpoint_off_grid ERC warnings."""
+    from kicad_mcp.backends.file_backend import _is_on_grid
+    ops = FileSchematicOps()
+    symbols = [
+        {"name": "VCC", "x": 50.3, "y": 50.8},   # both off-grid
+        {"name": "GND", "x": 99.4, "y": 12.1},
+    ]
+    result = ops.add_power_symbols_bulk(sch_with_power_libs, symbols)
+
+    assert result["failed"] == []
+    for placed in result["placed"]:
+        assert _is_on_grid(placed["position"]["x"]), placed
+        assert _is_on_grid(placed["position"]["y"]), placed
+    # A snap actually happened (input 50.3 was off-grid).
+    assert result["placed"][0]["position"]["x"] != 50.3
+
+
+def test_add_power_symbol_snaps_to_grid(sch_with_power_libs: Path):
+    """F9: the single-symbol path snaps too."""
+    from kicad_mcp.backends.file_backend import _is_on_grid
+    ops = FileSchematicOps()
+    result = ops.add_power_symbol(sch_with_power_libs, "VCC", 50.3, 50.75)
+    assert _is_on_grid(result["position"]["x"])
+    assert _is_on_grid(result["position"]["y"])
+
+
 # ---------------------------------------------------------------------------
 # connect_pins_bulk
 # ---------------------------------------------------------------------------

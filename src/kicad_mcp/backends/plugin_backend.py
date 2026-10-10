@@ -335,8 +335,75 @@ class PluginBoardOps(BoardOps):
                           reference=reference, value=value)
         return result
 
+    def set_footprint_metadata(
+        self, path: Path, reference: str,
+        sheet_path: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"reference": reference}
+        if sheet_path is not None:
+            kwargs["sheet_path"] = sheet_path
+        if fields is not None:
+            kwargs["fields"] = fields
+        result: dict[str, Any] = self._call("set_footprint_metadata", path, **kwargs)
+        return result
+
+    def get_reference_texts(self, path: Path) -> dict[str, Any]:
+        # bridge extra: bulk read of every footprint's Reference-field geometry
+        result: dict[str, Any] = self._call("get_reference_texts", path)
+        return result
+
+    def set_reference_text(
+        self, path: Path, reference: str,
+        x: float | None = None, y: float | None = None,
+        dx: float | None = None, dy: float | None = None,
+        visible: bool | None = None,
+    ) -> dict[str, Any]:
+        # bridge extra: move/show/hide a footprint's Reference field
+        kwargs: dict[str, Any] = {"reference": reference}
+        if x is not None:
+            kwargs["x"] = x
+        if y is not None:
+            kwargs["y"] = y
+        if dx is not None:
+            kwargs["dx"] = dx
+        if dy is not None:
+            kwargs["dy"] = dy
+        if visible is not None:
+            kwargs["visible"] = visible
+        result: dict[str, Any] = self._call("set_reference_text", path, **kwargs)
+        return result
+
     def refill_zones(self, path: Path) -> dict[str, Any]:
         result: dict[str, Any] = self._call("refill_zones", path)
+        return result
+
+    def add_zone(
+        self, path: Path, net: str, layer: str,
+        outline: list[dict[str, float]],
+        clearance_mm: float = 0.5,
+        min_thickness_mm: float = 0.25,
+        pad_connection: str = "thermal",
+        thermal_gap_mm: float = 0.5,
+        thermal_spoke_width_mm: float = 0.5,
+        name: str = "",
+        refill: bool = True,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_zone", path, net=net, layer=layer, outline=outline,
+            clearance_mm=clearance_mm, min_thickness_mm=min_thickness_mm,
+            pad_connection=pad_connection, thermal_gap_mm=thermal_gap_mm,
+            thermal_spoke_width_mm=thermal_spoke_width_mm, name=name,
+            refill=refill,
+        )
+        return result
+
+    def delete_zone(
+        self, path: Path, name: str = "", uuid: str = "",
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "delete_zone", path, name=name, uuid=uuid,
+        )
         return result
 
     def save_board(self, path: Path) -> dict[str, Any]:
@@ -491,6 +558,17 @@ class PluginBoardOps(BoardOps):
         result: dict[str, Any] = self._call("import_ses", path, ses_path=str(ses_path))
         return result
 
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_routed_tracks", path, segments=segments, vias=vias
+        )
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Backend
@@ -504,6 +582,7 @@ class PluginBackend(KiCadBackend):
         BackendCapability.BOARD_READ,
         BackendCapability.BOARD_MODIFY,
         BackendCapability.ZONE_REFILL,
+        BackendCapability.ZONE_CREATE,
         BackendCapability.BOARD_STACKUP,
         BackendCapability.BOARD_ROUTE,
     }

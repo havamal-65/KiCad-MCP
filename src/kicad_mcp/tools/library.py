@@ -150,16 +150,26 @@ def register_tools(mcp: FastMCP, backend: BackendProtocol, change_log: ChangeLog
         }, indent=2)
 
     @mcp.tool()
-    def get_symbol_info(lib_id: str) -> str:
+    def get_symbol_info(lib_id: str, project_dir: str = "") -> str:
         """Get detailed information about a specific symbol.
 
         Args:
             lib_id: Symbol identifier in 'Library:Symbol' format (e.g. 'Device:R', 'MCU_Microchip:ATmega328P-AU').
+            project_dir: Optional project directory whose sym-lib-table should
+                be honored (enables ${KIPRJMOD}-relative project libraries).
 
         Returns:
-            JSON with symbol details: description, pins, properties.
+            JSON with symbol details: description, pins, properties, plus
+            unit_count and unit_pins ({"0": [...], "1": [...], ...} — pin
+            numbers grouped by owning unit; unit 0 = pins common to all units
+            of a multi-unit symbol). unit_count > 1 means placing the full
+            component takes one add_component call per unit, same reference.
         """
-        ops = backend.get_library_ops()
+        if project_dir:
+            from kicad_mcp.backends.file_backend import FileLibraryOps
+            ops: LibraryOps = FileLibraryOps(project_dir=project_dir)
+        else:
+            ops = backend.get_library_ops()
         result = ops.get_symbol_info(lib_id)
         change_log.record("get_symbol_info", {"lib_id": lib_id})
         return json.dumps({"status": "success", **result}, indent=2)

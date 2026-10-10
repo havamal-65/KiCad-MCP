@@ -213,6 +213,52 @@ def test_name_match_no_pads_is_indeterminate(tmp_path: Path):
     assert result["indeterminate"][0]["ref"] == "J1"
 
 
+def test_axial_resistors_produce_no_indeterminate(tmp_path: Path):
+    """SW-2: four ecc83-geometry axial resistors produce zero indeterminate
+    noise — only the one determinate JST is checked. Payload keys unchanged."""
+    lines = [
+        "(kicad_pcb",
+        "  (version 20231231)",
+        '  (generator "pcbnew")',
+        '  (net 0 "")',
+        '  (gr_rect (start 0 0) (end 80 70) (stroke (width 0.05)) '
+        '(layer "Edge.Cuts"))',
+    ]
+    # Pads (0,0)/(7.62,0) → centroid (3.81, 0); courtyard -1.05..8.67 ×
+    # -1.5..1.5 → center (3.81, 0) — coincident, the pre-SW-2 noise case.
+    for idx, (ax, ay) in enumerate([(10, 10), (10, 20), (10, 30), (10, 40)], start=1):
+        lines += [
+            f'  (footprint "Footprints:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" '
+            f'(layer "F.Cu") (at {ax} {ay})',
+            f'    (property "Reference" "R{idx}" (at 0 0 0) (layer "F.Fab"))',
+            '    (fp_rect (start -1.05 -1.5) (end 8.67 1.5) (layer "F.CrtYd") '
+            '(stroke (width 0.05)))',
+            '    (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) '
+            '(layers "*.Cu" "*.Mask"))',
+            '    (pad "2" thru_hole circle (at 7.62 0) (size 1.6 1.6) (drill 0.8) '
+            '(layers "*.Cu" "*.Mask"))',
+            "  )",
+        ]
+    # One determinate JST at the south edge, facing outward.
+    lines += [
+        '  (footprint "Connector_JST:JST_PH_S2B-PH-K_1x02_P2.00mm_Horizontal" '
+        '(layer "F.Cu") (at 40.0 67.0)',
+        '    (property "Reference" "J1" (at 0 0 0) (layer "F.Fab"))',
+        '    (fp_text user "PCB edge" (at 0.0 3.65 0) (layer "Dwgs.User"))',
+        "  )",
+        ")",
+    ]
+    board = _write(tmp_path, "axial_noise.kicad_pcb", "\n".join(lines) + "\n")
+    result = _call_tool(board)
+    assert result["passed"] is True
+    assert result["checked"] == 1
+    assert result["violations"] == []
+    assert result["indeterminate"] == []
+    assert set(result.keys()) == {
+        "status", "passed", "checked", "violations", "indeterminate",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sidecar cache: result is written and survives subsequent reads
 # ---------------------------------------------------------------------------

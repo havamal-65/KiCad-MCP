@@ -8,16 +8,17 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **110 MCP Tools** across 10 categories:
-  - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project (IPC-first, with bridge fallback), PCB workflow reference, plan capture and retrieval, **7-item startup gate checklist**
-  - 📐 **Schematic Operations** (28 tools): Create schematics from scratch, place/remove/move components, wire routing, labels (add/remove/edit label text), no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, pin position queries (with `extends` resolution **and audited rotation/mirror math against eeschema**), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
-  - 🔌 **PCB Board Operations** (17 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, refill copper zones, query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), **board-size verification gate**, full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
+- **121 MCP Tools** across 11 categories:
+  - 📋 **Project Management** (15 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project (IPC-first, with bridge fallback), PCB workflow reference, plan capture and retrieval, **KiCad 9→10 project format upgrade** (kicad-cli-driven, backed up, one-way), **8-item startup gate checklist**
+  - 📐 **Schematic Operations** (29 tools): Create schematics from scratch, place/remove/move components, wire routing, labels (add/remove/edit label text), no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, **symbol attribute authoring and editing** (`in_bom` / `on_board` / `dnp` / `exclude_from_sim`), pin position queries (with `extends` resolution **and audited rotation/mirror math against eeschema**), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
+  - 🔌 **PCB Board Operations** (21 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, **author/list/delete copper pour zones** plus refill, **silkscreen refdes tidying** (relocate-first, hide-fallback), query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), **board-size verification gate**, full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
   - 📦 **Library Management** (9 tools): Clone repos, register sources, import symbols/footprints, create project libraries
   - ✅ **Design Rule Checks** (13 tools): Run DRC and ERC validations, file-based schematic and board validation (no kicad-cli), kicad-cli strict schematic validation, query board design rules, **symbol/footprint pad-match validator**, **pre-sync schematic completeness check**, **fast courtyard overlap check**, **placement-quality gate** (keep-out intrusion + net-aware metric), **detect edge-facing connectors** (USB-C, JST, audio jacks, etc.), **validate connector orientations** with autoroute hash-gate that refuses to route over inward-facing connectors
-  - 📤 **Export Operations** (8 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models**, **verify 3D model references resolve on disk**
+  - 📤 **Export Operations** (9 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models** (STEP with a three-way success / partial / error verdict), **verify 3D model references resolve on disk**, **render a board or schematic to an image for visual self-inspection**
   - 🏭 **Manufacturing** (1 tool): One-call **manufacturing-readiness audit** — DRC + board-size + courtyard + 3D-model + all five fab artifacts with a structured ship/no-ship verdict
-  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clean board for routing**, **clear all routes for re-placement**
+  - 🎛️ **Design Variants** (4 tools, KiCad 10+): Create/delete variants, set per-component overrides (DNP, BOM/position exclusion, field values — schematic and board sides in one call), list variants with cross-file consistency checks; all writes kicad-cli-validated and atomic, structured refusal on KiCad 9
+  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing — **TraceMaker preferred when its WSL runtime is detected, with automatic FreeRouting fallback** (both optional; `router` parameter forces either engine), **clean board for routing**, **clear all routes for re-placement**
   - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
 
 - **Plugin Backend Architecture**: `PluginDirectBackend` routes each operation to the right subsystem — no fallback ambiguity:
@@ -61,10 +62,19 @@ Activate the venv first, then install the extras inside it:
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-For auto-routing functionality (requires Java and FreeRouting):
-- Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
-- Ensure Java Runtime Environment (JRE) is installed
-- Set `KICAD_MCP_FREEROUTING_JAR` and `KICAD_MCP_JAVA_PATH` environment variables (or let the tool auto-detect)
+For auto-routing functionality, install at least one routing engine (the `autoroute`
+tool prefers TraceMaker when it is available and falls back to FreeRouting
+automatically — see [Auto-Routing](#auto-routing-6-tools---optional)):
+
+- **TraceMaker** (Windows, via WSL2): build [TraceMaker](https://github.com/DingoOz/TraceMaker)
+  inside a WSL2 distro. By default the tool looks for distro `tracemaker-build` and
+  binary `~/TraceMaker/build/cpu-only/src/app/tracemaker`; override with
+  `KICAD_MCP_TRACEMAKER_DISTRO` and `KICAD_MCP_TRACEMAKER_BIN`. Set
+  `KICAD_MCP_NO_TRACEMAKER=1` to disable detection entirely.
+- **FreeRouting** (all platforms, requires Java):
+  - Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
+  - Ensure Java Runtime Environment (JRE) is installed
+  - Set `KICAD_MCP_FREEROUTING_JAR` and `KICAD_MCP_JAVA_PATH` environment variables (or let the tool auto-detect)
 
 For development:
 ```bash
@@ -332,7 +342,7 @@ python -m kicad_mcp_plugin
 
 ## Available Tools
 
-### Project Management (14 tools)
+### Project Management (15 tools)
 - `open_kicad`: Launch KiCad and wait for the bridge to become ready
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
@@ -346,12 +356,13 @@ python -m kicad_mcp_plugin
 - `get_pcb_workflow`: Return a structured 11-step PCB design workflow reference (JSON) showing the recommended tool sequence from project creation through DRC
 - `plan_project`: Record a structured project plan into a `project_plan.json` file. When `board_width_mm`/`board_height_mm` are 0 (default) and footprint IDs are included in `key_components`, auto-estimates board dimensions from courtyard bounds. Emits a `size_warning` when provided dimensions are more than 15% smaller than the estimate.
 - `read_project_plan`: Read back the saved project plan for a given project directory
-- `get_startup_checklist`: Run a seven-item PASS/FAIL gate before any board operation: KiCad running (counts pcbnew/eeschema too) · IPC API server reachable · bridge reachable · bridge version · PCB editor open (board-ready aware — distinguishes "still loading" from "no board") · kicad-cli on PATH · active project loaded. A down bridge is a non-blocking WARN whenever the IPC path already serves the open board (and vice-versa). Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
+- `upgrade_project_format`: Upgrade a project's schematic and board files from KiCad-9 to KiCad-10 format via KiCad's own `kicad-cli sch/pcb upgrade`, backing up every changed file first. One-way (KiCad 9 cannot re-open v10 files; the `.kicad_mcp_backups/` copies are the rollback); refuses without touching any file if no KiCad-10 kicad-cli is available. Needed before the Design Variants tools on a v9-format project
+- `get_startup_checklist`: Run an eight-item PASS/WARN/FAIL gate before any board operation: KiCad running (counts pcbnew/eeschema too) · IPC API server reachable · bridge reachable · bridge version · PCB editor open (board-ready aware — distinguishes "still loading" from "no board") · live board ↔ file coherence (WARNs with a reload advisory when the open board's component set or Edge.Cuts outline diverges from the file on disk) · kicad-cli on PATH · active project loaded. A down bridge is a non-blocking WARN whenever the IPC path already serves the open board (and vice-versa). Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
 
-### Schematic Operations (28 tools)
-- `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions)
+### Schematic Operations (29 tools)
+- `read_schematic`: Read complete schematic structure (symbols, wires, labels, no-connects, junctions). Every symbol row carries the four attribute flags (`in_bom`, `on_board`, `dnp`, `exclude_from_sim`)
 - `create_schematic`: Create a new, empty KiCad 8+ schematic file with proper structure
-- `add_component`: Place symbols with rotation, mirror, footprint, custom properties, and KiCad 8+ instance data
+- `add_component`: Place symbols with rotation, mirror, footprint, custom properties, KiCad 8+ instance data, and optional symbol attribute flags (`in_bom`, `on_board`, `dnp`, `exclude_from_sim` — e.g. keep a mounting hole out of the BOM at placement time)
 - `add_components`: **Bulk** — place N components in one call (single file read/write). Prefer over looping `add_component`.
 - `add_wire`: Draw wire connections between two points
 - `add_label`: Add net labels (net, global, hierarchical)
@@ -369,6 +380,7 @@ python -m kicad_mcp_plugin
 - `move_schematic_component`: Move a component to a new position with optional rotation (shifts property labels too)
 - `move_components`: **Bulk** — reposition N components in one call (single file read/write).
 - `update_component_property`: Update or add a property (Value, Footprint, MPN, etc.) on a placed component
+- `set_symbol_attributes`: Edit the four attribute flags (`in_bom`, `on_board`, `dnp`, `exclude_from_sim`) on an already-placed symbol — only the flags you pass change; multi-unit symbols are updated across every unit and the per-unit results reported
 - `get_symbol_pin_positions`: Get absolute schematic coordinates for each pin of a placed symbol; resolves `extends` chains so symbols like ATtiny85-20S and AMS1117-3.3 work correctly, and applies KiCad's rotation/mirror transform (audited against eeschema's own placement so rotated/mirrored symbols resolve correctly)
 - `get_pin_net`: Get the net name connected to a specific pin of a symbol
 - `get_net_connections`: Get all connections (pins, labels, wires) on a named net
@@ -378,7 +390,7 @@ python -m kicad_mcp_plugin
 - `annotate_schematic`: Auto-annotate component reference designators
 - `generate_netlist`: Generate netlist from schematic
 
-### PCB Board Operations (17 tools)
+### PCB Board Operations (21 tools)
 - `read_board`: Read complete board structure
 - `get_board_info`: Get board metadata (title, revision, layers, counts)
 - `place_component`: Place a component footprint on the board
@@ -390,6 +402,10 @@ python -m kicad_mcp_plugin
 - `assign_net`: Assign a net to a component pad
 - `get_design_rules`: Get the board's design rules (clearances, track widths, via sizes)
 - `refill_zones`: Refill all copper pour zones on a board
+- `add_zone`: Add a copper pour zone (e.g. a GND plane) from an explicit polygon or, with `follow_board_outline`, a rectangle derived from the Edge.Cuts bounding box inset by a margin. The zone is filled via a kicad-cli subprocess so the saved file carries real fill geometry
+- `list_zones`: List every zone on a board, including rule (keep-out) areas — reads the saved `.kicad_pcb` directly so the answer is always file truth
+- `delete_zone`: Delete one copper zone by name or uuid (rule areas are refused — use the keep-out tools for those)
+- `tidy_silkscreen`: Reduce silkscreen DRC warnings by tidying reference-designator text — relocate each clipped/overlapping refdes to the nearest clear spot first, hide only small passives with nowhere clear to go (IC and connector refs are never hidden), then re-run DRC and report the delta
 - `get_stackup`: Get the layer stackup definition for a board
 - `verify_board_size`: Gate that asserts the chosen board size accommodates the placed parts plus manufacturing tolerances (panelization keepout, mounting holes, fiducials, routing channels). Returns `{passed, total_required_mm2, available_mm2, shortfall_breakdown, suggested_min_dimensions}` and is a precondition on `auto_place`.
 - `set_board_design_rules`: Write manufacturing-enforceable design rules into the `.kicad_pro` `net_settings.classes` Default entry. Preset `"class2"` applies IPC-2221 Class 2 / IPC-7351 Level B values (0.20 mm clearance, 0.25 mm trace, 0.30 mm via drill). Preset `"fab_jlcpcb"` applies JLCPCB 2-layer standard rules.
@@ -430,34 +446,43 @@ python -m kicad_mcp_plugin
 - `get_board_design_rules`: Get the design rules configured for a board
 - `validate_schematic_for_pcb`: Pre-sync completeness check (no kicad-cli required). Verifies every component has a Footprint, references are unique, PWR_FLAG symbols cover power nets, no component sits at (0, 0), net count is non-zero, and optionally runs full ERC if kicad-cli is available. Returns `ready_for_pcb_sync` bool and a `blocking_issues` list. **Must pass before calling `sync_schematic_to_pcb`.**
 - `check_courtyard_overlaps`: Fast file-based courtyard AABB intersection check (milliseconds, no kicad-cli). Returns `passed` bool and a list of overlapping component pairs with `overlap_x_mm`, `overlap_y_mm`, and `suggested_move_mm`. **Must pass before calling `autoroute`.**
-- `identify_edge_facing_connectors`: Detect connectors that need outward-facing placement at a board edge (USB-C, JST PH/XH, audio jacks, barrel jacks, RJ45, HDMI, etc.). Uses three signals, highest confidence first: KiCad library's `Dwgs.User` "PCB edge" marker, F.SilkS centroid asymmetry, and footprint-name heuristics. Returns each ref's `mating_face` in footprint-local frame plus `confidence` and `evidence`. Use this as Phase 4a's survey step in `/build-pcb`.
+- `identify_edge_facing_connectors`: Detect connectors that need outward-facing placement at a board edge (USB-C, JST PH/XH, audio jacks, barrel jacks, RJ45, HDMI, etc.). Uses three signals, highest confidence first: KiCad library's `Dwgs.User` "PCB edge" marker, F.SilkS centroid asymmetry, and footprint-name heuristics. Returns each ref's `mating_face` in footprint-local frame plus `confidence` and `evidence`. A name match whose only token hit is the generic orientation word "Horizontal" is kept only when the refdes class is a connector class (J/P/X/XP/XS/CON) — axial passives are silently skipped. Use this as Phase 4a's survey step in `/build-pcb`.
 - `validate_connector_orientations`: Placement-quality gate for edge-facing connectors. For each ref from `identify_edge_facing_connectors`, applies the placed rotation to the mating-face vector, checks it points toward the closest board edge within ±30°, and accepts any of multiple equidistant edges within 2 mm (corner-placement tolerance). Returns `passed` bool, `violations` (with `suggested_edge` and `suggested_rotation`), and `indeterminate` (refs needing manual review). **Side effect**: writes the result to `<board>.validation_cache.json` so `autoroute` can refuse to run when this most-recent check is missing or failed for the current board hash. **Must pass before calling `autoroute`.**
 
-### Export Operations (8 tools)
+### Export Operations (9 tools)
 - `export_gerbers`: Export Gerber manufacturing files from a PCB board
 - `export_drill`: Export drill files (Excellon format)
 - `export_bom`: Export Bill of Materials (CSV, JSON, etc.)
 - `export_pick_and_place`: Export pick-and-place component placement file
 - `export_pdf`: Export a board or schematic to PDF. Verifies kicad-cli is on PATH before attempting export and confirms the output file was actually created. On failure, surfaces the exact kicad-cli command attempted and stderr so you can diagnose the root cause.
-- `export_step`: Export a 3D STEP model from a PCB board for mechanical integration. Requires kicad-cli.
+- `export_step`: Export a 3D STEP model from a PCB board for mechanical integration. Requires kicad-cli. Status is three-way: `success` (clean export), `partial` (kicad-cli exited nonzero but wrote a structurally valid STEP this run — e.g. VRML-only 3D models it cannot convert; the payload lists the excluded models and a remedy), or `error` (no usable file). A bare nonzero exit is never misreported as success.
+- `render_view`: Render a board or schematic to an image for visual inspection — boards to PNG via `kicad-cli pcb render` (3D view, top side by default), schematics to PDF. Built so an AI agent can actually look at what it built; board renders save the live board state to disk first so the image matches reality.
 - `export_vrml`: Export a 3D VRML model from a PCB board for 3D rendering and simulation tools. Requires kicad-cli.
 - `verify_3d_models`: Walk every footprint's `(model …)` clause, expand KiCad path variables (`${KICAD9_3DMODEL_DIR}`, etc.), and check each referenced 3D model resolves on disk (with a `.wrl`↔`.step` sibling fallback) before `export_step` fails at render time. Distinguishes `file_not_found` from `unresolved_variable`.
 
 ### Manufacturing (1 tool)
-- `manufacturing_readiness_audit`: One call returns a structured ship/no-ship verdict covering DRC, board-size verification, courtyard overlaps, 3D-model resolution, and all five fab artifacts (Gerbers, drill, BOM, pick-and-place, STEP). Returns `{ready_to_ship, checks: [{name, passed, detail, artifact_path}], blocking_issues}`. `/build-pcb` Phase 7 uses this instead of running each export individually.
+- `manufacturing_readiness_audit`: One call returns a structured ship/no-ship verdict covering DRC, board-size verification, courtyard overlaps, 3D-model resolution, and all five fab artifacts (Gerbers, drill, BOM, pick-and-place, STEP). Returns `{ready_to_ship, checks: [{name, passed, detail, artifact_path}], blocking_issues}`. A partial STEP export (valid file despite excluded 3D models) surfaces as a non-blocking `partial_step` advisory naming the excluded models — the audit can still be `ready_to_ship`. Projects with design variants (KiCad 10+) run the audit once per shipping variant via `variant="<name>"` — artifacts land under `<output_dir>/<variant>/`. `/build-pcb` Phase 7 uses this instead of running each export individually.
+
+### Design Variants (4 tools, KiCad 10+)
+Author design variants (e.g. a "no-debug-header" assembly) at design stage; every write is validated with kicad-cli before the originals are replaced (a failed validation leaves every file byte-identical), and the tools refuse with a structured payload on KiCad 9.
+
+- `create_variant`: Register a variant in the `.kicad_pro` and (when a board exists) the `.kicad_pcb` board registry — both sides in one operation
+- `set_variant_overrides`: Set per-variant overrides on one component, schematic symbol AND board footprint in one call (DNP, BOM/position-file exclusion, field values; positive logic — `in_bom=False` means excluded) so variant BOM/pos/gerber exports stay coherent
+- `list_variants`: Read-only merge of all three files (project registry, schematic overrides, board overrides) with cross-file inconsistency flags — works on any KiCad version
+- `delete_variant`: Remove a variant fully — registry entries and every per-component override block on both sides, no orphan tokens
 
 ### Auto-Routing (6 tools) - Optional
-**Requires:** [FreeRouting](https://github.com/freerouting/freerouting) and Java
+**Requires:** at least one routing engine — [TraceMaker](https://github.com/DingoOz/TraceMaker) (Windows, running inside WSL2) and/or [FreeRouting](https://github.com/freerouting/freerouting) with Java
 
 These tools provide automated PCB trace routing capabilities:
 - `export_dsn`: Export PCB to Specctra DSN format for FreeRouting
 - `import_ses`: Import routed SES session file back into PCB
 - `run_freerouter`: Execute FreeRouting auto-router on a DSN file
 - `clean_board_for_routing`: Remove keepouts and problematic tracks before routing
-- `autoroute`: Complete pipeline (clean → export → route → import)
+- `autoroute`: Complete routing pipeline with engine selection via the `router` parameter (`"auto"` default / `"tracemaker"` / `"freerouting"`). In `auto` mode the tool prefers TraceMaker when its WSL runtime is detected (routes the `.kicad_pcb` directly, imports the new tracks through the live bridge when one is up), and **any TraceMaker failure falls back to the full FreeRouting pipeline (clean → DSN export → route → SES import) in the same call**. TraceMaker detection honors `KICAD_MCP_TRACEMAKER_DISTRO` / `KICAD_MCP_TRACEMAKER_BIN` and the `KICAD_MCP_NO_TRACEMAKER=1` kill-switch. Run post-route DRC as the completion oracle
 - `clear_routes`: Remove all routed tracks and vias from a board, preserving footprint placement, nets, and the board outline. When the plugin bridge is active, mutates pcbnew's live in-memory board so the file and bridge cache stay in sync — subsequent `autoroute` calls see the cleared state and tracks do not compound across iterations. Falls back to direct file editing when the bridge is unreachable. Writes a `.clear_routes_backup.kicad_pcb` file before modifying.
 
-> **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without FreeRouting or Java.
+> **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without TraceMaker, FreeRouting, or Java.
 
 ### Parts Catalog (6 tools)
 These tools index and search third-party KiCad library sources (GitHub releases, local directories) and install parts by MPN into project libraries. They extend the built-in Library Management tools with a content-addressed parts index.
@@ -610,11 +635,11 @@ The skill enforces the seven-phase workflow described above (Environment & Requi
 
 ## Troubleshooting
 
-### Does KiCad-MCP require FreeRouting?
+### Does KiCad-MCP require FreeRouting or TraceMaker?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 104 tools work without FreeRouting or Java.
+**No.** Routing engines are completely optional and only needed if you want to use the 6 auto-routing tools. All other 115 tools work without TraceMaker, FreeRouting, or Java.
 
-If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
+When you do route, `autoroute` prefers TraceMaker if its WSL runtime is detected and falls back to FreeRouting automatically; either engine alone is enough. If neither is installed, you'll get a helpful error message with setup instructions.
 
 ### Plugin Backend Setup
 
@@ -670,7 +695,20 @@ Use `get_backend_info` MCP tool to see the routing status. Common fixes:
 
 ### Auto-Routing Not Working
 
-Auto-routing requires both Java and FreeRouting:
+Auto-routing needs at least one working engine.
+
+**TraceMaker (preferred in `router="auto"` when detected; Windows + WSL2):**
+
+1. Build [TraceMaker](https://github.com/DingoOz/TraceMaker) inside a WSL2 distro
+2. Detection expects distro `tracemaker-build` with the binary at
+   `~/TraceMaker/build/cpu-only/src/app/tracemaker`; override with
+   `KICAD_MCP_TRACEMAKER_DISTRO` / `KICAD_MCP_TRACEMAKER_BIN`
+3. Verify with `wsl -d <distro> -- <binary> version` — the `version` subcommand, not `--version`
+4. `KICAD_MCP_NO_TRACEMAKER=1` disables TraceMaker entirely (auto mode then goes straight to FreeRouting)
+
+Any TraceMaker failure in `auto` mode is recorded in the tool report and the same call retries with FreeRouting — so a missing or broken TraceMaker never blocks routing as long as FreeRouting is set up.
+
+**FreeRouting (fallback engine; all platforms, requires Java):**
 
 1. Install Java Runtime Environment (JRE)
 2. Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)

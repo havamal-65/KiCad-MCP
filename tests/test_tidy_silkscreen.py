@@ -235,7 +235,7 @@ def test_bridge_set_reference_text_is_mutating(bridge):
 
 
 def test_bridge_version_bumped(bridge):
-    assert bridge._BRIDGE_VERSION == "2.7.0-zones"
+    assert bridge._BRIDGE_VERSION == "2.8.0-tracemaker"
 
 
 # ── tool integration ──────────────────────────────────────────────────────────

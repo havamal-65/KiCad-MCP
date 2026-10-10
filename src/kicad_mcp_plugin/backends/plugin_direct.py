@@ -298,6 +298,15 @@ class _LiveBoardOps(BoardOps):
         result: dict[str, Any] = self._call("import_ses", path, ses_path)
         return result
 
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call("add_routed_tracks", path, segments, vias)
+        return result
+
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
         result: dict[str, Any] = self._call("clear_routes", path, backup)
         return result
@@ -548,6 +557,23 @@ class PluginDirectBackend(BackendProtocol):
         """Import FreeRouting SES into live in-memory board via bridge. Always executes."""
         try:
             return self._board_ops.import_ses(path, ses_path)
+        except BridgeTemporarilyUnavailableError:
+            self._on_bridge_disconnect()
+            raise
+
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed tracks to the live in-memory board via bridge.
+
+        TraceMaker seam — always executes on the bridge (atomic batch; a failed
+        batch never modifies the board file).
+        """
+        try:
+            return self._board_ops.add_routed_tracks(path, segments, vias)
         except BridgeTemporarilyUnavailableError:
             self._on_bridge_disconnect()
             raise

@@ -620,7 +620,7 @@ def test_bridge_registers_zone_handlers(bridge) -> None:
     assert "delete_zone" in bridge._DISPATCH
     assert "add_zone" in bridge._MUTATING_METHODS
     assert "delete_zone" in bridge._MUTATING_METHODS
-    assert bridge._BRIDGE_VERSION == "2.7.0-zones"
+    assert bridge._BRIDGE_VERSION == "2.8.0-tracemaker"
 
 
 def test_bridge_refill_zoneless_no_save(bridge, monkeypatch) -> None:

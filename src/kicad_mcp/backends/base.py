@@ -205,6 +205,20 @@ class BoardOps(ABC):
         """Import Specctra SES routing into live in-memory board."""
         raise NotImplementedError("This backend does not support import_ses")
 
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed segments/vias to the live in-memory board.
+
+        TraceMaker seam: the router worked on a temp copy, so the new copper
+        is re-applied here as an atomic batch (mm floats, layer names, net
+        NAMES). A failed batch never modifies the board file.
+        """
+        raise NotImplementedError("This backend does not support add_routed_tracks")
+
     def clear_routes(self, path: Path, backup: bool = True) -> dict[str, Any]:
         """Remove all routed tracks and vias from the board file."""
         raise NotImplementedError("This backend does not support clear_routes")
@@ -724,6 +738,19 @@ class BackendProtocol:
         otherwise subprocess pcbnew). Raises on failure.
         """
         raise NotImplementedError("This backend does not support SES import")
+
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Add externally routed segments/vias (TraceMaker seam).
+
+        Routes to the live BOARD_ROUTE backend (plugin bridge). Raises on
+        failure; a failed batch never modifies the board file.
+        """
+        raise NotImplementedError("This backend does not support add_routed_tracks")
 
     def reload_board(self, path: Path) -> bool:
         """Reload pcbnew in-memory board from disk after an external write.

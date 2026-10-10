@@ -53,7 +53,10 @@ _tcp_server: socketserver.TCPServer | None = None
 # 2.1.0-s5: structured stale_board error responses + disk-coherence pre-check.
 # 2.1.1-s5: reload_board keeps the baseline stale when board.Load() fails, so a
 #           failed in-place reload can never let a mutation clobber newer disk.
-_BRIDGE_VERSION = "2.7.0-zones"
+# 2.8.0-tracemaker: add_routed_tracks — atomic batch import of externally
+#           routed segments/vias (TraceMaker seam); all-or-nothing, no save on
+#           failure.
+_BRIDGE_VERSION = "2.8.0-tracemaker"
 
 
 # ---------------------------------------------------------------------------
@@ -1647,6 +1650,121 @@ def _handle_import_ses(path: str, ses_path: str) -> dict[str, Any]:
     return _run_on_main_thread(_do)
 
 
+def _handle_add_routed_tracks(path: str, segments: list, vias: list) -> dict[str, Any]:
+    """Add a batch of externally routed segments and through vias atomically.
+
+    TraceMaker seam (spec: tracemaker-default-routing Stage 1): the router
+    operated on a temp COPY of the board, so the new copper must be re-applied
+    to the LIVE in-memory board here (KiCad 9 cannot reload a board in place).
+
+    Payload shapes (mm floats, layer NAMES, net NAMES — never numeric codes):
+      segments: [{"start_x","start_y","end_x","end_y","width","layer","net"}]
+      vias:     [{"x","y","size","drill","net","layers":[front,back]}]
+
+    All-or-nothing: every item is constructed and added first; if ANY item
+    fails (unresolvable layer, or a non-empty net name the board does not
+    have), every already-added item is removed again with ``RemoveNative``
+    (never ``Remove()`` — #14A SWIG ownership landmine) and a structured error
+    naming all offenders is returned WITHOUT saving. Same safety contract as
+    import_ses: a failed import never modifies the board file.
+    """
+    def _do():
+        import pcbnew
+        board = _get_open_board(path)
+        # Capture before mutation (#14A) — in-place mutations can detach the
+        # board's filename mid-handler.
+        filename = board.GetFileName()
+
+        added: list = []        # items already board.Add()ed, for rollback
+        offenders: list = []    # human-readable per-item failure descriptions
+
+        def _resolve_net(net_name: str, what: str):
+            """Board NETINFO_ITEM for *net_name*, or record an offender."""
+            if not net_name:
+                return None  # unnetted copper is legal — leave net unset
+            netinfo = board.FindNet(net_name)
+            if netinfo is None:
+                offenders.append(f"{what}: net {net_name!r} not found on board")
+            return netinfo
+
+        def _resolve_layer(layer_name: str, what: str):
+            try:
+                return _layer_id(board, layer_name)
+            except Exception as exc:
+                offenders.append(f"{what}: {exc}")
+                return None
+
+        def _rollback() -> None:
+            # Roll back every item added before the failure was noticed — the
+            # board must be exactly as it was, and nothing is saved.
+            for item in added:
+                board.RemoveNative(item)  # not Remove() — see remove_component (#14A)
+
+        tracks_added = 0
+        vias_added = 0
+        try:
+            for i, seg in enumerate(segments):
+                what = f"segment[{i}]"
+                lid = _resolve_layer(seg["layer"], what)
+                netinfo = _resolve_net(seg.get("net", ""), what)
+                if offenders:
+                    continue  # keep scanning so the error lists ALL offenders
+                track = pcbnew.PCB_TRACK(board)
+                track.SetStart(pcbnew.VECTOR2I(_mm(seg["start_x"]), _mm(seg["start_y"])))
+                track.SetEnd(pcbnew.VECTOR2I(_mm(seg["end_x"]), _mm(seg["end_y"])))
+                track.SetWidth(_mm(seg["width"]))
+                track.SetLayer(lid)
+                if netinfo is not None:
+                    track.SetNet(netinfo)
+                board.Add(track)
+                added.append(track)
+                tracks_added += 1
+
+            for i, via_data in enumerate(vias):
+                what = f"via[{i}]"
+                layers = via_data.get("layers", ["F.Cu", "B.Cu"])
+                if not isinstance(layers, (list, tuple)) or len(layers) != 2:
+                    # Structured offender, not an IndexError: the whole batch
+                    # must report ALL bad items in one refusal.
+                    offenders.append(
+                        f"{what}: layers must be [front, back], got {layers!r}"
+                    )
+                    continue
+                front_id = _resolve_layer(layers[0], what)
+                back_id = _resolve_layer(layers[1], what)
+                netinfo = _resolve_net(via_data.get("net", ""), what)
+                if offenders:
+                    continue
+                via = pcbnew.PCB_VIA(board)
+                via.SetPosition(pcbnew.VECTOR2I(_mm(via_data["x"]), _mm(via_data["y"])))
+                via.SetWidth(_mm(via_data["size"]))
+                via.SetDrill(_mm(via_data["drill"]))
+                via.SetViaType(pcbnew.VIATYPE_THROUGH)  # through vias only (Stage 1)
+                via.SetLayerPair(front_id, back_id)
+                if netinfo is not None:
+                    via.SetNet(netinfo)
+                board.Add(via)
+                added.append(via)
+                vias_added += 1
+        except Exception:
+            # Unexpected mid-batch failure (e.g. malformed payload dict): the
+            # live board must not keep a partial batch either — it would be
+            # silently persisted by the NEXT save of anything.
+            _rollback()
+            raise
+
+        if offenders:
+            _rollback()
+            raise ValueError(
+                "add_routed_tracks failed — no items were kept and the board "
+                "file was not modified: " + "; ".join(offenders)
+            )
+
+        _save_and_refresh(board, filename)
+        return {"status": "ok", "tracks_added": tracks_added, "vias_added": vias_added}
+    return _run_on_main_thread(_do)
+
+
 def _handle_reload_board(path: str) -> dict[str, Any]:
     """Reload the board from disk into pcbnew, then refresh the GUI.
 
@@ -1762,6 +1880,9 @@ _DISPATCH = {
     ),
     "export_dsn":         lambda req: _handle_export_dsn(req["path"], req["dsn_path"]),
     "import_ses":         lambda req: _handle_import_ses(req["path"], req["ses_path"]),
+    "add_routed_tracks":  lambda req: _handle_add_routed_tracks(
+        req["path"], req.get("segments", []), req.get("vias", []),
+    ),
 }
 
 
@@ -1776,7 +1897,8 @@ _MUTATING_METHODS = frozenset({
     "set_footprint_value", "set_footprint_metadata", "refill_zones",
     "add_zone", "delete_zone",
     "save_board", "clear_routes",
-    "add_board_outline", "auto_place", "import_ses", "set_reference_text",
+    "add_board_outline", "auto_place", "import_ses", "add_routed_tracks",
+    "set_reference_text",
 })
 
 

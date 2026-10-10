@@ -558,6 +558,17 @@ class PluginBoardOps(BoardOps):
         result: dict[str, Any] = self._call("import_ses", path, ses_path=str(ses_path))
         return result
 
+    def add_routed_tracks(
+        self,
+        path: Path,
+        segments: list[dict[str, Any]],
+        vias: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = self._call(
+            "add_routed_tracks", path, segments=segments, vias=vias
+        )
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Backend

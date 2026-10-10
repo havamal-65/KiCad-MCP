@@ -253,7 +253,7 @@ def test_bridge_dispatch_has_set_footprint_metadata_and_mutating():
     spec.loader.exec_module(bridge)
     assert "set_footprint_metadata" in bridge._DISPATCH
     assert "set_footprint_metadata" in bridge._MUTATING_METHODS
-    assert bridge._BRIDGE_VERSION == "2.7.0-zones"
+    assert bridge._BRIDGE_VERSION == "2.8.0-tracemaker"
 
 
 # ---------------------------------------------------------------------------

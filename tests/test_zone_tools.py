@@ -534,8 +534,10 @@ def _k9_board(tmp_path: Path) -> Path:
 def test_fill_zones_subprocess_warns_on_format_upgrade(tmp_path: Path) -> None:
     proc = MagicMock(returncode=0,
                      stdout='{"zones_filled": 1, "filled": true}\n', stderr="")
+    # Forward slashes: a backslash literal is a single path component on
+    # POSIX, so _interpreter_major would find no version segment on Linux CI.
     with patch.object(zfs, "find_bundled_python",
-                      return_value=Path(r"C:\kc\10.0\bin\python.exe")), \
+                      return_value=Path("C:/kc/10.0/bin/python.exe")), \
          patch("subprocess.run", return_value=proc):
         result = zfs.fill_zones_subprocess(_k9_board(tmp_path))
     assert result["filled"] is True
@@ -546,7 +548,7 @@ def test_fill_zones_subprocess_no_warning_when_matched(tmp_path: Path) -> None:
     proc = MagicMock(returncode=0,
                      stdout='{"zones_filled": 1, "filled": true}\n', stderr="")
     with patch.object(zfs, "find_bundled_python",
-                      return_value=Path(r"C:\kc\9.0\bin\python.exe")) as finder, \
+                      return_value=Path("C:/kc/9.0/bin/python.exe")) as finder, \
          patch("subprocess.run", return_value=proc):
         result = zfs.fill_zones_subprocess(_k9_board(tmp_path))
     finder.assert_called_once_with("9")

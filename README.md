@@ -8,8 +8,8 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
 
 ### Key Features
 
-- **120 MCP Tools** across 11 categories:
-  - 📋 **Project Management** (14 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project (IPC-first, with bridge fallback), PCB workflow reference, plan capture and retrieval, **8-item startup gate checklist**
+- **121 MCP Tools** across 11 categories:
+  - 📋 **Project Management** (15 tools): Create projects, open projects, list files, read/write metadata, text variable management, query backend info, query active KiCad project (IPC-first, with bridge fallback), PCB workflow reference, plan capture and retrieval, **KiCad 9→10 project format upgrade** (kicad-cli-driven, backed up, one-way), **8-item startup gate checklist**
   - 📐 **Schematic Operations** (29 tools): Create schematics from scratch, place/remove/move components, wire routing, labels (add/remove/edit label text), no-connects, junctions, power symbols, bulk component / power-symbol / pin-net / no-connect / move operations (drop ~200 calls per design to ~10), property editing, **symbol attribute authoring and editing** (`in_bom` / `on_board` / `dnp` / `exclude_from_sim`), pin position queries (with `extends` resolution **and audited rotation/mirror math against eeschema**), net connectivity analysis, hierarchical sheet traversal, schematic-to-PCB comparison and sync (with **PlacementIntent** schematic-driven anchoring + sheet-path propagation)
   - 🔌 **PCB Board Operations** (21 tools): Read boards, place/move components, add tracks/vias/board outlines, assign nets, query design rules, **author/list/delete copper pour zones** plus refill, **silkscreen refdes tidying** (relocate-first, hide-fallback), query layer stackup, write IPC-2221/JLCPCB design rules, geometry-driven auto-placement (with **sheet-hierarchy clustering** and **anchors** parameter so place_at_edge work survives bulk placement), **board-size verification gate**, full schematic-to-routed-PCB pipeline (with mandatory pre-flight gate), **diff two board snapshots**, **anchor an edge-facing connector at a named board edge with correct outward rotation**
   - 📚 **Library Search** (8 tools): Search symbols/footprints, list libraries, get symbol/footprint info, suggest footprints for a symbol (with physical dimensions), query footprint courtyard dimensions, **estimate board size from footprint list**
@@ -18,7 +18,7 @@ KiCad MCP Server provides a standardized interface for AI assistants to read, an
   - 📤 **Export Operations** (9 tools): Export Gerbers, drill files, BOMs, pick-and-place, PDFs (with actionable error diagnostics), **3D STEP and VRML models** (STEP with a three-way success / partial / error verdict), **verify 3D model references resolve on disk**, **render a board or schematic to an image for visual self-inspection**
   - 🏭 **Manufacturing** (1 tool): One-call **manufacturing-readiness audit** — DRC + board-size + courtyard + 3D-model + all five fab artifacts with a structured ship/no-ship verdict
   - 🎛️ **Design Variants** (4 tools, KiCad 10+): Create/delete variants, set per-component overrides (DNP, BOM/position exclusion, field values — schematic and board sides in one call), list variants with cross-file consistency checks; all writes kicad-cli-validated and atomic, structured refusal on KiCad 9
-  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing via FreeRouting (optional), **clean board for routing**, **clear all routes for re-placement**
+  - 🔀 **Auto-Routing** (6 tools): PCB trace auto-routing — **TraceMaker preferred when its WSL runtime is detected, with automatic FreeRouting fallback** (both optional; `router` parameter forces either engine), **clean board for routing**, **clear all routes for re-placement**
   - 🔍 **Parts Catalog** (6 tools): Index and search third-party KiCad library sources by MPN, install parts into project libraries
 
 - **Plugin Backend Architecture**: `PluginDirectBackend` routes each operation to the right subsystem — no fallback ambiguity:
@@ -62,10 +62,19 @@ Activate the venv first, then install the extras inside it:
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-For auto-routing functionality (requires Java and FreeRouting):
-- Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
-- Ensure Java Runtime Environment (JRE) is installed
-- Set `KICAD_MCP_FREEROUTING_JAR` and `KICAD_MCP_JAVA_PATH` environment variables (or let the tool auto-detect)
+For auto-routing functionality, install at least one routing engine (the `autoroute`
+tool prefers TraceMaker when it is available and falls back to FreeRouting
+automatically — see [Auto-Routing](#auto-routing-6-tools---optional)):
+
+- **TraceMaker** (Windows, via WSL2): build [TraceMaker](https://github.com/DingoOz/TraceMaker)
+  inside a WSL2 distro. By default the tool looks for distro `tracemaker-build` and
+  binary `~/TraceMaker/build/cpu-only/src/app/tracemaker`; override with
+  `KICAD_MCP_TRACEMAKER_DISTRO` and `KICAD_MCP_TRACEMAKER_BIN`. Set
+  `KICAD_MCP_NO_TRACEMAKER=1` to disable detection entirely.
+- **FreeRouting** (all platforms, requires Java):
+  - Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)
+  - Ensure Java Runtime Environment (JRE) is installed
+  - Set `KICAD_MCP_FREEROUTING_JAR` and `KICAD_MCP_JAVA_PATH` environment variables (or let the tool auto-detect)
 
 For development:
 ```bash
@@ -333,7 +342,7 @@ python -m kicad_mcp_plugin
 
 ## Available Tools
 
-### Project Management (14 tools)
+### Project Management (15 tools)
 - `open_kicad`: Launch KiCad and wait for the bridge to become ready
 - `open_project`: Open a KiCad project and return its structure
 - `list_project_files`: List all KiCad-related files in a project directory
@@ -347,6 +356,7 @@ python -m kicad_mcp_plugin
 - `get_pcb_workflow`: Return a structured 11-step PCB design workflow reference (JSON) showing the recommended tool sequence from project creation through DRC
 - `plan_project`: Record a structured project plan into a `project_plan.json` file. When `board_width_mm`/`board_height_mm` are 0 (default) and footprint IDs are included in `key_components`, auto-estimates board dimensions from courtyard bounds. Emits a `size_warning` when provided dimensions are more than 15% smaller than the estimate.
 - `read_project_plan`: Read back the saved project plan for a given project directory
+- `upgrade_project_format`: Upgrade a project's schematic and board files from KiCad-9 to KiCad-10 format via KiCad's own `kicad-cli sch/pcb upgrade`, backing up every changed file first. One-way (KiCad 9 cannot re-open v10 files; the `.kicad_mcp_backups/` copies are the rollback); refuses without touching any file if no KiCad-10 kicad-cli is available. Needed before the Design Variants tools on a v9-format project
 - `get_startup_checklist`: Run an eight-item PASS/WARN/FAIL gate before any board operation: KiCad running (counts pcbnew/eeschema too) · IPC API server reachable · bridge reachable · bridge version · PCB editor open (board-ready aware — distinguishes "still loading" from "no board") · live board ↔ file coherence (WARNs with a reload advisory when the open board's component set or Edge.Cuts outline diverges from the file on disk) · kicad-cli on PATH · active project loaded. A down bridge is a non-blocking WARN whenever the IPC path already serves the open board (and vice-versa). Returns `ready_for_pcb` bool and `required_actions` list. **Must be called at the start of every session involving PCB operations.**
 
 ### Schematic Operations (29 tools)
@@ -462,17 +472,17 @@ Author design variants (e.g. a "no-debug-header" assembly) at design stage; ever
 - `delete_variant`: Remove a variant fully — registry entries and every per-component override block on both sides, no orphan tokens
 
 ### Auto-Routing (6 tools) - Optional
-**Requires:** [FreeRouting](https://github.com/freerouting/freerouting) and Java
+**Requires:** at least one routing engine — [TraceMaker](https://github.com/DingoOz/TraceMaker) (Windows, running inside WSL2) and/or [FreeRouting](https://github.com/freerouting/freerouting) with Java
 
 These tools provide automated PCB trace routing capabilities:
 - `export_dsn`: Export PCB to Specctra DSN format for FreeRouting
 - `import_ses`: Import routed SES session file back into PCB
 - `run_freerouter`: Execute FreeRouting auto-router on a DSN file
 - `clean_board_for_routing`: Remove keepouts and problematic tracks before routing
-- `autoroute`: Complete pipeline (clean → export → route → import)
+- `autoroute`: Complete routing pipeline with engine selection via the `router` parameter (`"auto"` default / `"tracemaker"` / `"freerouting"`). In `auto` mode the tool prefers TraceMaker when its WSL runtime is detected (routes the `.kicad_pcb` directly, imports the new tracks through the live bridge when one is up), and **any TraceMaker failure falls back to the full FreeRouting pipeline (clean → DSN export → route → SES import) in the same call**. TraceMaker detection honors `KICAD_MCP_TRACEMAKER_DISTRO` / `KICAD_MCP_TRACEMAKER_BIN` and the `KICAD_MCP_NO_TRACEMAKER=1` kill-switch. Run post-route DRC as the completion oracle
 - `clear_routes`: Remove all routed tracks and vias from a board, preserving footprint placement, nets, and the board outline. When the plugin bridge is active, mutates pcbnew's live in-memory board so the file and bridge cache stay in sync — subsequent `autoroute` calls see the cleared state and tracks do not compound across iterations. Falls back to direct file editing when the bridge is unreachable. Writes a `.clear_routes_backup.kicad_pcb` file before modifying.
 
-> **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without FreeRouting or Java.
+> **Note**: The auto-routing tools are completely optional. All other KiCad-MCP functionality works without TraceMaker, FreeRouting, or Java.
 
 ### Parts Catalog (6 tools)
 These tools index and search third-party KiCad library sources (GitHub releases, local directories) and install parts by MPN into project libraries. They extend the built-in Library Management tools with a content-addressed parts index.
@@ -625,11 +635,11 @@ The skill enforces the seven-phase workflow described above (Environment & Requi
 
 ## Troubleshooting
 
-### Does KiCad-MCP require FreeRouting?
+### Does KiCad-MCP require FreeRouting or TraceMaker?
 
-**No.** FreeRouting is completely optional and only needed if you want to use the 6 auto-routing tools. All other 104 tools work without FreeRouting or Java.
+**No.** Routing engines are completely optional and only needed if you want to use the 6 auto-routing tools. All other 115 tools work without TraceMaker, FreeRouting, or Java.
 
-If you try to use auto-routing tools without FreeRouting, you'll get a helpful error message with download instructions.
+When you do route, `autoroute` prefers TraceMaker if its WSL runtime is detected and falls back to FreeRouting automatically; either engine alone is enough. If neither is installed, you'll get a helpful error message with setup instructions.
 
 ### Plugin Backend Setup
 
@@ -685,7 +695,20 @@ Use `get_backend_info` MCP tool to see the routing status. Common fixes:
 
 ### Auto-Routing Not Working
 
-Auto-routing requires both Java and FreeRouting:
+Auto-routing needs at least one working engine.
+
+**TraceMaker (preferred in `router="auto"` when detected; Windows + WSL2):**
+
+1. Build [TraceMaker](https://github.com/DingoOz/TraceMaker) inside a WSL2 distro
+2. Detection expects distro `tracemaker-build` with the binary at
+   `~/TraceMaker/build/cpu-only/src/app/tracemaker`; override with
+   `KICAD_MCP_TRACEMAKER_DISTRO` / `KICAD_MCP_TRACEMAKER_BIN`
+3. Verify with `wsl -d <distro> -- <binary> version` — the `version` subcommand, not `--version`
+4. `KICAD_MCP_NO_TRACEMAKER=1` disables TraceMaker entirely (auto mode then goes straight to FreeRouting)
+
+Any TraceMaker failure in `auto` mode is recorded in the tool report and the same call retries with FreeRouting — so a missing or broken TraceMaker never blocks routing as long as FreeRouting is set up.
+
+**FreeRouting (fallback engine; all platforms, requires Java):**
 
 1. Install Java Runtime Environment (JRE)
 2. Download [FreeRouting JAR](https://github.com/freerouting/freerouting/releases)

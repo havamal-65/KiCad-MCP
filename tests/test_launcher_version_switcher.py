@@ -12,6 +12,10 @@ from pathlib import Path
 
 import pytest
 
+# launcher.app imports webview at module level; without the [launcher] extra
+# installed, collection of this module must skip rather than error.
+pytest.importorskip("webview")
+
 from kicad_mcp.utils import kicad_version as kv
 from launcher import processes, settings
 from launcher.app import LauncherApi

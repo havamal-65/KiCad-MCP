@@ -19,7 +19,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        # [launcher] (pywebview + psutil) so the launcher test modules collect
+        # and run; GUI backends only load at webview.start(), never in tests.
+        run: pip install -e ".[dev,launcher]"
       - name: Run tests
         run: python -m pytest --tb=short -q
 
